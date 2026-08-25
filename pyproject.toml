@@ -11,6 +11,7 @@ dependencies = [
     "rich>=13.0",
     "razorpay>=2.0",
     "flask>=3.0",
+    "networkx>=3.0",
 ]
 
 [project.optional-dependencies]

@@ -497,20 +497,23 @@ class RevenueLossEnvironment:
         }
 
     def _agent_decide(self, state: GymState) -> ActionType:
-        """Memory-aware agent decision logic for the Gym.
+        """Memory-aware + KG-router agent decision logic for the Gym.
 
-        Uses diagnosis, memory store, and decision layer.
+        Uses diagnosis, memory store, KG router, and decision layer.
         """
         case = state.case
         from recovery_agent.agent.diagnosis import run_diagnosis
         from recovery_agent.agent.decision import run_decision
         from recovery_agent.agent.memory import CustomerMemoryStore
+        from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
 
         if case.diagnosis is None:
             case = run_diagnosis(case)
 
         if not hasattr(self, "memory_store"):
             self.memory_store = CustomerMemoryStore()
+        if not hasattr(self, "kg_router"):
+            self.kg_router = RazorpayKnowledgeGraph()
 
         profile = self.memory_store.get_or_create_profile(case.payment.customer_id)
         
@@ -518,7 +521,12 @@ class RevenueLossEnvironment:
         if state.customer_persona.value == "salary_dependent":
             profile.salary_window.typical_pay_day = 1
 
-        case = run_decision(case, profile=profile, memory=self.memory_store)
+        case = run_decision(
+            case,
+            profile=profile,
+            memory=self.memory_store,
+            kg_router=self.kg_router,
+        )
 
         action_value = case.payment.metadata.get("decided_action")
         if action_value:

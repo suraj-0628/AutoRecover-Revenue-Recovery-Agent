@@ -142,6 +142,9 @@ def observe_outcome(action: ActionType, execution_result: dict, customer_respond
 def run_execution(case) -> Case:
     """Execute the decided intervention and record the attempt.
 
+    Incorporates KG router metadata (discovered_rail_path, recommended_api_rail)
+    into execution details for observability.
+
     Source: Error handling through feedback loops
     https://www.deeplearning.ai/courses/building-coding-agents-with-tool-execution
     """
@@ -156,6 +159,14 @@ def run_execution(case) -> Case:
 
     execution = execute_action(action, cause_value, case.payment.amount)
 
+    # Enrich execution details with KG router findings
+    recommended_rail = case.payment.metadata.get("recommended_api_rail", "")
+    rail_path = case.payment.metadata.get("discovered_rail_path", [])
+    if recommended_rail:
+        execution["recommended_rail"] = recommended_rail
+        execution["rail_path"] = rail_path
+        execution["detail"] += f" [Rail: {recommended_rail}]"
+
     # For the batch/standalone agent, simulate customer response
     # In the frontend, this is handled by the waiting mechanism
     success_rate = {
@@ -167,11 +178,25 @@ def run_execution(case) -> Case:
         ActionType.ABANDON: 0.0,
     }.get(action, 0.3)
 
+    # Boost success rate if KG found a high-quality rail
+    if recommended_rail and action == ActionType.RETRY_PAYMENT:
+        from recovery_agent.agent.kg_router import RAIL_DETAILS
+        rail_info = RAIL_DETAILS.get(recommended_rail, {})
+        conversion_cost = rail_info.get("conversion_cost", 0.05)
+        # Lower conversion cost → higher success multiplier (1.0 to 1.3)
+        kg_boost = 1.0 + (0.05 - conversion_cost) * 6
+        success_rate = min(0.95, success_rate * kg_boost)
+
     success = random.random() < success_rate
 
     attempt = AttemptModel(
         action_type=action,
-        action_details={"cause": cause_value, "amount": case.payment.amount, "detail": execution["detail"]},
+        action_details={
+            "cause": cause_value,
+            "amount": case.payment.amount,
+            "detail": execution["detail"],
+            "recommended_rail": recommended_rail,
+        },
         result="success" if success else "failed",
     )
 

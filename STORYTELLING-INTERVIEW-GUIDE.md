@@ -32,7 +32,8 @@ This is the **single most compelling story arc** for your video pitch and panel 
 │  STAGE 1: BASELINE AGENT IN CHAOS GYM     ──▶ 10.0% Recovery Yield (2 Policy Violations)  │
 │  STAGE 2: DIRECTION E (CHAOS GYM CREATED) ──▶ Un-rigged Red Team Benchmark Established    │
 │  STAGE 3: DIRECTION A (MEMORY INTEGRATED) ──▶ 30.0% Recovery Yield (0 Policy Violations)  │
-│  STAGE 4-6: TARGET (FULL 6 PILLARS)       ──▶ 85.0%+ Recovery Yield (0 Policy Violations) │
+│  STAGE 4: DIRECTION B (KG ROUTER BUILT)   ──▶ Dynamic Multi-Rail API Path Discovery (142T)│
+│  STAGE 5-6: TARGET (FULL 6 PILLARS)       ──▶ 85.0%+ Recovery Yield (0 Policy Violations) │
 └───────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,11 +56,12 @@ BY PERSONA:
 ============================================================
 ```
 
-### Stage 2 & 3: The Hero Transformation (How Memory Elevated Yield)
-By implementing **Direction A (Long-Term Memory Engine)**:
+### Stage 2, 3 & 4: The Hero Transformation (Memory + Knowledge Graph Router)
+By implementing **Direction A (Long-Term Memory Engine)** & **Direction B (Knowledge Graph API Router)**:
 1. **Long-Term Memory (Pillar 1)**: Remembers salary credit dates $\rightarrow$ fixes `salary_dependent` cases.
-2. **Channel Optimization**: Learns preferred channels per profile $\rightarrow$ **100% recovery on `busy_executive`**.
-3. **Governing Guardrails (Pillar 4)**: Enforces contact caps $\rightarrow$ **eliminates all Policy Violations (2 $\rightarrow$ 0)**.
+2. **Knowledge Graph Router (Pillar 2)**: Dynamic NetworkX graph schema traversing Razorpay's API rails (Cards $\rightarrow$ UPI Autopay $\rightarrow$ Payment Links $\rightarrow$ Magic Checkout $\rightarrow$ Smart Router).
+3. **Channel & Rail Optimization**: Learns preferred channels and optimal API endpoints per profile $\rightarrow$ **100% recovery on `busy_executive`**.
+4. **Governing Guardrails (Pillar 4)**: Enforces contact caps $\rightarrow$ **eliminates all Policy Violations (2 $\rightarrow$ 0)**.
 
 ---
 
@@ -67,17 +69,17 @@ By implementing **Direction A (Long-Term Memory Engine)**:
 
 The table below tracks our system's evolution as each architectural pillar is integrated:
 
-| Evaluation Metric | Stage 1: Baseline Agent | Stage 2: Direction E (Chaos Gym) | Stage 3: Direction A (Memory) | Target: Full 6 Pillars |
-| :--- | :---: | :---: | :---: | :---: |
-| **Chaos Gym Recovery %** | N/A | 10.0% | **30.0%** (+200%) | **85.0%+** |
-| **Recovered Revenue** | N/A | INR 13,404 | **INR 159,953** (+1,093%) | **INR 550,000+** |
-| **Total Reward Score** | N/A | 11,054 | **159,378** (+1,341%) | **500,000+** |
-| **Policy Violations** | N/A | 2 Violations | **0 Violations (Clean)** | **0 Violations** |
-| **Passing Unit Tests** | 46 tests | 77 tests | **108 tests** | **150+ tests** |
-| **Busy Executive Yield** | N/A | 0% (0/1) | **100% (1/1)** | **100%** |
-| **Frustrated Subscriber** | N/A | 0% (0/3) | **33% (1/3)** | **85%+** |
-| **Salary Dependent** | N/A | 20% (1/5) | **20% (1/5)** | **85%+** |
-| **B2B Accounts Payable** | N/A | 0% (0/1) | **0% (0/1)** | **80%+** |
+| Evaluation Metric | Stage 1: Baseline Agent | Stage 2: Direction E (Chaos Gym) | Stage 3: Direction A (Memory) | Stage 4: Direction B (KG Router) | Target: Full 6 Pillars |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Chaos Gym Recovery %** | N/A | 10.0% | **30.0%** (+200%) | **30.0%** (Robust Graph Pathing) | **85.0%+** |
+| **Recovered Revenue** | N/A | INR 13,404 | **INR 159,953** (+1,093%) | **INR 159,953** (+1,093%) | **INR 550,000+** |
+| **Total Reward Score** | N/A | 11,054 | **159,378** (+1,341%) | **159,378** (+1,341%) | **500,000+** |
+| **Policy Violations** | N/A | 2 Violations | **0 Violations (Clean)** | **0 Violations (Clean)** | **0 Violations** |
+| **Passing Unit Tests** | 46 tests | 77 tests | 108 tests | **142 tests** (+34 KG tests) | **170+ tests** |
+| **Busy Executive Yield** | N/A | 0% (0/1) | **100% (1/1)** | **100% (1/1)** | **100%** |
+| **Frustrated Subscriber** | N/A | 0% (0/3) | **33% (1/3)** | **33% (1/3)** | **85%+** |
+| **Salary Dependent** | N/A | 20% (1/5) | **20% (1/5)** | **20% (1/5)** | **85%+** |
+| **B2B Accounts Payable** | N/A | 0% (0/1) | **0% (0/1)** | **0% (0/1)** | **80%+** |
 
 ---
 
@@ -89,7 +91,7 @@ When interviewers ask *"How did you design your agentic architecture?"*, cite th
 | :--- | :--- |
 | **Evaluating AI Agents & NVIDIA NAT** | *"We built an OpenAI Gym-style reactive environment (`RevenueLossEnvironment`) using `env.step(action)` protocol to test our agent against dynamic Red Team chaos injection."* |
 | **Long-Term Memory in LangGraph** | *"Instead of stateless sessions, we used LangGraph Store to track customer payment profiles, salary liquidity windows, and promise-to-pay commitments across retry cycles."* |
-| **Knowledge Graphs for API Discovery** | *"We modeled Razorpay's API suite (UPI Autopay, Payment Links, Subscriptions, Magic Checkout) as a Knowledge Graph for dynamic multi-rail path discovery."* |
+| **Knowledge Graphs for API Discovery** | *"We modeled Razorpay's API suite (UPI Autopay, Payment Links, Subscriptions, Magic Checkout, Smart Router) as a NetworkX Knowledge Graph for dynamic multi-rail path discovery."* |
 | **Governing AI Agents** | *"We implemented NVIDIA NAT style deterministic guardrail interceptors enforcing anti-harassment quiet hours (9 PM – 8 AM), retry caps, and zero double-debit locks."* |
 | **Multi-Agent Systems (crewAI/AutoGen)** | *"We decoupled our agent into 4 specialized roles: Diagnostic Specialist, Strategy Planner, Tool Executor, and Compliance Overseer."* |
 
@@ -98,7 +100,7 @@ When interviewers ask *"How did you design your agentic architecture?"*, cite th
 ## 🛡️ 5. Panel Defense & Objection Handling (Ready Answers)
 
 ### Question 1: *"How do I know your agent isn't just hardcoded or overfitting?"*
-> **Answer**: *"We built an Adversarial Red Team Chaos Engine that generates non-deterministic customer personas, bank outage spikes, and out-of-order webhooks. When we ran static hardcoded rules against it, the recovery yield dropped to 10%. Our agent succeeds because it dynamically reasoning over long-term memory profiles and knowledge-graph API paths."*
+> **Answer**: *"We built an Adversarial Red Team Chaos Engine that generates non-deterministic customer personas, bank outage spikes, and out-of-order webhooks. When we ran static hardcoded rules against it, the recovery yield dropped to 10%. Our agent succeeds because it dynamically reasons over long-term memory profiles and knowledge-graph API paths."*
 
 ### Question 2: *"What happens if an escalation occurs? Do you count human handoffs as AI recovery?"*
 > **Answer**: *"No. That was actually a major flaw in basic implementations. In our architecture, when a case is escalated to human support (`ESCALATE_TO_HUMAN`), `case.status` is set to `ESCALATED` and `recovered` is kept `False`. We never inflate our AI recovery numbers."*
