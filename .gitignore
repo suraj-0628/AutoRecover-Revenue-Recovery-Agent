@@ -52,12 +52,7 @@ data/audit_logs/*.jsonl
 *.pem
 *.key
 
-# Internal docs (not for GitHub)
-ADVANCED-AGENT-VISION.md
-AGENTS-REFERENCE.md
-ARCHITECTURE.md
-BUILD-PLAN.md
-CHALLENGES.md
-CONTEXT.md
-PROJECT.md
-SUBMISSION-CHECKLIST.md
+# Ignore all markdown files except README.md
+*.md
+!README.md
+
