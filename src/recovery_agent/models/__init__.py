@@ -175,3 +175,46 @@ class GymStepResult(BaseModel):
     reward: float
     done: bool
     info: dict[str, Any] = Field(default_factory=dict)
+
+
+# --- Long-Term Memory Models ---
+
+class PaymentRecord(BaseModel):
+    """Historical payment attempt record for a customer."""
+    payment_id: str
+    amount: float
+    channel_used: str
+    status: str  # success, failed, pending
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    failure_type: str = ""
+
+
+class PromiseToPay(BaseModel):
+    """Customer commitment to pay by a specific date."""
+    promise_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
+    amount: float
+    promised_date: str  # ISO date string YYYY-MM-DD
+    fulfilled: bool = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class SalaryWindow(BaseModel):
+    """Tracks customer salary credit timing for liquidity-aware retries."""
+    typical_pay_day: int = Field(ge=0, le=31, default=0)
+    last_salary_date: str = ""  # ISO date string
+    is_salary_due: bool = False
+    salary_history: list[str] = Field(default_factory=list)  # ISO dates
+
+
+class CustomerProfile(BaseModel):
+    """Persistent memory profile for a customer across sessions."""
+    customer_id: str
+    payment_history: list[PaymentRecord] = Field(default_factory=list)
+    salary_window: SalaryWindow = Field(default_factory=SalaryWindow)
+    promises: list[PromiseToPay] = Field(default_factory=list)
+    preferred_channel: str = ""
+    total_recovered: float = 0.0
+    total_attempts: int = 0
+    channel_success_rates: dict[str, float] = Field(default_factory=dict)
+    last_contacted: datetime | None = None
+    failure_type_counts: dict[str, int] = Field(default_factory=dict)

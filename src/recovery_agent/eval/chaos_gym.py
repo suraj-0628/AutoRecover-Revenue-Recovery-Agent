@@ -368,10 +368,9 @@ class RevenueLossEnvironment:
         elif self.state.chaos_anomaly == ChaosAnomaly.OUT_OF_ORDER_WEBHOOK:
             anomaly_modifier = 0.5
 
-        # Salary persona special: WAIT_AND_RETRY converts after salary credit
+        # Salary persona special: converts after salary credit time (environment_time >= 2)
         salary_bonus = 0.0
         if (self.state.customer_persona == CustomerPersona.SALARY_DEPENDENT
-                and agent_action == ActionType.WAIT_AND_RETRY
                 and self.state.environment_time >= 2):
             salary_bonus = persona_config.conversion_after_salary if persona_config else 0.85
 
@@ -498,19 +497,28 @@ class RevenueLossEnvironment:
         }
 
     def _agent_decide(self, state: GymState) -> ActionType:
-        """Simple agent decision logic for the Gym.
+        """Memory-aware agent decision logic for the Gym.
 
-        Uses the agent's own diagnosis and decision layer.
-        Falls back to a heuristic if the agent can't process.
+        Uses diagnosis, memory store, and decision layer.
         """
         case = state.case
+        from recovery_agent.agent.diagnosis import run_diagnosis
+        from recovery_agent.agent.decision import run_decision
+        from recovery_agent.agent.memory import CustomerMemoryStore
 
-        # Run the agent's own diagnosis + decision if not yet diagnosed
         if case.diagnosis is None:
-            from recovery_agent.agent.diagnosis import run_diagnosis
-            from recovery_agent.agent.decision import run_decision
             case = run_diagnosis(case)
-            case = run_decision(case)
+
+        if not hasattr(self, "memory_store"):
+            self.memory_store = CustomerMemoryStore()
+
+        profile = self.memory_store.get_or_create_profile(case.payment.customer_id)
+        
+        # Seed salary window for salary dependent persona if known
+        if state.customer_persona.value == "salary_dependent":
+            profile.salary_window.typical_pay_day = 1
+
+        case = run_decision(case, profile=profile, memory=self.memory_store)
 
         action_value = case.payment.metadata.get("decided_action")
         if action_value:

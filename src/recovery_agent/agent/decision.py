@@ -5,18 +5,29 @@ Source: Planning pattern from Agentic AI (Andrew Ng), Module 5
 """
 from __future__ import annotations
 
+from datetime import datetime
+
+from recovery_agent.agent.memory import CustomerMemoryStore
 from recovery_agent.models import (
     ActionType,
     Case,
     CaseStatus,
+    CustomerProfile,
     FailureType,
 )
 
 
-def decide_intervention(case: Case) -> ActionType:
-    """Choose the appropriate intervention based on diagnosis and attempt history.
+def decide_intervention(
+    case: Case,
+    profile: CustomerProfile | None = None,
+    memory: CustomerMemoryStore | None = None,
+) -> ActionType:
+    """Choose the appropriate intervention based on diagnosis, attempt history, and memory.
 
-    Maps: root_cause + attempt_count -> action type
+    Memory-aware rules:
+    - INSUFFICIENT_FUNDS + salary_dependent + not in salary window → WAIT_AND_RETRY
+    - Best channel from profile overrides default
+    - Promise-to-pay tracked if customer commits
 
     Source: Planning pattern — agent creates plan then executes
     https://www.deeplearning.ai/courses/agentic-ai (Module 5)
@@ -26,6 +37,20 @@ def decide_intervention(case: Case) -> ActionType:
 
     cause = case.diagnosis.root_cause
     attempts = case.attempt_count
+
+    # Memory-aware: If insufficient funds and customer is salary-dependent,
+    # keep waiting until salary window is active
+    if (
+        cause == FailureType.INSUFFICIENT_FUNDS
+        and profile
+        and memory
+        and profile.salary_window.typical_pay_day > 0
+    ):
+        current_day = datetime.now().day
+        in_window = memory.check_salary_liquidity(profile.customer_id, current_day)
+        if not in_window and attempts < 3:
+            # Don't burn attempts outside salary window — keep waiting
+            return ActionType.WAIT_AND_RETRY
 
     # Decision matrix: cause x attempt count -> action
     decision_tree: dict[FailureType, dict[int, ActionType]] = {
@@ -78,7 +103,11 @@ def decide_intervention(case: Case) -> ActionType:
     return action
 
 
-def run_decision(case: Case) -> Case:
+def run_decision(
+    case: Case,
+    profile: CustomerProfile | None = None,
+    memory: CustomerMemoryStore | None = None,
+) -> Case:
     """Run decision layer on a case and update its state.
 
     Transitions case from DIAGNOSING → DIAGNOSED after selecting an intervention.
@@ -88,9 +117,15 @@ def run_decision(case: Case) -> Case:
     """
     case.status = CaseStatus.DIAGNOSED
 
-    action = decide_intervention(case)
+    action = decide_intervention(case, profile=profile, memory=memory)
 
     # Store the decided action in the case metadata for the act step
     case.payment.metadata["decided_action"] = action.value
+
+    # Store optimal channel from memory for execution
+    if memory and profile:
+        case.payment.metadata["optimal_channel"] = memory.get_optimal_channel(
+            profile.customer_id
+        )
 
     return case

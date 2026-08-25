@@ -14,6 +14,7 @@ from langgraph.graph import END, StateGraph
 from recovery_agent.agent.decision import run_decision
 from recovery_agent.agent.diagnosis import run_diagnosis
 from recovery_agent.agent.execution import run_execution
+from recovery_agent.agent.memory import CustomerMemoryStore
 from recovery_agent.agent.stopping import check_stopping_rules, run_stopping_check
 from recovery_agent.logging import AuditLogger
 from recovery_agent.models import (
@@ -33,8 +34,13 @@ class RecoveryAgent:
     https://www.deeplearning.ai/courses/ai-agents-in-langgraph
     """
 
-    def __init__(self, audit_logger: AuditLogger | None = None):
+    def __init__(
+        self,
+        audit_logger: AuditLogger | None = None,
+        memory_store: CustomerMemoryStore | None = None,
+    ):
         self.logger = audit_logger or AuditLogger()
+        self.memory = memory_store or CustomerMemoryStore()
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
@@ -118,11 +124,14 @@ class RecoveryAgent:
         return {"case": case, "current_step": AuditStep.DIAGNOSE}
 
     def _decide(self, state: AgentState) -> dict:
-        """Step 3: Decide — choose intervention based on diagnosis."""
+        """Step 3: Decide — choose intervention based on diagnosis and memory."""
         start = time.time()
         case = state.case
 
-        case = run_decision(case)
+        # Load customer profile from memory
+        profile = self.memory.get_or_create_profile(case.payment.customer_id)
+
+        case = run_decision(case, profile=profile, memory=self.memory)
         action = case.payment.metadata.get("decided_action", "unknown")
 
         self.logger.log_step(
@@ -131,9 +140,12 @@ class RecoveryAgent:
             input_data={
                 "root_cause": case.diagnosis.root_cause.value if case.diagnosis else "unknown",
                 "attempt_count": case.attempt_count,
+                "memory_enhanced": True,
+                "preferred_channel": profile.preferred_channel,
             },
             reasoning=f"Attempt #{case.attempt_count + 1}. "
                       f"Cause: {case.diagnosis.root_cause.value if case.diagnosis else 'unknown'}. "
+                      f"Channel: {profile.preferred_channel or 'default'}. "
                       f"Chosen action: {action}",
             output_data={"action": action},
             duration_ms=int((time.time() - start) * 1000),
@@ -169,12 +181,27 @@ class RecoveryAgent:
         return {"case": case, "current_step": AuditStep.ACT}
 
     def _observe(self, state: AgentState) -> dict:
-        """Step 5: Observe — evaluate outcome and check stopping rules."""
+        """Step 5: Observe — evaluate outcome, check stopping rules, update memory."""
         start = time.time()
         case = state.case
 
         case = run_stopping_check(case)
         should_stop, stop_reason = check_stopping_rules(case)
+
+        # Update customer memory with this attempt's outcome
+        if case.attempts:
+            last_attempt = case.attempts[-1]
+            channel = case.payment.metadata.get("decided_action", "")
+            self.memory.update_profile_after_attempt(
+                customer_id=case.payment.customer_id,
+                attempt={
+                    "payment_id": case.payment.payment_id,
+                    "amount": case.payment.amount,
+                    "failure_type": case.diagnosis.root_cause.value if case.diagnosis else "",
+                },
+                success=case.recovered,
+                channel=channel,
+            )
 
         self.logger.log_step(
             case=case,
