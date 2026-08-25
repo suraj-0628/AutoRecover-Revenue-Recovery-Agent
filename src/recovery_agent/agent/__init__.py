@@ -14,6 +14,7 @@ from langgraph.graph import END, StateGraph
 from recovery_agent.agent.decision import run_decision
 from recovery_agent.agent.diagnosis import run_diagnosis
 from recovery_agent.agent.execution import run_execution
+from recovery_agent.agent.guardrails import GuardrailEngine
 from recovery_agent.agent.memory import CustomerMemoryStore
 from recovery_agent.agent.stopping import check_stopping_rules, run_stopping_check
 from recovery_agent.logging import AuditLogger
@@ -28,7 +29,7 @@ class RecoveryAgent:
     """Revenue recovery agent built with LangGraph.
 
     Architecture:
-        detect -> diagnose -> decide -> act -> observe (stop?) -> loop or end
+        detect -> diagnose -> decide -> [guardrail] -> act -> observe (stop?) -> loop or end
 
     Source: LangGraph components — Nodes, Edges, Conditional Edges
     https://www.deeplearning.ai/courses/ai-agents-in-langgraph
@@ -38,9 +39,11 @@ class RecoveryAgent:
         self,
         audit_logger: AuditLogger | None = None,
         memory_store: CustomerMemoryStore | None = None,
+        guardrail_engine: GuardrailEngine | None = None,
     ):
         self.logger = audit_logger or AuditLogger()
         self.memory = memory_store or CustomerMemoryStore()
+        self.guardrails = guardrail_engine or GuardrailEngine()
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
@@ -154,12 +157,20 @@ class RecoveryAgent:
         return {"case": case, "current_step": AuditStep.DECIDE}
 
     def _act(self, state: AgentState) -> dict:
-        """Step 4: Act — execute the chosen intervention."""
+        """Step 4: Act — execute the chosen intervention with guardrail interception."""
         start = time.time()
         case = state.case
 
-        case = run_execution(case)
+        # Load customer profile for guardrail checks
+        profile = self.memory.get_or_create_profile(case.payment.customer_id)
+
+        # Run execution with guardrail interception
+        case = run_execution(case, guardrail_engine=self.guardrails, profile=profile)
         last_attempt = case.attempts[-1] if case.attempts else None
+
+        # Log guardrail check results if present
+        guardrail_checks = case.payment.metadata.get("guardrail_checks", [])
+        guardrail_final = case.payment.metadata.get("guardrail_final_action", "")
 
         self.logger.log_step(
             case=case,
@@ -167,13 +178,17 @@ class RecoveryAgent:
             input_data={
                 "action": last_attempt.action_type.value if last_attempt else "none",
                 "attempt_number": case.attempt_count,
+                "guardrail_checks": len(guardrail_checks),
+                "guardrail_final_action": guardrail_final,
             },
             reasoning=f"Executed: {last_attempt.action_type.value}. "
                       f"Result: {last_attempt.result}. "
+                      f"Guardrail: {guardrail_final or 'none'}. "
                       f"{last_attempt.action_details.get('detail', '')}",
             output_data={
                 "action": last_attempt.action_type.value if last_attempt else "none",
                 "result": last_attempt.result if last_attempt else "none",
+                "guardrail_final_action": guardrail_final,
             },
             duration_ms=int((time.time() - start) * 1000),
         )

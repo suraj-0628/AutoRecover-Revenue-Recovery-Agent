@@ -497,15 +497,16 @@ class RevenueLossEnvironment:
         }
 
     def _agent_decide(self, state: GymState) -> ActionType:
-        """Memory-aware + KG-router agent decision logic for the Gym.
+        """Memory-aware + KG-router + guardrails agent decision logic for the Gym.
 
-        Uses diagnosis, memory store, KG router, and decision layer.
+        Uses diagnosis, memory store, KG router, guardrails, and decision layer.
         """
         case = state.case
         from recovery_agent.agent.diagnosis import run_diagnosis
         from recovery_agent.agent.decision import run_decision
         from recovery_agent.agent.memory import CustomerMemoryStore
         from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
+        from recovery_agent.agent.guardrails import GuardrailEngine
 
         if case.diagnosis is None:
             case = run_diagnosis(case)
@@ -514,12 +515,36 @@ class RevenueLossEnvironment:
             self.memory_store = CustomerMemoryStore()
         if not hasattr(self, "kg_router"):
             self.kg_router = RazorpayKnowledgeGraph()
+        if not hasattr(self, "guardrail_engine"):
+            self.guardrail_engine = GuardrailEngine()
 
         profile = self.memory_store.get_or_create_profile(case.payment.customer_id)
         
         # Seed salary window for salary dependent persona if known
         if state.customer_persona.value == "salary_dependent":
             profile.salary_window.typical_pay_day = 1
+
+        # Sync gym's messages_sent into profile's payment history for frequency cap guardrail
+        if state.messages_sent > 0:
+            from datetime import datetime, timezone, timedelta
+            now = datetime.now(timezone.utc)
+            # Ensure payment_history has enough recent contacts to match messages_sent
+            recent_sms = [
+                r for r in profile.payment_history
+                if r.channel_used == "sms"
+                and (now - r.timestamp).total_seconds() < 86400
+            ]
+            while len(recent_sms) < state.messages_sent:
+                from recovery_agent.models import PaymentRecord
+                record = PaymentRecord(
+                    payment_id=f"gym_msg_{len(profile.payment_history)}",
+                    amount=0,
+                    channel_used="sms",
+                    status="failed",
+                    timestamp=now - timedelta(minutes=30 * len(recent_sms)),
+                )
+                profile.payment_history.append(record)
+                recent_sms.append(record)
 
         case = run_decision(
             case,
@@ -528,15 +553,26 @@ class RevenueLossEnvironment:
             kg_router=self.kg_router,
         )
 
+        # Get the decided action
         action_value = case.payment.metadata.get("decided_action")
         if action_value:
             try:
-                return ActionType(action_value)
+                proposed_action = ActionType(action_value)
             except ValueError:
-                pass
+                proposed_action = self._heuristic_fallback(state)
+        else:
+            proposed_action = self._heuristic_fallback(state)
 
-        # Heuristic fallback based on failure type
-        failure = case.payment.failure_code
+        # Run guardrails to validate/modify the action
+        approved_action, checks = self.guardrail_engine.validate_action(
+            case=case, action=proposed_action, profile=profile,
+        )
+
+        return approved_action
+
+    def _heuristic_fallback(self, state: GymState) -> ActionType:
+        """Fallback heuristic if decision layer doesn't produce an action."""
+        failure = state.case.payment.failure_code
         attempt = state.attempt_count
 
         if "insufficient" in failure:

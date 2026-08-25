@@ -139,11 +139,11 @@ def observe_outcome(action: ActionType, execution_result: dict, customer_respond
 
 
 # Wrapper for backward compatibility with agent/__init__.py
-def run_execution(case) -> Case:
+def run_execution(case, guardrail_engine=None, profile=None) -> Case:
     """Execute the decided intervention and record the attempt.
 
-    Incorporates KG router metadata (discovered_rail_path, recommended_api_rail)
-    into execution details for observability.
+    Incorporates pre-execution guardrail interception, KG router metadata,
+    and guardrail check results into execution details for observability.
 
     Source: Error handling through feedback loops
     https://www.deeplearning.ai/courses/building-coding-agents-with-tool-execution
@@ -156,6 +156,14 @@ def run_execution(case) -> Case:
     action_value = case.payment.metadata.get("decided_action", "abandon")
     action = ActionType(action_value)
     cause_value = case.diagnosis.root_cause.value if case.diagnosis else "unknown"
+
+    # --- Pre-execution guardrail interception ---
+    if guardrail_engine:
+        action, guardrail_checks = guardrail_engine.validate_action(
+            case=case, action=action, profile=profile,
+        )
+        # Update the decided action to the guardrail-approved version
+        case.payment.metadata["decided_action"] = action.value
 
     execution = execute_action(action, cause_value, case.payment.amount)
 
@@ -196,6 +204,7 @@ def run_execution(case) -> Case:
             "amount": case.payment.amount,
             "detail": execution["detail"],
             "recommended_rail": recommended_rail,
+            "guardrail_final_action": case.payment.metadata.get("guardrail_final_action", ""),
         },
         result="success" if success else "failed",
     )

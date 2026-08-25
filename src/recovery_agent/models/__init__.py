@@ -218,3 +218,4 @@ class CustomerProfile(BaseModel):
     channel_success_rates: dict[str, float] = Field(default_factory=dict)
     last_contacted: datetime | None = None
     failure_type_counts: dict[str, int] = Field(default_factory=dict)
+    opt_out: bool = False
