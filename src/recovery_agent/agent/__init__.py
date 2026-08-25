@@ -16,6 +16,7 @@ from recovery_agent.agent.diagnosis import run_diagnosis
 from recovery_agent.agent.execution import run_execution
 from recovery_agent.agent.guardrails import GuardrailEngine
 from recovery_agent.agent.memory import CustomerMemoryStore
+from recovery_agent.agent.squad import SquadOrchestrator
 from recovery_agent.agent.stopping import check_stopping_rules, run_stopping_check
 from recovery_agent.logging import AuditLogger
 from recovery_agent.models import (
@@ -31,6 +32,8 @@ class RecoveryAgent:
     Architecture:
         detect -> diagnose -> decide -> [guardrail] -> act -> observe (stop?) -> loop or end
 
+    Supports both monolithic mode and squad mode (SquadOrchestrator).
+
     Source: LangGraph components — Nodes, Edges, Conditional Edges
     https://www.deeplearning.ai/courses/ai-agents-in-langgraph
     """
@@ -40,10 +43,17 @@ class RecoveryAgent:
         audit_logger: AuditLogger | None = None,
         memory_store: CustomerMemoryStore | None = None,
         guardrail_engine: GuardrailEngine | None = None,
+        use_squad: bool = False,
     ):
         self.logger = audit_logger or AuditLogger()
         self.memory = memory_store or CustomerMemoryStore()
         self.guardrails = guardrail_engine or GuardrailEngine()
+        self.use_squad = use_squad
+        if use_squad:
+            self.squad = SquadOrchestrator(
+                memory_store=self.memory,
+                guardrail_engine=self.guardrails,
+            )
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
@@ -157,41 +167,69 @@ class RecoveryAgent:
         return {"case": case, "current_step": AuditStep.DECIDE}
 
     def _act(self, state: AgentState) -> dict:
-        """Step 4: Act — execute the chosen intervention with guardrail interception."""
+        """Step 4: Act — execute the chosen intervention with guardrail interception.
+
+        When use_squad=True, delegates to SquadOrchestrator for full agent coordination.
+        """
         start = time.time()
         case = state.case
 
         # Load customer profile for guardrail checks
         profile = self.memory.get_or_create_profile(case.payment.customer_id)
 
-        # Run execution with guardrail interception
-        case = run_execution(case, guardrail_engine=self.guardrails, profile=profile)
-        last_attempt = case.attempts[-1] if case.attempts else None
+        if self.use_squad:
+            # Squad mode: run full Diagnose → Plan → Guard → Execute pipeline
+            result = self.squad.run_step(case, profile=profile)
+            case = result.next_case
+            last_attempt = case.attempts[-1] if case.attempts else None
 
-        # Log guardrail check results if present
-        guardrail_checks = case.payment.metadata.get("guardrail_checks", [])
-        guardrail_final = case.payment.metadata.get("guardrail_final_action", "")
+            self.logger.log_step(
+                case=case,
+                step=AuditStep.ACT,
+                input_data={
+                    "action": result.action_taken,
+                    "attempt_number": case.attempt_count,
+                    "verdict": result.verdict,
+                    "squad_mode": True,
+                },
+                reasoning=f"Squad executed: {result.action_taken}. "
+                          f"Verdict: {result.verdict}. "
+                          f"{last_attempt.action_details.get('detail', '') if last_attempt else ''}",
+                output_data={
+                    "action": result.action_taken,
+                    "verdict": result.verdict,
+                    "squad_mode": True,
+                },
+                duration_ms=int((time.time() - start) * 1000),
+            )
+        else:
+            # Monolithic mode: original flow
+            case = run_execution(case, guardrail_engine=self.guardrails, profile=profile)
+            last_attempt = case.attempts[-1] if case.attempts else None
 
-        self.logger.log_step(
-            case=case,
-            step=AuditStep.ACT,
-            input_data={
-                "action": last_attempt.action_type.value if last_attempt else "none",
-                "attempt_number": case.attempt_count,
-                "guardrail_checks": len(guardrail_checks),
-                "guardrail_final_action": guardrail_final,
-            },
-            reasoning=f"Executed: {last_attempt.action_type.value}. "
-                      f"Result: {last_attempt.result}. "
-                      f"Guardrail: {guardrail_final or 'none'}. "
-                      f"{last_attempt.action_details.get('detail', '')}",
-            output_data={
-                "action": last_attempt.action_type.value if last_attempt else "none",
-                "result": last_attempt.result if last_attempt else "none",
-                "guardrail_final_action": guardrail_final,
-            },
-            duration_ms=int((time.time() - start) * 1000),
-        )
+            guardrail_checks = case.payment.metadata.get("guardrail_checks", [])
+            guardrail_final = case.payment.metadata.get("guardrail_final_action", "")
+
+            self.logger.log_step(
+                case=case,
+                step=AuditStep.ACT,
+                input_data={
+                    "action": last_attempt.action_type.value if last_attempt else "none",
+                    "attempt_number": case.attempt_count,
+                    "guardrail_checks": len(guardrail_checks),
+                    "guardrail_final_action": guardrail_final,
+                },
+                reasoning=f"Executed: {last_attempt.action_type.value}. "
+                          f"Result: {last_attempt.result}. "
+                          f"Guardrail: {guardrail_final or 'none'}. "
+                          f"{last_attempt.action_details.get('detail', '')}",
+                output_data={
+                    "action": last_attempt.action_type.value if last_attempt else "none",
+                    "result": last_attempt.result if last_attempt else "none",
+                    "guardrail_final_action": guardrail_final,
+                },
+                duration_ms=int((time.time() - start) * 1000),
+            )
 
         return {"case": case, "current_step": AuditStep.ACT}
 

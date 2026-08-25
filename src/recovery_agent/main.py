@@ -97,10 +97,19 @@ def run_frontend():
 
 
 def run_chaos_gym(episodes: int = 10, seed: int | None = None):
-    """Run the Adversarial Chaos Gym evaluation."""
+    """Run the Adversarial Chaos Gym evaluation with trajectory benchmarking."""
     from recovery_agent.eval.chaos_gym import run_chaos_gym as _run_chaos_gym
+    from recovery_agent.eval.trajectory_benchmark import TrajectoryBenchmark
 
     result = _run_chaos_gym(episodes=episodes, seed=seed)
+
+    # Run trajectory benchmarking on all episodes
+    benchmark = TrajectoryBenchmark()
+    all_metrics = []
+    for ep in result["episodes_data"]:
+        metrics = benchmark.evaluate_trajectory(ep.get("benchmark_trajectory", ep["trajectory"]))
+        all_metrics.append(metrics)
+    agg = benchmark.aggregate_metrics(all_metrics)
 
     print("=" * 60)
     print("ADVERSARIAL CHAOS GYM RESULTS")
@@ -118,6 +127,14 @@ def run_chaos_gym(episodes: int = 10, seed: int | None = None):
     print("BY PERSONA:")
     for persona, stats in result["by_persona"].items():
         print(f"  {persona}: {stats['recovered']}/{stats['total']} recovered ({stats['recovery_rate']:.0%})")
+    print("-" * 60)
+    print("TRAJECTORY BENCHMARK:")
+    print(f"  Avg Step Efficiency:    {agg['avg_step_efficiency']:.3f}")
+    print(f"  Avg Friction Score:     {agg['avg_friction_score']:.3f}")
+    print(f"  Avg Compliance Rate:    {agg['avg_policy_compliance']:.3f}")
+    print(f"  Avg Trajectory Score:   {agg['avg_trajectory_score']:.3f}")
+    if agg.get("total_invasive_steps", 0) > 0:
+        print(f"  Total Invasive Steps:   {agg['total_invasive_steps']}")
     print("=" * 60)
 
 

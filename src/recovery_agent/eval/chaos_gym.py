@@ -459,12 +459,13 @@ class RevenueLossEnvironment:
     def run_episode(self) -> dict:
         """Run a full episode: reset → step loop → done.
 
-        Returns episode summary.
+        Returns episode summary with trajectory data.
         """
         state = self.reset()
         total_reward = 0.0
         steps = 0
         trajectory: list[dict] = []
+        self.trajectory = []  # Reset squad trajectory tracker
 
         while not state.done and steps < 10:
             # Let the agent decide what to do
@@ -483,6 +484,9 @@ class RevenueLossEnvironment:
 
             state = result.next_state
 
+        # Use squad trajectory if available (has verdict data for benchmarking)
+        benchmark_trajectory = self.trajectory if self.trajectory else trajectory
+
         return {
             "persona": state.customer_persona.value,
             "failure_type": state.case.payment.failure_code,
@@ -494,22 +498,20 @@ class RevenueLossEnvironment:
             "steps": steps,
             "policy_violations": state.policy_violations,
             "trajectory": trajectory,
+            "benchmark_trajectory": benchmark_trajectory,
         }
 
     def _agent_decide(self, state: GymState) -> ActionType:
-        """Memory-aware + KG-router + guardrails agent decision logic for the Gym.
+        """Multi-agent squad decision logic for the Gym.
 
-        Uses diagnosis, memory store, KG router, guardrails, and decision layer.
+        Uses SquadOrchestrator to coordinate specialized agents:
+        DiagnosticAgent → StrategyPlannerAgent → ComplianceOverseerAgent → ToolExecutionAgent
         """
         case = state.case
-        from recovery_agent.agent.diagnosis import run_diagnosis
-        from recovery_agent.agent.decision import run_decision
         from recovery_agent.agent.memory import CustomerMemoryStore
         from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
         from recovery_agent.agent.guardrails import GuardrailEngine
-
-        if case.diagnosis is None:
-            case = run_diagnosis(case)
+        from recovery_agent.agent.squad import SquadOrchestrator
 
         if not hasattr(self, "memory_store"):
             self.memory_store = CustomerMemoryStore()
@@ -517,6 +519,12 @@ class RevenueLossEnvironment:
             self.kg_router = RazorpayKnowledgeGraph()
         if not hasattr(self, "guardrail_engine"):
             self.guardrail_engine = GuardrailEngine()
+        if not hasattr(self, "squad"):
+            self.squad = SquadOrchestrator(
+                memory_store=self.memory_store,
+                kg_router=self.kg_router,
+                guardrail_engine=self.guardrail_engine,
+            )
 
         profile = self.memory_store.get_or_create_profile(case.payment.customer_id)
         
@@ -528,7 +536,6 @@ class RevenueLossEnvironment:
         if state.messages_sent > 0:
             from datetime import datetime, timezone, timedelta
             now = datetime.now(timezone.utc)
-            # Ensure payment_history has enough recent contacts to match messages_sent
             recent_sms = [
                 r for r in profile.payment_history
                 if r.channel_used == "sms"
@@ -546,27 +553,37 @@ class RevenueLossEnvironment:
                 profile.payment_history.append(record)
                 recent_sms.append(record)
 
-        case = run_decision(
-            case,
-            profile=profile,
-            memory=self.memory_store,
-            kg_router=self.kg_router,
-        )
+        # Run squad pipeline: Diagnose → Plan (Memory+KG) → Guard (Compliance Intercept)
+        diagnosis = self.squad.diagnostic.diagnose(case)
+        case.diagnosis = diagnosis
 
-        # Get the decided action
-        action_value = case.payment.metadata.get("decided_action")
-        if action_value:
-            try:
-                proposed_action = ActionType(action_value)
-            except ValueError:
-                proposed_action = self._heuristic_fallback(state)
-        else:
-            proposed_action = self._heuristic_fallback(state)
+        # Keep case attempt count synced with Gym state
+        case.attempt_count = max(0, state.attempt_count - 1)
 
-        # Run guardrails to validate/modify the action
-        approved_action, checks = self.guardrail_engine.validate_action(
-            case=case, action=proposed_action, profile=profile,
-        )
+        proposed_action = self.squad.planner.plan(case, profile, self.kg_router, self.memory_store)
+        approved_action, checks = self.squad.compliance.intercept(case, proposed_action, profile)
+
+        verdict = "pass"
+        if approved_action != proposed_action:
+            if any(c.verdict.value == "blocked" for c in checks):
+                verdict = "blocked"
+            elif any(c.verdict.value == "modified" for c in checks):
+                verdict = "modified"
+
+        # Store trajectory step for benchmarking
+        if not hasattr(self, "trajectory"):
+            self.trajectory = []
+        self.trajectory.append({
+            "step": state.attempt_count,
+            "diagnosis": diagnosis.root_cause.value,
+            "diagnosis_confidence": diagnosis.confidence,
+            "proposed_action": proposed_action.value,
+            "approved_action": approved_action.value,
+            "verdict": verdict,
+            "guardrail_checks": len(checks),
+            "execution_result": approved_action.value,
+            "elapsed_ms": 1,
+        })
 
         return approved_action
 
@@ -624,6 +641,7 @@ def run_chaos_gym(episodes: int = 10, seed: int | None = None) -> dict:
         "avg_steps": round(total_steps / episodes, 1) if episodes > 0 else 0.0,
         "avg_friction_index": round(avg_friction, 3),
         "by_persona": _aggregate_by_persona(results),
+        "episodes_data": results,
     }
 
 
