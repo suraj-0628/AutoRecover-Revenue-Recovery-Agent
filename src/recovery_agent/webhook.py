@@ -32,6 +32,23 @@ def verify_signature(payload: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+def process_webhook_payload(payload: dict) -> dict:
+    """Process a raw webhook event dictionary programmatically."""
+    event = payload.get("event", "")
+    data = payload.get("payload", {})
+
+    if event == "payment.failed":
+        response, status = _handle_payment_failed(data)
+        return {"event": event, "status": "processed", "status_code": status}
+    elif event == "payment.captured":
+        response, status = _handle_payment_captured(data)
+        return {"event": event, "status": "processed", "status_code": status}
+    elif "dispute" in event:
+        return {"event": event, "status": "handled", "status_code": 200}
+
+    return {"event": event, "status": "ignored", "status_code": 200}
+
+
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
     signature = request.headers.get("X-Razorpay-Signature", "")
@@ -39,17 +56,8 @@ def handle_webhook():
         return jsonify({"error": "Invalid signature"}), 400
 
     payload = request.json
-    event = payload.get("event", "")
-    data = payload.get("payload", {})
-
-    print(f"[webhook] Event: {event}")
-
-    if event == "payment.failed":
-        return _handle_payment_failed(data)
-    elif event == "payment.captured":
-        return _handle_payment_captured(data)
-
-    return jsonify({"status": "ignored"}), 200
+    res = process_webhook_payload(payload)
+    return jsonify(res), res.get("status_code", 200)
 
 
 def _handle_payment_failed(data: dict) -> tuple[Any, int]:
@@ -61,16 +69,20 @@ def _handle_payment_failed(data: dict) -> tuple[Any, int]:
     error_step = payment.get("error_step", "")
     contact = payment.get("contact", "")
     email = payment.get("email", "")
+    notes = payment.get("notes", {})
+    customer_id = notes.get("customer_id", payment.get("customer_id", f"cust_{payment_id}"))
 
     print(f"[webhook] Payment failed: {payment_id} — {error_code}: {error_reason}")
 
     event = PaymentEvent(
         event_type="payment_failed",
         payment_id=payment_id,
+        customer_id=customer_id,
         amount=amount,
         currency=payment.get("currency", "INR"),
         status="failed",
         failure_reason=f"{error_code}: {error_reason}",
+        failure_code=error_code or "BAD_REQUEST_PAYMENT_FAILED",
         metadata={
             "order_id": payment.get("order_id", ""),
             "error_code": error_code,
@@ -93,12 +105,12 @@ def _handle_payment_failed(data: dict) -> tuple[Any, int]:
 
     active_cases[payment_id] = final_case
 
-    return jsonify({
+    return {
         "status": "processed",
         "case_id": final_case.id,
         "recovered": final_case.recovered,
         "recovered_amount": final_case.recovered_amount,
-    }), 200
+    }, 200
 
 
 def _handle_payment_captured(data: dict) -> tuple[Any, int]:
@@ -114,7 +126,7 @@ def _handle_payment_captured(data: dict) -> tuple[Any, int]:
         case.recovered_amount = amount
         del active_cases[payment_id]
 
-    return jsonify({"status": "processed"}), 200
+    return {"status": "processed"}, 200
 
 
 @app.route("/health", methods=["GET"])

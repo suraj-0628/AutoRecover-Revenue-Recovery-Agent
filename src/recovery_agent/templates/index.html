@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Razorpay AutoRecover — OpenCode Agentic Operations HUD</title>
+  
+  <!-- Google Fonts: JetBrains Mono + Fira Code -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  
+  <!-- SocketIO -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+
+  <style>
+    :root {
+      --bg-dark: #0d1117;
+      --panel-bg: #161b22;
+      --card-bg: #0d1117;
+      --border-color: #30363d;
+      --text-main: #c9d1d9;
+      --text-muted: #8b949e;
+      --text-bright: #f0f6fc;
+      
+      --accent-blue: #58a6ff;
+      --accent-green: #7ee787;
+      --accent-purple: #d2a8ff;
+      --accent-amber: #ffa657;
+      --accent-red: #ff7b72;
+
+      --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      font-family: var(--font-mono);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      font-size: 0.82rem;
+    }
+
+    /* Top Navigation Header */
+    header {
+      height: 52px;
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 1.2rem;
+      flex-shrink: 0;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: var(--text-bright);
+      letter-spacing: -0.3px;
+    }
+    .brand-badge {
+      background: #1f242c;
+      color: var(--accent-blue);
+      border: 1px solid #30363d;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 500;
+    }
+
+    /* Financial KPI Header Chips */
+    .kpi-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .kpi-chip {
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      padding: 3px 9px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .kpi-chip span { font-weight: 600; color: var(--text-bright); }
+    .kpi-chip.green span { color: var(--accent-green); }
+    .kpi-chip.blue span { color: var(--accent-blue); }
+
+    .demo-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .btn-sim {
+      background: #21262d;
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 5px 10px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .btn-sim:hover {
+      background: #30363d;
+      border-color: var(--accent-blue);
+      color: var(--text-bright);
+    }
+    .btn-sim.primary {
+      background: #238636;
+      border-color: #2e9040;
+      color: #ffffff;
+    }
+    .btn-sim.primary:hover {
+      background: #2ea043;
+    }
+
+    /* Main Split-Screen Workspace */
+    .workspace {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 48% 52%;
+      gap: 10px;
+      padding: 10px;
+      overflow: hidden;
+    }
+
+    /* Panel Base */
+    .panel {
+      background: var(--panel-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 8px 12px;
+      background: #0d1117;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .panel-title {
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .status-pill {
+      font-size: 0.72rem;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .status-idle { background: #21262d; color: var(--text-muted); border: 1px solid #30363d; }
+    .status-thinking { background: rgba(210, 168, 255, 0.1); color: var(--accent-purple); border: 1px solid var(--accent-purple); }
+    .status-executing { background: rgba(255, 166, 87, 0.1); color: var(--accent-amber); border: 1px solid var(--accent-amber); }
+    .status-recovered { background: rgba(126, 231, 135, 0.1); color: var(--accent-green); border: 1px solid var(--accent-green); }
+
+    .panel-body {
+      flex: 1;
+      padding: 10px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    /* Left Panel Console Output — Fixed Viewing Window */
+    .terminal-box {
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 10px;
+      font-size: 0.78rem;
+      line-height: 1.55;
+      height: 380px;
+      min-height: 380px;
+      max-height: 380px;
+      flex-shrink: 0;
+      overflow-y: auto;
+      color: var(--text-main);
+    }
+    .log-line {
+      margin-bottom: 6px;
+      animation: fadeIn 0.15s ease-in;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .tag-thinking { color: var(--accent-purple); font-weight: 600; }
+    .tag-diagnosing { color: var(--accent-blue); font-weight: 600; }
+    .tag-guardrail { color: var(--accent-amber); font-weight: 600; }
+    .tag-kg { color: var(--accent-green); font-weight: 600; }
+    .tag-acting { color: var(--accent-red); font-weight: 600; }
+
+    /* OpenCode Tool Call Card */
+    .tool-card {
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 8px 12px;
+      font-size: 0.75rem;
+    }
+    .tool-title {
+      color: var(--accent-amber);
+      font-weight: 600;
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .tool-code {
+      background: #161b22;
+      padding: 8px;
+      border-radius: 4px;
+      color: var(--text-bright);
+      overflow-x: auto;
+      overflow-y: auto;
+      max-height: 160px;
+      border: 1px solid #21262d;
+    }
+
+    /* Telemetry Radar Grid */
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .telemetry-card {
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 8px;
+    }
+    .telemetry-title {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+    }
+    .telemetry-val {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-bright);
+    }
+
+    /* Right Panel (Live Customer Canvas) */
+    .canvas-container {
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px;
+      position: relative;
+      overflow-y: auto;
+    }
+
+    /* Business Scenario Context Bar */
+    .biz-context-bar {
+      width: 100%;
+      max-width: 460px;
+      background: #161b22;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 6px 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-bottom: 10px;
+    }
+    .biz-badge {
+      background: #21262d;
+      color: var(--accent-blue);
+      border: 1px solid #30363d;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+
+    /* Enterprise Razorpay Recovery Canvas Card */
+    .shop-checkout {
+      background: #161b22;
+      color: var(--text-main);
+      width: 100%;
+      max-width: 460px;
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+      border: 1px solid var(--border-color);
+      font-family: var(--font-mono);
+    }
+    .rzp-top-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+    }
+    .rzp-brand {
+      font-weight: 700;
+      font-size: 0.85rem;
+      color: var(--text-bright);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .rzp-trust-badge {
+      font-size: 0.68rem;
+      background: #0d1117;
+      color: var(--accent-blue);
+      border: 1px solid #30363d;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+    .order-summary {
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 12px;
+      font-size: 0.78rem;
+      margin-bottom: 12px;
+    }
+    .order-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      color: var(--text-muted);
+    }
+    .order-row.total {
+      font-weight: 700;
+      color: var(--text-bright);
+      font-size: 0.88rem;
+      border-top: 1px dashed var(--border-color);
+      padding-top: 8px;
+      margin-top: 8px;
+      margin-bottom: 0;
+    }
+
+    /* Virtual Credit Card Component */
+    .virtual-card {
+      background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+      border: 1px solid var(--border-color);
+      color: var(--text-bright);
+      padding: 12px 14px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      font-size: 0.78rem;
+    }
+    .card-number { font-size: 0.88rem; letter-spacing: 2px; margin-bottom: 6px; color: var(--accent-blue); }
+    .card-footer { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--text-muted); }
+
+    /* Generative UI Morph Boxes */
+    .gen-morph-box {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      animation: fadeIn 0.2s ease-in;
+    }
+    .morph-failover {
+      background: rgba(88, 166, 255, 0.08);
+      border: 1px solid var(--accent-blue);
+      color: var(--text-bright);
+    }
+    .morph-expiry {
+      background: rgba(210, 153, 34, 0.08);
+      border: 1px solid var(--accent-amber);
+      color: var(--text-bright);
+    }
+    .morph-whatsapp {
+      background: rgba(46, 160, 67, 0.08);
+      border: 1px solid var(--accent-green);
+      color: var(--text-bright);
+    }
+
+    .wa-bubble {
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      border-left: 3px solid var(--accent-green);
+      padding: 10px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      margin-top: 8px;
+      color: var(--text-main);
+    }
+
+    /* Voice Call Player Widget */
+    .voice-widget {
+      width: 100%;
+      max-width: 460px;
+      background: #161b22;
+      border: 1px solid var(--accent-purple);
+      border-radius: 6px;
+      padding: 12px;
+      margin-top: 10px;
+      display: none;
+    }
+    .voice-widget.active { display: block; }
+    .btn-voice-audio {
+      background: #21262d;
+      color: var(--accent-purple);
+      border: 1px solid var(--accent-purple);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      margin-top: 6px;
+    }
+    .btn-voice-audio:hover { background: var(--accent-purple); color: #0d1117; }
+
+    /* OpenCode View Switcher */
+    .view-toggle-bar {
+      display: flex;
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 2px;
+      gap: 2px;
+    }
+    .toggle-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 500;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .toggle-btn:hover { color: var(--text-bright); }
+    .toggle-btn.active {
+      background: #21262d;
+      color: var(--accent-blue);
+      border: 1px solid #30363d;
+    }
+
+    /* Live Recovery Step Progress Bar */
+    .recovery-progress-bar {
+      width: 100%;
+      max-width: 460px;
+      background: #161b22;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 8px 12px;
+      margin-top: 10px;
+    }
+    .progress-title {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .progress-steps {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .step-pill {
+      font-size: 0.68rem;
+      font-weight: 600;
+      padding: 3px 7px;
+      border-radius: 3px;
+      background: #0d1117;
+      color: var(--text-muted);
+      border: 1px solid #21262d;
+      transition: all 0.2s ease;
+    }
+    .step-pill.active-detect { background: #1f293d; color: var(--accent-blue); border-color: var(--accent-blue); }
+    .step-pill.active-diagnose { background: #261f3d; color: var(--accent-purple); border-color: var(--accent-purple); }
+    .step-pill.active-guardrail { background: #3d2f1f; color: var(--accent-amber); border-color: var(--accent-amber); }
+    .step-pill.active-morph { background: #3d1f2d; color: var(--accent-red); border-color: var(--accent-red); }
+    .step-pill.active-recovered { background: #1f3d26; color: var(--accent-green); border-color: var(--accent-green); }
+
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation Header -->
+  <header>
+    <div class="brand">
+      Razorpay AutoRecover
+      <span class="brand-badge">OpenCode Agentic Ops</span>
+    </div>
+
+    <!-- Live Financial KPI Header Chips -->
+    <div class="kpi-bar">
+      <div class="kpi-chip">Risk: <span id="kpi-risk">INR 0.00</span></div>
+      <div class="kpi-chip green">Recovered: <span id="kpi-recovered">INR 0.00</span></div>
+      <div class="kpi-chip blue">Yield: <span id="kpi-yield">0%</span></div>
+    </div>
+
+    <!-- Demo Simulation Triggers -->
+    <div class="demo-bar">
+      <button class="btn-sim" onclick="triggerScenario('degradation')">504 Degradation</button>
+      <button class="btn-sim" onclick="triggerScenario('card_expiry')">Expired Card</button>
+      <button class="btn-sim" onclick="triggerScenario('abandonment')">Cart Abandonment</button>
+      <button class="btn-sim" onclick="triggerScenario('voice_call')">Voice Call</button>
+      <button class="btn-sim primary" onclick="triggerScenario('batch')">Run 30-Case Batch</button>
+    </div>
+  </header>
+
+  <!-- Main Split-Screen Workspace -->
+  <div class="workspace">
+    
+    <!-- LEFT PANEL: OPENCODE AGENT EXECUTION STREAM -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">
+          Agent Execution & Reasoning Monologue
+        </span>
+        <span class="status-pill status-idle" id="status-pill">AGENT IDLE</span>
+      </div>
+      <div class="panel-body">
+        
+        <!-- Thought Stream Console -->
+        <div class="terminal-box" id="terminal-stream">
+          <div class="log-line"><span class="tag-kg">[SYSTEM]</span> Agentic HUD Initialized. Listening to Razorpay Webhooks & Session Heartbeats...</div>
+        </div>
+
+        <!-- OpenCode Tool Call Card -->
+        <div class="tool-card" id="tool-card" style="display:none;">
+          <div class="tool-title">
+            <span id="tool-name">RazorpaySDK.tool_call</span>
+            <span style="color:var(--text-muted); font-weight:normal;">JSON Payload</span>
+          </div>
+          <pre class="tool-code" id="tool-args">{}</pre>
+        </div>
+
+        <!-- Telemetry Radar Grid -->
+        <div class="telemetry-grid">
+          <div class="telemetry-card">
+            <div class="telemetry-title">NVIDIA NAT Guardrails</div>
+            <div class="telemetry-val" id="tele-guardrail">Quiet Hours OK | Attempt 1/3</div>
+          </div>
+          <div class="telemetry-card">
+            <div class="telemetry-title">Customer Memory Radar</div>
+            <div class="telemetry-val" id="tele-memory">Payday Liquidity High</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- RIGHT PANEL: LIVE CUSTOMER VIEW & REAL STORE CHECKOUT -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">
+          Live Customer View
+        </span>
+
+        <!-- OpenCode View Switcher -->
+        <div class="view-toggle-bar">
+          <button class="toggle-btn active" id="btn-view-canvas" onclick="switchRightPanelTab('canvas')">
+            Canvas View
+          </button>
+          <button class="toggle-btn" id="btn-view-store" onclick="switchRightPanelTab('store')">
+            Store Checkout (/pay)
+          </button>
+        </div>
+      </div>
+
+      <!-- Real Store View Mode (/pay embedded iframe) -->
+      <div id="store-view-mode" style="display:none; height:calc(100% - 40px); padding:8px; background:#0d1117;">
+        <iframe src="/pay" id="store-iframe" style="width:100%; height:100%; border:none; border-radius:4px; background:#ffffff;"></iframe>
+      </div>
+
+      <!-- Generative Canvas View Mode -->
+      <div class="panel-body canvas-container" id="canvas-view-mode">
+        
+        <!-- Business Scenario Context Bar -->
+        <div class="biz-context-bar" id="biz-context-bar">
+          <div>
+            <span id="biz-name" style="font-weight:600; color:var(--text-bright);">SaaS Subscription Platform</span>
+            <span style="font-size:0.7rem; color:var(--text-muted); margin-left:6px;">(Annual Pro Plan)</span>
+          </div>
+          <span class="biz-badge" id="biz-badge">Gateway 504 Degradation</span>
+        </div>
+
+        <!-- Enterprise Razorpay Recovery Canvas Card -->
+        <div class="shop-checkout" id="shop-checkout">
+          <!-- Razorpay Top Bar -->
+          <div class="rzp-top-bar">
+            <div class="rzp-brand">
+              <span style="color:#58a6ff; font-weight:800;">Razorpay</span> Standard Checkout v2
+            </div>
+            <div class="rzp-trust-badge">
+              API Verified
+            </div>
+          </div>
+
+          <!-- Order Summary Itemization -->
+          <div class="order-summary" id="order-summary">
+            <div class="order-row">
+              <span id="item-name">Pro Subscription Plan (Annual)</span>
+              <span id="item-subtotal">INR 4,999.00</span>
+            </div>
+            <div class="order-row">
+              <span>Razorpay Recovery Engine</span>
+              <span style="color:var(--accent-green); font-weight:600;">[ACTIVE]</span>
+            </div>
+            <div class="order-row total">
+              <span>Total Payable</span>
+              <span id="canvas-price" style="color:var(--accent-blue);">INR 4,999.00</span>
+            </div>
+          </div>
+
+          <!-- Virtual Credit Card Preview -->
+          <div class="virtual-card" id="virtual-card">
+            <div class="card-number" id="card-num-preview">•••• •••• •••• 4242</div>
+            <div class="card-footer">
+              <span>RAHUL KUMAR</span>
+              <span id="card-exp-preview">EXP: 08/29</span>
+            </div>
+          </div>
+
+          <!-- Morph Container -->
+          <div id="morph-container">
+            <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504 (HDFC Netbanking drop)')">
+              Pay INR 4,999.00 Now
+            </button>
+          </div>
+        </div>
+
+        <!-- Voice Call Player Widget -->
+        <div class="voice-widget" id="voice-widget">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-weight:600; color:var(--accent-purple); font-size:0.8rem;">Voice AI Call Active</span>
+            <span style="font-size:0.72rem; color:var(--accent-green);">[CONNECTED]</span>
+          </div>
+          <div style="font-size:0.78rem; color:var(--text-main); font-style:italic; background:#0d1117; padding:8px; border-radius:4px; margin-top:8px; border:1px solid #21262d;" id="voice-transcript">
+            "Namaste Rahul ji! Aapka Razorpay payment decline ho gaya hai. Tap karein to auto-retry..."
+          </div>
+          <button class="btn-voice-audio" onclick="speakHinglish('Namaste Rahul ji! Aapka Razorpay payment decline ho gaya hai. Tap karein to auto retry payment.')">
+            Replay Voice Agent Call
+          </button>
+        </div>
+
+        <!-- Live 5-Step Recovery Progress Tracker Bar -->
+        <div class="recovery-progress-bar" id="recovery-progress-bar">
+          <div class="progress-title">
+            <span>Intervention Pipeline</span>
+            <span style="color:var(--accent-blue);" id="progress-status-label">IDLE</span>
+          </div>
+          <div class="progress-steps">
+            <div class="step-pill" id="p-detect">1. DETECT</div>
+            <div class="step-pill" id="p-diagnose">2. DIAGNOSE</div>
+            <div class="step-pill" id="p-guardrail">3. GUARDRAIL</div>
+            <div class="step-pill" id="p-morph">4. MORPH</div>
+            <div class="step-pill" id="p-recovered">5. RECOVERED</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const socket = io();
+    const terminal = document.getElementById("terminal-stream");
+    const statusPill = document.getElementById("status-pill");
+    const toolCard = document.getElementById("tool-card");
+    const toolName = document.getElementById("tool-name");
+    const toolArgs = document.getElementById("tool-args");
+    const morphContainer = document.getElementById("morph-container");
+    const voiceWidget = document.getElementById("voice-widget");
+
+    let activePaymentId = "";
+
+    function switchRightPanelTab(mode) {
+      const btnCanvas = document.getElementById("btn-view-canvas");
+      const btnStore = document.getElementById("btn-view-store");
+      const canvasMode = document.getElementById("canvas-view-mode");
+      const storeMode = document.getElementById("store-view-mode");
+
+      if (mode === "canvas") {
+        btnCanvas.classList.add("active");
+        btnStore.classList.remove("active");
+        canvasMode.style.display = "flex";
+        storeMode.style.display = "none";
+      } else {
+        btnStore.classList.add("active");
+        btnCanvas.classList.remove("active");
+        storeMode.style.display = "block";
+        canvasMode.style.display = "none";
+        const iframe = document.getElementById("store-iframe");
+        if (iframe) iframe.src = "/pay";
+      }
+    }
+
+    function resetProgressPills() {
+      document.getElementById("p-detect").className = "step-pill";
+      document.getElementById("p-diagnose").className = "step-pill";
+      document.getElementById("p-guardrail").className = "step-pill";
+      document.getElementById("p-morph").className = "step-pill";
+      document.getElementById("p-recovered").className = "step-pill";
+    }
+
+    function updateScenarioContext(name) {
+      const bizName = document.getElementById("biz-name");
+      const bizBadge = document.getElementById("biz-badge");
+      const itemName = document.getElementById("item-name");
+      const itemSubtotal = document.getElementById("item-subtotal");
+      const canvasPrice = document.getElementById("canvas-price");
+
+      if (name === "degradation") {
+        bizName.textContent = "SaaS Subscription Platform";
+        bizBadge.textContent = "Gateway 504 Degradation";
+        itemName.textContent = "Pro Subscription Plan (Annual)";
+        canvasPrice.textContent = "INR 4,999.00";
+        if (itemSubtotal) itemSubtotal.textContent = "INR 4,999.00";
+      } else if (name === "card_expiry") {
+        bizName.textContent = "Recurring Auto-Debit Membership";
+        bizBadge.textContent = "Card Expiry Failure";
+        itemName.textContent = "Enterprise Cloud Infrastructure";
+        canvasPrice.textContent = "INR 12,999.00";
+        if (itemSubtotal) itemSubtotal.textContent = "INR 12,999.00";
+      } else if (name === "abandonment") {
+        bizName.textContent = "E-Commerce Magic Checkout";
+        bizBadge.textContent = "Cart Abandonment";
+        itemName.textContent = "Noise-Cancelling Headphones";
+        canvasPrice.textContent = "INR 2,999.00";
+        if (itemSubtotal) itemSubtotal.textContent = "INR 2,999.00";
+      } else if (name === "voice_call") {
+        bizName.textContent = "B2B Enterprise Invoice Gateway";
+        bizBadge.textContent = "High-Value Voice AI";
+        itemName.textContent = "Quarterly API Gateway License";
+        canvasPrice.textContent = "INR 8,500.00";
+        if (itemSubtotal) itemSubtotal.textContent = "INR 8,500.00";
+      } else if (name === "batch") {
+        bizName.textContent = "High-Volume Transaction Stream";
+        bizBadge.textContent = "30-Case Batch Evaluation";
+      }
+    }
+
+    function fetchMetrics() {
+      fetch("/api/payments")
+        .then(r => r.json())
+        .then(data => {
+          const payments = data.payments || [];
+          let risk = 0;
+          let recovered = 0;
+
+          payments.forEach(p => {
+            const amt = floatVal(p.amount);
+            risk += amt;
+            if (p.status === "recovered") {
+              recovered += amt;
+            }
+          });
+
+          document.getElementById("kpi-risk").textContent = "INR " + risk.toLocaleString('en-IN', { minimumFractionDigits: 2 });
+          document.getElementById("kpi-recovered").textContent = "INR " + recovered.toLocaleString('en-IN', { minimumFractionDigits: 2 });
+          const yieldPct = risk > 0 ? ((recovered / risk) * 100).toFixed(1) : "0.0";
+          document.getElementById("kpi-yield").textContent = yieldPct + "%";
+        });
+    }
+
+    function floatVal(val) {
+      const num = parseFloat(val);
+      return isNaN(num) ? 0 : num;
+    }
+
+    function setStatus(text, cls) {
+      statusPill.textContent = text;
+      statusPill.className = "status-pill " + cls;
+    }
+
+    function speakHinglish(text) {
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = 'hi-IN';
+        utterance.rate = 0.95;
+        window.speechSynthesis.speak(utterance);
+      }
+    }
+
+    fetchMetrics();
+
+    function formatDetail(detail) {
+      if (!detail) return "";
+      let clean = detail.replace(/↳/g, "").trim();
+      return `<br/><span style="color:#8b949e; font-size:0.75rem; white-space:pre-wrap;">${clean}</span>`;
+    }
+
+    function logThought(tag, tagCls, text, detail) {
+      const line = document.createElement("div");
+      line.className = "log-line";
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      line.innerHTML = `<span style="color:#484f58; font-size:0.72rem; margin-right:6px;">[${ts}]</span><span class="${tagCls}">[${tag}]</span> <strong style="color:#f0f6fc;">${text}</strong> ${formatDetail(detail)}`;
+      terminal.appendChild(line);
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    function submitCardExpiryFix(event, pid) {
+      if (event) event.preventDefault();
+      const val = document.getElementById("expiry-input")?.value || "08/29";
+      fetch("/api/customer-responded", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ payment_id: pid || activePaymentId, updated_expiry: val })
+      })
+      .then(r => r.json())
+      .then(data => {
+        morphContainer.innerHTML = `
+          <div style="background:#f0fdf4; color:#166534; border:1px solid #bbf7d0; padding:12px; border-radius:4px; margin-top:12px; text-align:center; font-weight:600;">
+            Card Expiry (${val}) Updated & Payment Captured (Razorpay API Verified)
+          </div>`;
+        document.getElementById("p-recovered").className = "step-pill active-recovered";
+        document.getElementById("progress-status-label").textContent = "RECOVERED";
+        fetchMetrics();
+      });
+    }
+
+    function startPaymentFromCanvas(scenarioReason) {
+      const paymentId = "pay_sim_" + Math.floor(1000 + Math.random() * 9000);
+      const amount = 4999.0;
+      activePaymentId = paymentId;
+      
+      resetProgressPills();
+      document.getElementById("progress-status-label").textContent = "CREATING RAZORPAY ORDER...";
+      logThought("CHECKOUT", "tag-thinking", `Initiating Razorpay Checkout for ${paymentId}...`, `Amount: INR ${amount.toFixed(2)}`);
+
+      fetch("/api/create-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: amount, payment_id: paymentId })
+      })
+      .then(r => r.json())
+      .then(data => {
+        logThought("ORDER", "tag-kg", `Razorpay Order Created: ${data.order_id}`, `Paise: ${data.amount} | Currency: ${data.currency} | Key: ${data.key_id || 'rzp_test_demo'}`);
+        document.getElementById("progress-status-label").textContent = "PROCESSING PAYMENT...";
+        
+        setTimeout(() => {
+          logThought("GATEWAY", "tag-acting", `Razorpay Gateway Failure Event Fired!`, `Reason: ${scenarioReason || 'Gateway Timeout 504 (HDFC Netbanking drop)'}`);
+          fetch("/api/payment-failed", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              payment_id: paymentId,
+              amount: amount,
+              failure_reason: scenarioReason || "Gateway Timeout 504 (HDFC Netbanking drop)",
+              customer: { name: "Rahul Kumar", email: "rahul@example.com" }
+            })
+          });
+        }, 800);
+      });
+    }
+
+    function triggerScenario(name) {
+      voiceWidget.classList.remove("active");
+      resetProgressPills();
+      updateScenarioContext(name);
+      document.getElementById("progress-status-label").textContent = "SIMULATING...";
+      fetch("/api/simulate/" + name, { method: "POST" })
+        .then(r => r.json())
+        .then(data => {
+          if (data.payment_id) activePaymentId = data.payment_id;
+          if (data.status === "batch_completed") {
+            logThought("BATCH", "tag-kg", "Batch Evaluation Complete!", data.summary);
+            fetchMetrics();
+          }
+        });
+    }
+
+    socket.on("agent_stream", function(data) {
+      if (data.payment_id) activePaymentId = data.payment_id;
+
+      // 1. Log streaming thoughts & update live progress pills
+      if (data.step === "detecting") {
+        setStatus("THINKING...", "status-thinking");
+        logThought("DETECT", "tag-thinking", data.msg, data.detail);
+        document.getElementById("p-detect").className = "step-pill active-detect";
+        document.getElementById("progress-status-label").textContent = "DETECTING ANOMALY";
+      } else if (data.step === "diagnosing") {
+        setStatus("DIAGNOSING...", "status-thinking");
+        logThought("DIAGNOSE", "tag-diagnosing", data.msg, data.detail);
+        document.getElementById("p-diagnose").className = "step-pill active-diagnose";
+        document.getElementById("progress-status-label").textContent = "LLM DIAGNOSIS";
+      } else if (data.step === "diagnosed") {
+        logThought("ROOT CAUSE", "tag-kg", data.msg, data.detail);
+      } else if (data.step === "deciding") {
+        setStatus("CHECKING GUARDRAILS", "status-executing");
+        logThought("GUARDRAIL", "tag-guardrail", data.msg, data.detail);
+        document.getElementById("p-guardrail").className = "step-pill active-guardrail";
+        document.getElementById("progress-status-label").textContent = "GUARDRAIL CHECK";
+      } else if (data.step === "acting") {
+        setStatus("EXECUTING TOOL", "status-executing");
+        logThought("ACTION", "tag-acting", data.msg, data.detail);
+        document.getElementById("p-morph").className = "step-pill active-morph";
+        document.getElementById("progress-status-label").textContent = "GENUI MORPHING";
+      } else if (data.step === "stopping") {
+        setStatus("RECOVERED!", "status-recovered");
+        logThought("SUCCESS", "tag-kg", data.msg, data.detail);
+        document.getElementById("p-recovered").className = "step-pill active-recovered";
+        document.getElementById("progress-status-label").textContent = "RECOVERED";
+        fetchMetrics();
+      }
+
+      // 2. Render Tool Call Cards
+      if (data.tool_call) {
+        toolCard.style.display = "block";
+        toolName.textContent = data.tool_call.tool || "RazorpayTool";
+        toolArgs.textContent = JSON.stringify(data.tool_call, null, 2);
+      }
+
+      // 3. Generative UI Morphing
+      const uiType = data.ui_morph || (data.ui_spec ? data.ui_spec.ui_type : null);
+      if (uiType) {
+        const spec = data.ui_spec || {};
+        const headline = spec.headline || "Razorpay Smart Intervention Active";
+        const subtext = spec.subtext || "Auto-detected failure pattern. Switching recovery rail.";
+        const cta = spec.primary_cta || "Complete Payment";
+        const discount = spec.discount_incentive ? `<div style="font-size:0.75rem; color:#166534; margin-top:4px;">Incentive: ${spec.discount_incentive}</div>` : "";
+
+        if (uiType === "SMART_FAILOVER_BANNER" || uiType === "PAYMENT_LINK_MODAL") {
+          morphContainer.innerHTML = `
+            <div class="gen-morph-box morph-failover">
+              <strong style="color:var(--accent-blue);">${headline}</strong><br/>
+              <span style="font-size:0.78rem; color:var(--text-muted);">${subtext}</span>
+              ${discount}
+              <button style="margin-top:8px; width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:8px; border-radius:4px; font-weight:600; font-family:var(--font-mono); cursor:pointer;" onclick="triggerScenario('degradation')">
+                ${cta}
+              </button>
+            </div>`;
+        } else if (uiType === "CARD_EXPIRY_FIXER") {
+          morphContainer.innerHTML = `
+            <form onsubmit="submitCardExpiryFix(event, '${data.payment_id || activePaymentId}')" class="gen-morph-box morph-expiry">
+              <strong style="color:var(--accent-amber);">${headline}</strong><br/>
+              <span style="font-size:0.78rem; color:var(--text-muted);">${subtext}</span>
+              ${discount}
+              <input type="text" id="expiry-input" placeholder="MM/YY" style="width:100%; margin-top:8px; padding:8px; border-radius:4px; border:1px solid var(--accent-amber); background:#0d1117; color:var(--text-bright); font-family:var(--font-mono);" value="08/29"/>
+              <button type="submit" style="margin-top:8px; width:100%; background:#d29922; color:#0d1117; border:none; padding:8px; border-radius:4px; font-weight:600; font-family:var(--font-mono); cursor:pointer;">
+                ${cta}
+              </button>
+            </form>`;
+        } else if (uiType === "ABANDONMENT_WHATSAPP_OVERLAY") {
+          morphContainer.innerHTML = `
+            <div class="gen-morph-box morph-whatsapp">
+              <strong style="color:var(--accent-green);">${headline}</strong><br/>
+              <span style="font-size:0.78rem; color:var(--text-muted);">${subtext}</span>
+              <div class="wa-bubble">
+                <strong style="color:var(--accent-green);">WhatsApp Magic Link (+91 98765 43210):</strong><br/>
+                "Hi Rahul! We saved your cart. Complete purchase in 5 mins for instant cashback."
+                <button style="margin-top:8px; width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:8px; border-radius:4px; font-weight:600; font-family:var(--font-mono); cursor:pointer;" onclick="triggerScenario('abandonment')">
+                  Complete Purchase via Magic Link
+                </button>
+              </div>
+              ${discount}
+            </div>`;
+        } else if (uiType === "HINGLISH_VOICE_CALL") {
+          voiceWidget.classList.add("active");
+          const vScript = spec.hinglish_voice_script || "Namaste Rahul ji! Aapka Razorpay payment decline ho gaya hai. Tap karein to auto retry payment.";
+          document.getElementById("voice-transcript").textContent = `"${vScript}"`;
+          speakHinglish(vScript);
+        } else if (uiType === "RECOVERY_SUCCESS") {
+          morphContainer.innerHTML = `
+            <div style="background:rgba(46,160,67,0.12); color:var(--accent-green); border:1px solid var(--accent-green); padding:12px; border-radius:4px; margin-top:12px; text-align:center; font-weight:600; font-family:var(--font-mono);">
+              Revenue Recovered & Payment Captured (Razorpay API Verified)
+            </div>`;
+          document.getElementById("p-recovered").className = "step-pill active-recovered";
+          document.getElementById("progress-status-label").textContent = "RECOVERED";
+          fetchMetrics();
+        }
+      }
+    });
+  </script>
+</body>
+</html>
