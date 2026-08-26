@@ -1,17 +1,17 @@
-"""Diagnosis engine — classifies payment failure root causes.
+"""Diagnosis engine — real-time LLM diagnostic reflection.
 
-Uses LLM (via OmniRoute local API) for nuanced classification,
-with Razorpay error mapping and rule-based fallback.
+Uses LLM (Nemotron via OmniRoute) as the PRIMARY diagnosis method.
+The LLM performs structured reflection over raw payment failure payloads,
+customer history, and bank health signals to classify root causes.
+
+Cascade: Razorpay API data → LLM reflection → UNKNOWN fallback
 
 Source: Reflection pattern from Agentic AI (Andrew Ng), Module 2
         Router decomposition from Evaluating AI Agents
 """
 from __future__ import annotations
 
-import os
-from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
-
+from recovery_agent.agent.llm_client import invoke_llm_json
 from recovery_agent.models import (
     Case,
     CaseStatus,
@@ -20,13 +20,15 @@ from recovery_agent.models import (
 )
 from recovery_agent.razorpay_client import RazorpayClient, diagnose_from_razorpay_error
 
-# Mapping of Razorpay failure codes to our failure types
+# Quick-check mapping for Razorpay API error codes (Layer 1)
 FAILURE_CODE_MAP: dict[str, FailureType] = {
     "card_expired": FailureType.CARD_EXPIRED,
     "insufficient_funds": FailureType.INSUFFICIENT_FUNDS,
     "do_not_honor": FailureType.BANK_DECLINED,
     "generic_decline": FailureType.BANK_DECLINED,
     "network_error": FailureType.NETWORK_TIMEOUT,
+    "network_timeout": FailureType.NETWORK_TIMEOUT,
+    "gateway_timeout": FailureType.NETWORK_TIMEOUT,
     "timeout": FailureType.NETWORK_TIMEOUT,
     "risk_check_failed": FailureType.RISK_BLOCK,
     "fraud_suspected": FailureType.RISK_BLOCK,
@@ -34,120 +36,144 @@ FAILURE_CODE_MAP: dict[str, FailureType] = {
     "mandate_revoked": FailureType.MANDATE_REVOKED,
 }
 
-# Keywords in failure reasons that hint at root cause
-REASON_KEYWORDS: dict[str, FailureType] = {
-    "expired": FailureType.CARD_EXPIRED,
-    "expir": FailureType.CARD_EXPIRED,
-    "insufficient": FailureType.INSUFFICIENT_FUNDS,
-    "not enough": FailureType.INSUFFICIENT_FUNDS,
-    "balance": FailureType.INSUFFICIENT_FUNDS,
-    "declined": FailureType.BANK_DECLINED,
-    "rejected": FailureType.BANK_DECLINED,
-    "blocked": FailureType.RISK_BLOCK,
-    "fraud": FailureType.RISK_BLOCK,
-    "risk": FailureType.RISK_BLOCK,
-    "timeout": FailureType.NETWORK_TIMEOUT,
-    "network": FailureType.NETWORK_TIMEOUT,
-    "connection": FailureType.NETWORK_TIMEOUT,
-    "mandate": FailureType.MANDATE_REVOKED,
-    "revoked": FailureType.MANDATE_REVOKED,
-    "cancelled": FailureType.MANDATE_REVOKED,
-}
+DIAGNOSIS_SYSTEM_PROMPT = """You are an expert payment failure diagnostician for Razorpay.
+
+Your task: Analyze a raw payment failure payload and classify the root cause.
+You MUST reason step-by-step through the evidence before concluding:
+- Step 1 — Failure code & raw error message analysis
+- Step 2 — Error step (initiation, authentication, authorization) & error source (customer, bank, gateway, risk)
+- Step 3 — Contextual signals (transaction amount, customer history, bank health)
+- Step 4 — Final confidence assessment & root cause classification
+
+Available failure categories:
+- card_expired: Card on file has expired (expiry date in the past)
+- insufficient_funds: Customer's account lacks sufficient balance
+- bank_declined: Bank rejected the transaction (limit, security, intl block)
+- network_timeout: Gateway timeout, connection drop, HTTP 5xx, 3DS OTP timeout
+- risk_block: Fraud/risk system blocked the payment
+- mandate_revoked: UPI autopay mandate was cancelled or expired
+- unknown: Insufficient evidence to classify
+
+CRITICAL: Start your response immediately with the character { . Do NOT output any preamble or markdown explanation before the JSON object.
+
+You must output EXACTLY this JSON format:
+{
+  "root_cause": "<one of the 7 categories above>",
+  "confidence": <0.70 to 0.98>,
+  "reasoning": "Step 1 — Failure code analysis: ... Step 2 — Failure reason analysis: ... Step 3 — Contextual signal analysis: ... Step 4 — Confidence assessment: ..."
+}"""
 
 
-def diagnose_payment_failure(case: Case) -> Diagnosis:
-    """Classify the root cause of a payment failure.
+def _build_diagnosis_prompt(case: Case) -> str:
+    """Build the diagnostic prompt from raw payment failure data."""
+    payment = case.payment
+    attempt_history = ""
+    if case.attempts:
+        attempt_history = f"\nPrevious attempt history ({len(case.attempts)} attempts):\n"
+        for i, a in enumerate(case.attempts[-3:], 1):
+            attempt_history += (
+                f"  {i}. Action: {a.action_type.value}, "
+                f"Result: {a.result}, "
+                f"Detail: {a.action_details.get('detail', 'none')}\n"
+            )
 
-    Uses failure code first, then keyword matching on reason text.
-    Falls back to UNKNOWN if nothing matches.
+    customer_context = ""
+    if case.payment.metadata.get("customer_name"):
+        customer_context += f"\nCustomer: {payment.metadata['customer_name']}"
+    if payment.metadata.get("salary_window"):
+        customer_context += f"\nSalary window active: {payment.metadata['salary_window']}"
+    if payment.metadata.get("promise_to_pay"):
+        customer_context += f"\nPromise-to-pay: {payment.metadata['promise_to_pay']}"
+    if payment.metadata.get("bank_health"):
+        customer_context += f"\nBank health signal: {payment.metadata['bank_health']}"
+
+    code_str = payment.failure_code or payment.metadata.get('error_code') or 'unmapped_code'
+    reason_str = payment.failure_reason or payment.metadata.get('error_description') or 'unmapped_reason'
+
+    return f"""Diagnose this payment failure using raw diagnostic signals:
+
+FAILURE PAYMENT DATA:
+  Payment ID: {payment.payment_id}
+  Customer ID: {payment.customer_id}
+  Amount: INR {payment.amount:,.2f}
+  Failure Reason: {reason_str}
+  Failure Code: {code_str}
+  Error Source: {payment.metadata.get('error_source', 'unknown')}
+  Error Step: {payment.metadata.get('error_step', 'unknown')}
+  Error Description: {payment.metadata.get('error_description', reason_str)}
+  Currency: {payment.currency}
+{attempt_history}{customer_context}
+
+Analyze the raw failure payload above. Reason step-by-step:
+1. Step 1 — Failure Code Analysis: What failure code or error string is provided?
+2. Step 2 — Failure Reason Analysis: What exact issue does the text describe?
+3. Step 3 — Contextual Signal Analysis: What do amount, customer, and gateway details imply?
+4. Step 4 — Confidence Assessment: Conclude the root cause category and confidence score.
+
+Output your diagnosis strictly as JSON:"""
+
+
+def diagnose_with_llm(case: Case) -> Diagnosis | None:
+    """Use LLM reflection to diagnose the root cause of a payment failure.
+
+    This is the PRIMARY diagnosis method — not a fallback.
+    The LLM reasons step-by-step over raw failure payload, customer history,
+    and bank health signals.
 
     Source: Router decomposition pattern from Evaluating AI Agents
     https://www.deeplearning.ai/courses/evaluating-ai-agents
     """
-    payment = case.payment
-    root_cause = FailureType.UNKNOWN
-    confidence = 0.3
-    reasoning_parts = []
-
-    # Try failure code mapping first (highest confidence)
-    if payment.failure_code:
-        mapped = FAILURE_CODE_MAP.get(payment.failure_code.lower())
-        if mapped:
-            root_cause = mapped
-            confidence = 0.9
-            reasoning_parts.append(
-                f"Failure code '{payment.failure_code}' maps to {mapped.value}"
-            )
-
-    # Try keyword matching on failure reason
-    if root_cause == FailureType.UNKNOWN and payment.failure_reason:
-        reason_lower = payment.failure_reason.lower()
-        for keyword, cause in REASON_KEYWORDS.items():
-            if keyword in reason_lower:
-                root_cause = cause
-                confidence = 0.7
-                reasoning_parts.append(
-                    f"Keyword '{keyword}' in reason '{payment.failure_reason}' -> {cause.value}"
-                )
-                break
-
-    # If still unknown, check if amount gives hints
-    if root_cause == FailureType.UNKNOWN:
-        if payment.amount > 100000:  # > 1 lakh
-            root_cause = FailureType.RISK_BLOCK
-            confidence = 0.4
-            reasoning_parts.append(f"High amount ({payment.amount}) suggests risk block")
-        else:
-            reasoning_parts.append("No clear signal from failure code or reason text")
-
-    category = f"payment_failure_{root_cause.value}"
-    reasoning = "; ".join(reasoning_parts) if reasoning_parts else "Classified by default"
-
-    return Diagnosis(
-        root_cause=root_cause,
-        confidence=confidence,
-        reasoning=reasoning,
-        category=category,
+    prompt = _build_diagnosis_prompt(case)
+    result = invoke_llm_json(
+        prompt=prompt,
+        system=DIAGNOSIS_SYSTEM_PROMPT,
+        temperature=0,
+        max_tokens=1024,
     )
 
+    if result is None:
+        return None
 
-def run_diagnosis(case: Case) -> Case:
-    """Run diagnosis on a case and update its state.
+    # Parse root cause
+    cause_str = result.get("root_cause", "unknown").lower().strip()
+    cause_map = {
+        "card_expired": FailureType.CARD_EXPIRED,
+        "insufficient_funds": FailureType.INSUFFICIENT_FUNDS,
+        "bank_declined": FailureType.BANK_DECLINED,
+        "network_timeout": FailureType.NETWORK_TIMEOUT,
+        "risk_block": FailureType.RISK_BLOCK,
+        "mandate_revoked": FailureType.MANDATE_REVOKED,
+        "unknown": FailureType.UNKNOWN,
+    }
+    cause = cause_map.get(cause_str, FailureType.UNKNOWN)
 
-    Tries: Razorpay error mapping -> LLM -> rule-based fallback
+    # Parse confidence
+    confidence = float(result.get("confidence", 0.7))
+    confidence = max(0.0, min(1.0, confidence))
 
-    Source: Reflection pattern — agent reviews before acting
-    https://www.deeplearning.ai/courses/agentic-ai (Module 2)
-    """
-    case.status = CaseStatus.DIAGNOSING
+    # Extract reasoning
+    reasoning = result.get("reasoning", "LLM diagnostic reflection")
+    if isinstance(reasoning, list):
+        reasoning = " ".join(str(r) for r in reasoning)
 
-    # Try Razorpay error mapping first (highest confidence for real API data)
-    rp_diagnosis = diagnose_from_razorpay(case)
-    if rp_diagnosis:
-        case.diagnosis = rp_diagnosis
-        return case
-
-    # Try LLM diagnosis
-    llm_diagnosis = diagnose_with_llm(case)
-    if llm_diagnosis:
-        case.diagnosis = llm_diagnosis
-    else:
-        # Fallback to rule-based
-        case.diagnosis = diagnose_payment_failure(case)
-
-    return case
+    return Diagnosis(
+        root_cause=cause,
+        confidence=confidence,
+        reasoning=reasoning,
+        category=f"payment_failure_{cause.value}",
+    )
 
 
 def diagnose_from_razorpay(case: Case) -> Diagnosis | None:
     """Diagnose using Razorpay payment error data if available.
 
+    Highest confidence — real API data.
+
     Source: Razorpay error structure
     https://razorpay.com/docs/errors/payments/list/
     """
-    # Check if we have Razorpay error data in payment metadata
     rp_error = case.payment.metadata.get("razorpay_error")
     if not rp_error:
-        # If payment has a Razorpay payment_id, try fetching from API
         rp_payment_id = case.payment.metadata.get("razorpay_payment_id")
         if rp_payment_id:
             client = RazorpayClient()
@@ -163,67 +189,84 @@ def diagnose_from_razorpay(case: Case) -> Diagnosis | None:
 
     return Diagnosis(
         root_cause=cause,
-        confidence=0.95,  # High confidence for real API data
+        confidence=0.95,
         reasoning=reasoning,
         category=f"payment_failure_{cause.value}",
     )
 
 
-def diagnose_with_llm(case: Case) -> Diagnosis | None:
-    """Use LLM to diagnose the root cause of a payment failure.
+def diagnose_payment_failure(case: Case) -> Diagnosis:
+    """Rule-based fallback diagnosis — used only when LLM is unavailable.
 
-    Source: Router decomposition pattern from Evaluating AI Agents
-    https://www.deeplearning.ai/courses/evaluating-ai-agents
+    Preserves the original logic as a safety net.
     """
-    # Check if LLM is configured
-    base_url = os.getenv("LLM_BASE_URL", "http://localhost:20128/v1")
-    model = os.getenv("LLM_MODEL", "oc/nemotron-3-ultra-free")
-    api_key = os.getenv("LLM_API_KEY", "dummy")
+    payment = case.payment
+    root_cause = FailureType.UNKNOWN
+    confidence = 0.3
+    reasoning_parts = []
 
-    try:
-        llm = ChatOpenAI(
-            base_url=base_url,
-            model=model,
-            api_key=api_key,
-            temperature=0,
-            max_tokens=100,
-        )
+    # Try failure code mapping
+    if payment.failure_code:
+        mapped = FAILURE_CODE_MAP.get(payment.failure_code.lower())
+        if mapped:
+            root_cause = mapped
+            confidence = 0.9
+            reasoning_parts.append(
+                f"Failure code '{payment.failure_code}' maps to {mapped.value}"
+            )
 
-        prompt = f"""Classify this payment failure as exactly one word from this list: card_expired, insufficient_funds, bank_declined, network_timeout, risk_block, mandate_revoked, unknown.
-Failure: {case.payment.failure_reason}
-Answer:"""
+    # Razorpay Knowledge Base normalizer fallback
+    if root_cause == FailureType.UNKNOWN:
+        from recovery_agent.razorpay_knowledge_base import normalize_razorpay_failure
+        raw_signal = f"{payment.failure_code or ''} {payment.failure_reason or ''} {payment.metadata.get('error_description', '')}"
+        norm = normalize_razorpay_failure(raw_signal)
+        root_cause = norm["failure_type"]
+        confidence = 0.90
+        reasoning_parts.append(f"Razorpay Official Error Catalog matched '{norm['error_code']}' -> {root_cause.value}")
 
-        response = llm.invoke([HumanMessage(content=prompt)])
-        content = response.content.strip().lower()
+    if root_cause == FailureType.UNKNOWN:
+        if payment.amount > 100000:
+            root_cause = FailureType.RISK_BLOCK
+            confidence = 0.4
+            reasoning_parts.append(f"High amount ({payment.amount}) suggests risk block")
+        else:
+            reasoning_parts.append("No clear signal — classified as unknown")
 
-        # Map response to FailureType
-        cause_map = {
-            "card_expired": FailureType.CARD_EXPIRED,
-            "insufficient_funds": FailureType.INSUFFICIENT_FUNDS,
-            "bank_declined": FailureType.BANK_DECLINED,
-            "network_timeout": FailureType.NETWORK_TIMEOUT,
-            "risk_block": FailureType.RISK_BLOCK,
-            "mandate_revoked": FailureType.MANDATE_REVOKED,
-            "unknown": FailureType.UNKNOWN,
-        }
+    reasoning = "; ".join(reasoning_parts) if reasoning_parts else "Rule-based fallback"
 
-        # Extract the first word that matches a category
-        words = content.split()
-        cause = FailureType.UNKNOWN
-        for word in words:
-            word = word.strip(".,;:!?\"'`")
-            if word in cause_map:
-                cause = cause_map[word]
-                break
-        confidence = 0.85 if cause != FailureType.UNKNOWN else 0.4
+    return Diagnosis(
+        root_cause=root_cause,
+        confidence=confidence,
+        reasoning=reasoning,
+        category=f"payment_failure_{root_cause.value}",
+    )
 
-        return Diagnosis(
-            root_cause=cause,
-            confidence=confidence,
-            reasoning=f"LLM classified as {cause.value}",
-            category=f"payment_failure_{cause.value}",
-        )
 
-    except Exception:
-        # LLM unavailable — fall back to rules
-        return None
+def run_diagnosis(case: Case) -> Case:
+    """Run diagnosis on a case — LLM Diagnostic Reflection is Layer 1.
+
+    Cascade:
+      Layer 1: LLM diagnostic reflection (PRIMARY intelligence — reasons step-by-step over raw payload)
+      Layer 2: Razorpay API error data
+      Layer 3: Rule-based fallback (safety net when LLM unavailable)
+    """
+    case.status = CaseStatus.DIAGNOSING
+
+    # Layer 1: LLM diagnostic reflection (PRIMARY METHOD — ALWAYS RUN FIRST)
+    llm_diagnosis = diagnose_with_llm(case)
+    if llm_diagnosis and llm_diagnosis.root_cause != FailureType.UNKNOWN:
+        case.diagnosis = llm_diagnosis
+        return case
+
+    # Layer 2: Razorpay API error data
+    rp_diagnosis = diagnose_from_razorpay(case)
+    if rp_diagnosis:
+        case.diagnosis = rp_diagnosis
+        return case
+
+    # Layer 3: Safety net fallback
+    if llm_diagnosis:
+        case.diagnosis = llm_diagnosis
+    else:
+        case.diagnosis = diagnose_payment_failure(case)
+    return case

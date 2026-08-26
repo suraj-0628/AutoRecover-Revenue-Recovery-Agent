@@ -1,4 +1,8 @@
-"""Decision layer — maps root cause to intervention strategy.
+"""Decision layer — LLM strategy planner for intervention selection.
+
+Replaces static cause × attempt matrices with active LLM reasoning.
+The LLM analyzes diagnosis, customer memory, guardrail constraints,
+and knowledge graph rails to dynamically select the optimal intervention.
 
 Source: Planning pattern from Agentic AI (Andrew Ng), Module 5
         Tool selection from Evaluating AI Agents
@@ -8,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
+from recovery_agent.agent.llm_client import invoke_llm_json
 from recovery_agent.agent.memory import CustomerMemoryStore
 from recovery_agent.models import (
     ActionType,
@@ -30,21 +35,256 @@ def _get_kg_router() -> RazorpayKnowledgeGraph:
     return _kg_router
 
 
+STRATEGY_SYSTEM_PROMPT = """You are a Razorpay revenue recovery strategy planner.
+
+Your task: Select the optimal intervention action for a failed payment.
+You MUST reason about what each action ACTUALLY DOES before choosing.
+
+═══ ACTION SEMANTICS (what each tool does mechanically) ═══
+
+retry_payment
+  WHAT IT DOES: Re-charges the SAME card/payment method immediately via Razorpay API.
+  WHEN TO USE: Only when the failure is TRANSIENT — the same method could succeed on retry.
+  GOOD FOR: network_timeout (gateway glitch), bank_declined (temporary bank hiccup), insufficient_funds (funds may have arrived).
+  BAD FOR: card_expired (same expired card will fail again!), mandate_revoked (same revoked mandate will fail again!).
+
+send_notification
+  WHAT IT DOES: Sends an email/SMS/WhatsApp message to the customer explaining the failure and asking them to act.
+  WHEN TO USE: When the customer needs to DO something — update card, re-authorize mandate, try a different method.
+  GOOD FOR: card_expired (ask to update card), mandate_revoked (ask to re-authorize), first attempt on any failure.
+  BAD FOR: network_timeout (no customer action needed — just retry).
+
+update_payment_method
+  WHAT IT DOES: Opens a Razorpay checkout modal pre-configured for the customer to enter a NEW card or switch to UPI/netbanking.
+  WHEN TO USE: When the current payment method is BROKEN and cannot work — expired card, blocked card, revoked mandate.
+  GOOD FOR: card_expired (must update card), mandate_revoked (must re-authorize via new method).
+  BAD FOR: network_timeout (current method is fine — just retry), insufficient_funds (method is fine — funds are the issue).
+
+wait_and_retry
+  WHAT IT DOES: Pauses for a configurable delay, then retries the SAME payment method.
+  WHEN TO USE: When the failure is TEMPORARY and conditions will improve with time.
+  GOOD FOR: insufficient_funds (salary may arrive), bank_declined (bank block may lift), network_timeout (gateway may recover).
+  BAD FOR: card_expired (card won't un-expire by waiting!), mandate_revoked (mandate won't re-authorize by waiting!).
+
+escalate_to_human
+  WHAT IT DOES: Transfers the case to a human support agent for manual intervention.
+  WHEN TO USE: When automated recovery has failed or the case requires human judgment.
+  GOOD FOR: risk_block (fraud review needed), high-value cases after multiple failed attempts.
+  BAD FOR: simple failures that automation can handle.
+
+abandon
+  WHAT IT DOES: Stops all recovery attempts. Customer is not contacted again.
+  WHEN TO USE: Only as absolute last resort — customer opted out, all methods exhausted, or recovery cost exceeds revenue value.
+
+═══ FAILURE → ACTION MAPPING (reason about WHY) ═══
+
+CARD_EXPIRED: The card itself is the problem. Retrying the same card WILL fail again.
+  → First try: send_notification (inform customer, ask to update)
+  → Or directly: update_payment_method (let them fix it now)
+  → NEVER: retry_payment or wait_and_retry (pointless — card is expired)
+
+INSUFFICIENT_FUNDS: The payment method is fine, but the account lacks balance.
+  → First try: wait_and_retry (funds may arrive — especially if salary-dependent)
+  → Then: send_notification (remind customer to add funds)
+  → Then: retry_payment (try once funds should be there)
+  → NEVER: update_payment_method (method is fine — money is the issue)
+
+BANK_DECLINED: Bank rejected, possibly transient.
+  → First try: retry_payment (may be a temporary bank hold)
+  → Then: send_notification (ask customer to check with bank or try different method)
+  → Then: update_payment_method (switch to a working method)
+
+NETWORK_TIMEOUT: Gateway glitch, nothing wrong with the payment method.
+  → First try: retry_payment (transient — retry immediately)
+  → Then: wait_and_retry (if still failing, wait and try again)
+  → NEVER: update_payment_method (method is fine — network was the issue)
+
+MANDATE_REVOKED: UPI autopay mandate cancelled by customer.
+  → First try: send_notification (ask to re-authorize mandate)
+  → Then: update_payment_method (switch to manual payment)
+  → NEVER: retry_payment or wait_and_retry (revoked mandate won't work)
+
+RISK_BLOCK: Fraud/risk system flagged the payment.
+  → escalate_to_human (requires human fraud review)
+
+You must output EXACTLY this JSON format:
+{
+  "decided_action": "<one of the 6 action names>",
+  "intervention_reasoning": "<step-by-step reasoning explaining WHY this specific action was chosen for this specific failure type, referencing what the action actually does>"
+}"""
+
+
+def _build_strategy_prompt(
+    case: Case,
+    profile: CustomerProfile | None,
+    available_rails: list[str],
+    optimal_channel: str,
+) -> str:
+    """Build the strategy planning prompt."""
+    diagnosis = case.diagnosis
+    payment = case.payment
+
+    diagnosis_context = "No diagnosis available."
+    if diagnosis:
+        diagnosis_context = (
+            f"Root Cause: {diagnosis.root_cause.value}\n"
+            f"Confidence: {diagnosis.confidence:.0%}\n"
+            f"Diagnostic Reasoning: {diagnosis.reasoning}"
+        )
+
+    memory_context = "No customer profile available."
+    if profile:
+        salary_info = "unknown"
+        if profile.salary_window.typical_pay_day > 0:
+            current_day = datetime.now().day
+            in_window = abs(current_day - profile.salary_window.typical_pay_day) <= 2
+            salary_info = (
+                f"pay day={profile.salary_window.typical_pay_day}, "
+                f"currently {'IN' if in_window else 'OUTSIDE'} liquidity window"
+            )
+
+        promise_info = "none"
+        if profile.promises:
+            unfulfilled = [p for p in profile.promises if not p.fulfilled]
+            if unfulfilled:
+                promise_info = f"{len(unfulfilled)} unfulfilled (latest: {unfulfilled[-1].promised_date})"
+
+        channel_info = "none"
+        if profile.channel_success_rates:
+            best = max(profile.channel_success_rates, key=profile.channel_success_rates.get)
+            channel_info = f"best={best} ({profile.channel_success_rates[best]:.0%} success)"
+
+        memory_context = (
+            f"Total attempts: {profile.total_attempts}\n"
+            f"Total recovered: INR {profile.total_recovered:,.2f}\n"
+            f"Salary window: {salary_info}\n"
+            f"Promise-to-pay: {promise_info}\n"
+            f"Channel performance: {channel_info}\n"
+            f"Preferred channel: {optimal_channel or 'sms'}\n"
+            f"Opted out: {'yes' if profile.opt_out else 'no'}"
+        )
+
+    rails_context = "No rails discovered."
+    if available_rails:
+        rails_context = f"Available recovery rails: {', '.join(available_rails)}"
+
+    attempt_context = (
+        f"Current attempt: {case.attempt_count + 1} of {case.max_attempts}"
+    )
+
+    return f"""Select the optimal recovery intervention:
+
+FAILURE DATA:
+  Payment ID: {payment.payment_id}
+  Amount: INR {payment.amount:,.2f}
+  Failure Code: {payment.failure_code or 'not provided'}
+  Failure Reason: {payment.failure_reason or 'not provided'}
+
+DIAGNOSIS:
+{diagnosis_context}
+
+CUSTOMER MEMORY:
+{memory_context}
+
+RECOVERY RAILS:
+{rails_context}
+
+{attempt_context}
+
+GUARDRAIL CONSTRAINTS:
+  - Quiet hours (9 PM - 8 AM): Communication actions deferred
+  - Frequency cap: Max 2 communications per 24h
+  - Double-debit lock: No retry if payment already succeeded or pending
+  - Monetary cap: Auto-retry blocked above INR 500,000
+  - Opt-out: No messages if customer opted out
+
+BEFORE CHOOSING, ANSWER THESE QUESTIONS:
+1. What is physically wrong with the payment? (expired card? no money? bank said no? network glitch?)
+2. Can waiting fix this? (ONLY if the problem is temporary — funds arriving, bank block lifting)
+3. Can retrying the SAME method fix this? (ONLY if the failure was transient — network glitch, temporary bank decline)
+4. Does the customer need to DO something? (update card, re-authorize mandate, add funds)
+5. Is this action appropriate for THIS failure type? (See the action semantics in your system prompt)
+
+Output your strategy as JSON:"""
+
+
+def _heuristic_fallback(case: Case) -> ActionType:
+    """Simple heuristic fallback when LLM is unavailable.
+
+    Preserves the original decision matrix behavior:
+    - Escalate at high attempt counts
+    - Match cause-specific action sequences
+    """
+    if not case.diagnosis:
+        return ActionType.ABANDON
+
+    cause = case.diagnosis.root_cause
+    attempts = case.attempt_count
+    max_attempts = case.max_attempts
+
+    # If near max attempts, always escalate
+    if attempts >= max_attempts - 1:
+        return ActionType.ESCALATE_TO_HUMAN
+
+    if cause == FailureType.CARD_EXPIRED:
+        # Card is expired — must update. Don't waste time notifying first.
+        if attempts == 0:
+            return ActionType.UPDATE_PAYMENT_METHOD
+        elif attempts == 1:
+            return ActionType.SEND_NOTIFICATION
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+    elif cause == FailureType.INSUFFICIENT_FUNDS:
+        if attempts == 0:
+            return ActionType.WAIT_AND_RETRY
+        elif attempts == 1:
+            return ActionType.RETRY_PAYMENT
+        elif attempts == 2:
+            return ActionType.SEND_NOTIFICATION
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+    elif cause == FailureType.NETWORK_TIMEOUT:
+        if attempts == 0:
+            return ActionType.RETRY_PAYMENT
+        elif attempts == 1:
+            return ActionType.WAIT_AND_RETRY
+        elif attempts == 2:
+            return ActionType.RETRY_PAYMENT
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+    elif cause == FailureType.RISK_BLOCK:
+        return ActionType.ESCALATE_TO_HUMAN
+    elif cause == FailureType.MANDATE_REVOKED:
+        if attempts == 0:
+            return ActionType.SEND_NOTIFICATION
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+    elif cause == FailureType.BANK_DECLINED:
+        if attempts == 0:
+            return ActionType.RETRY_PAYMENT
+        elif attempts == 1:
+            return ActionType.SEND_NOTIFICATION
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+    else:
+        if attempts < 2:
+            return ActionType.RETRY_PAYMENT
+        else:
+            return ActionType.SEND_NOTIFICATION
+
+
 def decide_intervention(
     case: Case,
     profile: CustomerProfile | None = None,
     memory: CustomerMemoryStore | None = None,
     kg_router: RazorpayKnowledgeGraph | None = None,
 ) -> ActionType:
-    """Choose the appropriate intervention based on diagnosis, attempt history, memory, and KG.
+    """Choose the appropriate intervention using LLM strategy planning.
 
-    Memory-aware rules:
-    - INSUFFICIENT_FUNDS + salary_dependent + not in salary window → WAIT_AND_RETRY
-    - Best channel from profile overrides default
+    The LLM analyzes diagnosis, memory, guardrail constraints, and KG rails
+    to dynamically select the optimal action with strategic reasoning.
 
-    KG-aware rules:
-    - On card/bank failures, discover optimal recovery rail path
-    - Attach rail recommendation to case metadata
+    Falls back to heuristic rules if LLM is unavailable.
 
     Source: Planning pattern — agent creates plan then executes
     https://www.deeplearning.ai/courses/agentic-ai (Module 5)
@@ -52,29 +292,19 @@ def decide_intervention(
     if not case.diagnosis:
         return ActionType.ABANDON
 
-    cause = case.diagnosis.root_cause
-    attempts = case.attempt_count
+    if case.attempt_count >= case.max_attempts - 1:
+        case.payment.metadata["strategy_reasoning"] = f"Max recovery attempts reached ({case.attempt_count + 1}/{case.max_attempts}). Escalating to human."
+        return ActionType.ESCALATE_TO_HUMAN
+
     router = kg_router or _get_kg_router()
+    cause = case.diagnosis.root_cause
 
-    # Memory-aware: If insufficient funds and customer is salary-dependent,
-    # keep waiting until salary window is active
-    if (
-        cause == FailureType.INSUFFICIENT_FUNDS
-        and profile
-        and memory
-        and profile.salary_window.typical_pay_day > 0
-    ):
-        current_day = datetime.now().day
-        in_window = memory.check_salary_liquidity(profile.customer_id, current_day)
-        if not in_window and attempts < 3:
-            return ActionType.WAIT_AND_RETRY
-
-    # KG-aware: Discover recovery rails for card/bank failures
-    failure_code = cause.value
+    # Discover recovery rails via KG (context for LLM, not decision maker)
     preferred_channel = ""
     if profile and memory:
         preferred_channel = memory.get_optimal_channel(profile.customer_id)
 
+    available_rails = []
     if cause in (
         FailureType.CARD_EXPIRED,
         FailureType.BANK_DECLINED,
@@ -82,65 +312,47 @@ def decide_intervention(
         FailureType.MANDATE_REVOKED,
         FailureType.RISK_BLOCK,
     ):
-        path = router.discover_recovery_path(
-            failure_code=failure_code,
+        available_rails = router.discover_recovery_path(
+            failure_code=cause.value,
             customer_id=case.payment.customer_id,
             preferred_channel=preferred_channel,
         )
         recommended_rail = router.recommend_optimal_rail(
-            failure_code=failure_code,
+            failure_code=cause.value,
             preferred_channel=preferred_channel,
         )
-        # Store KG results in metadata for execution layer
-        case.payment.metadata["discovered_rail_path"] = path
+        case.payment.metadata["discovered_rail_path"] = available_rails
         case.payment.metadata["recommended_api_rail"] = recommended_rail
 
-    # Decision matrix: cause x attempt count -> action
-    decision_tree: dict[FailureType, dict[int, ActionType]] = {
-        FailureType.CARD_EXPIRED: {
-            0: ActionType.SEND_NOTIFICATION,   # Ask to update card
-            1: ActionType.UPDATE_PAYMENT_METHOD,
-            2: ActionType.ESCALATE_TO_HUMAN,
-        },
-        FailureType.INSUFFICIENT_FUNDS: {
-            0: ActionType.WAIT_AND_RETRY,      # Wait, funds may arrive
-            1: ActionType.RETRY_PAYMENT,
-            2: ActionType.SEND_NOTIFICATION,
-            3: ActionType.ESCALATE_TO_HUMAN,
-        },
-        FailureType.BANK_DECLINED: {
-            0: ActionType.RETRY_PAYMENT,       # Transient, retry once
-            1: ActionType.SEND_NOTIFICATION,
-            2: ActionType.ESCALATE_TO_HUMAN,
-        },
-        FailureType.NETWORK_TIMEOUT: {
-            0: ActionType.RETRY_PAYMENT,       # Transient, retry immediately
-            1: ActionType.WAIT_AND_RETRY,
-            2: ActionType.RETRY_PAYMENT,
-            3: ActionType.ESCALATE_TO_HUMAN,
-        },
-        FailureType.RISK_BLOCK: {
-            0: ActionType.ESCALATE_TO_HUMAN,   # Always escalate risk blocks
-        },
-        FailureType.MANDATE_REVOKED: {
-            0: ActionType.SEND_NOTIFICATION,   # Inform customer
-            1: ActionType.ESCALATE_TO_HUMAN,
-        },
-        FailureType.UNKNOWN: {
-            0: ActionType.RETRY_PAYMENT,       # Try generic retry
-            1: ActionType.SEND_NOTIFICATION,
-            2: ActionType.ESCALATE_TO_HUMAN,
-        },
+    # Build strategy prompt and invoke LLM
+    prompt = _build_strategy_prompt(case, profile, available_rails, preferred_channel)
+    result = invoke_llm_json(
+        prompt=prompt,
+        system=STRATEGY_SYSTEM_PROMPT,
+        temperature=0,
+        max_tokens=1024,
+    )
+
+    if result is None:
+        return _heuristic_fallback(case)
+
+    # Parse decided action
+    action_str = result.get("decided_action", "").lower().strip()
+    action_map = {
+        "retry_payment": ActionType.RETRY_PAYMENT,
+        "send_notification": ActionType.SEND_NOTIFICATION,
+        "escalate_to_human": ActionType.ESCALATE_TO_HUMAN,
+        "update_payment_method": ActionType.UPDATE_PAYMENT_METHOD,
+        "wait_and_retry": ActionType.WAIT_AND_RETRY,
+        "abandon": ActionType.ABANDON,
     }
+    action = action_map.get(action_str)
+    if action is None:
+        return _heuristic_fallback(case)
 
-    cause_tree = decision_tree.get(cause, decision_tree[FailureType.UNKNOWN])
-
-    # Find the right action for this attempt count
-    action = ActionType.ABANDON
-    for threshold in sorted(cause_tree.keys(), reverse=True):
-        if attempts >= threshold:
-            action = cause_tree[threshold]
-            break
+    # Store strategic reasoning in metadata
+    reasoning = result.get("intervention_reasoning", "")
+    case.payment.metadata["strategy_reasoning"] = reasoning
 
     return action
 
@@ -153,8 +365,8 @@ def run_decision(
 ) -> Case:
     """Run decision layer on a case and update its state.
 
-    Transitions case from DIAGNOSING → DIAGNOSED after selecting an intervention.
-    Queries KG router for optimal recovery rails on payment failures.
+    Transitions case from DIAGNOSING → DIAGNOSED after LLM selects an intervention.
+    Queries KG router for optimal recovery rails and passes them as context.
 
     Source: Planning with code execution
     https://www.deeplearning.ai/courses/agentic-ai (Module 5)
@@ -163,10 +375,8 @@ def run_decision(
 
     action = decide_intervention(case, profile=profile, memory=memory, kg_router=kg_router)
 
-    # Store the decided action in the case metadata for the act step
     case.payment.metadata["decided_action"] = action.value
 
-    # Store optimal channel from memory for execution
     if memory and profile:
         case.payment.metadata["optimal_channel"] = memory.get_optimal_channel(
             profile.customer_id
