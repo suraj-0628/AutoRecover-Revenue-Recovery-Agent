@@ -24,15 +24,15 @@ pkill -f "recovery_agent.frontend" 2>/dev/null
 sleep 1
 
 # Start dashboard
-setsid python -m recovery_agent.dashboard < /dev/null > /tmp/dashboard.log 2>&1 &
+setsid .venv/bin/python3 -m recovery_agent.dashboard < /dev/null > /tmp/dashboard.log 2>&1 &
 DASHBOARD_PID=$!
 
 # Start webhook listener
-setsid python -m recovery_agent.webhook < /dev/null > /tmp/webhook.log 2>&1 &
+setsid .venv/bin/python3 -m recovery_agent.webhook < /dev/null > /tmp/webhook.log 2>&1 &
 WEBHOOK_PID=$!
 
 # Start frontend (customer + merchant)
-setsid python -m recovery_agent.frontend < /dev/null > /tmp/frontend.log 2>&1 &
+setsid .venv/bin/python3 -m recovery_agent.frontend < /dev/null > /tmp/frontend.log 2>&1 &
 FRONTEND_PID=$!
 
 sleep 3

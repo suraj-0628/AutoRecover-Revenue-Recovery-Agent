@@ -56,3 +56,7 @@ data/audit_logs/*.jsonl
 *.md
 !README.md
 
+# Agent skills & customizations
+.agents/
+
+

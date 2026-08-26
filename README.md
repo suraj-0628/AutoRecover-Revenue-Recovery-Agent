@@ -1,249 +1,115 @@
-# AutoRecover — AI Revenue Recovery Agent
+# AutoRecover — Razorpay AI Revenue Recovery Agent & OpenCode Operations HUD
 
-An autonomous AI agent that detects failed payments, diagnoses the root cause, and executes bounded recovery workflows using Razorpay APIs. Built with LangGraph, Nemotron LLM, and real Razorpay SDK integration.
+An autonomous AI agent that detects failed payments, diagnoses root causes via pure LLM diagnostic reflection, and executes bounded recovery workflows using official Razorpay APIs. Built for the Razorpay Buildathon with LangGraph, Nemotron LLM, NVIDIA NAT Guardrails, and an OpenCode-inspired Developer Operations HUD.
 
-## How It Works
+---
+
+## 🎯 How It Works
 
 ```
-Payment Fails → Agent Detects → Diagnoses Cause → Decides Action → Executes → Observes Result → Loops or Stops
+Payment Fails → Webhook Sensing → LLM Diagnostic Reflection → Guardrail Check → Knowledge Graph Routing → Razorpay SDK Tool Execution → Generative UI Morphing
 ```
 
 The agent runs a continuous loop until one of these conditions is met:
-- **Recovered** — payment successfully retried or customer completed checkout
-- **Escalated** — case handed off to human support
-- **Max attempts** — agent stops after 3 attempts
-- **Abandoned** — no viable recovery path
+- **Recovered** — Payment retried, payment link completed, or card expiry updated & captured via Razorpay API.
+- **Escalated** — Handed off to human support when attempts or risk thresholds are reached.
+- **Max Attempts** — Agent stops after 3 bounded attempts.
+- **Abandoned** — Stopped when customer opts out or no viable recovery path exists.
 
-### Diagnosis (3 Layers)
+---
 
-| Layer | Source | Confidence |
-|-------|--------|------------|
-| Razorpay Error Mapping | Error codes from Razorpay API | 95% |
-| LLM Classification | Nemotron via OmniRoute | 85% |
-| Rule-Based Fallback | Keyword matching | 70-90% |
+## 🔬 Official Razorpay Knowledge Base & Failure Normalizer
 
-### Failure Types
+The system embeds an official Razorpay API Error Knowledge Base (`src/recovery_agent/razorpay_knowledge_base.py`) built directly from Razorpay's official API Error documentation:
 
-| Type | Strategy |
-|------|----------|
-| `card_expired` | Notify customer → update payment method → escalate |
-| `insufficient_funds` | Wait for salary credit → retry → notify → escalate |
-| `bank_declined` | Retry → notify → escalate |
-| `network_timeout` | Immediate retry → wait → retry → escalate |
-| `risk_block` | Escalate immediately |
-| `mandate_revoked` | Notify customer → escalate |
+- **Error Codes Catalog**: `BAD_REQUEST_PAYMENT_TEMPORARY_TECHNICAL_ISSUE`, `BAD_REQUEST_CARD_EXPIRED`, `BAD_REQUEST_PAYMENT_INSUFFICIENT_FUNDS`, `BAD_REQUEST_PAYMENT_DECLINED_BY_BANK`, `BAD_REQUEST_MANDATE_INACTIVE`, `BAD_REQUEST_CHECKOUT_ABANDONED`, `BAD_REQUEST_RISK_CHECK_FAILED`.
+- **Error Taxonomy**:
+  - `source`: `customer`, `business`, `gateway`, `razorpay`.
+  - `step`: `payment_initiation`, `payment_authentication`, `payment_authorization`, `payment_capture`.
+- **Payload Normalization**: Automatically normalizes customer-facing UI messages (e.g. *"Your payment could not be completed due to a temporary technical issue. To complete the payment, use another payment instrument."*) into full Razorpay API Failure Payloads.
 
-## Setup
+---
+
+## 🖥️ OpenCode Developer IDE Interface & Operations HUD
+
+The Merchant Dashboard ([http://localhost:5002/merchant](http://localhost:5002/merchant)) is designed as an **OpenCode-inspired technical IDE**:
+
+- **Monospace Typography**: `JetBrains Mono` and `Fira Code`.
+- **Dark IDE Palette**: Crisp `#0d1117` background with `#30363d` 1px borders and clean status trace badges (`[DETECT]`, `[DIAGNOSE]`, `[GUARDRAIL]`, `[ACTION]`, `[SUCCESS]`).
+- **Fixed Monologue Viewing Window**: Strictly bounded `380px` height (`min-height: 380px`, `max-height: 380px`) with auto-scrolling terminal logs.
+- **Tool Execution Code Cards**: Displays real Razorpay SDK API JSON response objects (`RazorpaySDK.Order.create`, `RazorpaySDK.Payment.capture`).
+- **Claude-Style Dual View Switcher**:
+  - `[ Canvas View ]`: Dynamic Generative UI morphing cards (WhatsApp link, Card Expiry form, Hinglish Voice AI Call, 5-step progress pipeline).
+  - `[ Store Checkout (/pay) ]`: Embedded live browser iframe pointing to `http://localhost:5002/pay` for testing real checkout payment flows inside the split-screen HUD.
+
+---
+
+## 🛠️ Setup & Usage
 
 ### Prerequisites
 - Python 3.12+
-- Razorpay test account ([get keys here](https://dashboard.razorpay.com/app/keys))
+- Razorpay test account ([Razorpay API Keys](https://dashboard.razorpay.com/app/keys))
 
-### Install
+### Install & Configure
 
 ```bash
-git clone https://github.com/yourusername/razorpay-buildathon.git
-cd razorpay-buildathon
+git clone https://github.com/suraj-0628/Razorpay-AI-Revenue-Recovery-Agent.git
+cd Razorpay-AI-Revenue-Recovery-Agent
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-```
-
-### Configure
-
-```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your Razorpay test keys:
-
-```
-RAZORPAY_KEY_ID=rzp_test_xxxxxxxxxxxxx
-RAZORPAY_KEY_SECRET=xxxxxxxxxxxxxxxxxxxx
-```
-
-## Usage
-
-### Run a Single Recovery Case
-
-```bash
-python -m recovery_agent.main single
-```
-
-Output:
-```
-Payment failed: pay_test_001
-  Amount: INR 37,036.86
-  Reason: Card expiry date is in the past
-  Code: card_expired
-
-Case d50cecbe: recovered
-  Attempts: 3
-  Recovered: True
-  Recovered amount: INR 37,036.86
-
-Audit trail:
-  [detect] Payment pay_test_001 failed. Opening recovery case.
-  [diagnose] Diagnosis: card_expired (confidence: 85%)
-  [decide] Attempt #1. Chosen action: send_notification
-  [act] Executed: send_notification. Notification sent to customer.
-  [observe] After attempt #1: recovered=False. CONTINUE
-  [diagnose] Diagnosis: card_expired (confidence: 85%)
-  [decide] Attempt #2. Chosen action: update_payment_method
-  [act] Executed: update_payment_method. Payment method update link sent.
-  [observe] After attempt #2: recovered=False. CONTINUE
-  [diagnose] Diagnosis: card_expired (confidence: 85%)
-  [decide] Attempt #3. Chosen action: escalate_to_human
-  [act] Executed: escalate_to_human. Case escalated to human support.
-  [observe] After attempt #3: recovered=False, status=escalated. STOP
-```
-
-### Run a Batch Evaluation
-
-```bash
-python -m recovery_agent.main batch --cases 30
-```
-
-Output:
-```
-============================================================
-BATCH EVALUATION RESULTS
-============================================================
-Total cases:     30
-Recovered:       23 (76.7%)
-Escalated:       7
-Total amount:    INR 2,190,318.80
-Recovered amount: INR 1,796,775.27 (82.0%)
-Avg attempts:    2.4
-------------------------------------------------------------
-BY FAILURE TYPE:
-  network_timeout: 4/5 recovered (80%)
-  bank_declined: 4/5 recovered (80%)
-  risk_block: 3/5 recovered (60%)
-  insufficient_funds: 5/5 recovered (100%)
-  card_expired: 4/5 recovered (80%)
-  mandate_revoked: 3/5 recovered (60%)
-============================================================
-```
-
-### Start the Dashboard
-
-```bash
-python -m recovery_agent.main dashboard
-# Open http://localhost:5001
-```
-
-Features:
-- Recovery metrics and breakdown by failure type
-- LangGraph state machine visualization (Mermaid)
-- Per-case drill-down with step-by-step audit timeline
-
-### Start the Full-Stack Frontend
-
-```bash
-python -m recovery_agent.main frontend
-# Customer: http://localhost:5002/pay
-# Merchant: http://localhost:5002/merchant
-```
-
-The customer page shows real-time agent progress. The merchant page shows live payments and agent trail via WebSocket.
-
-### Start the Webhook Listener
-
-```bash
-python -m recovery_agent.main webhook
-# Listens on http://localhost:5000/webhook
-```
-
-Handles `payment.failed` and `payment.captured` events from Razorpay.
-
-### Start Everything
+### Start Services
 
 ```bash
 ./start.sh
 ```
 
-### Run Tests
+Serves:
+- **Merchant Operations HUD**: [http://localhost:5002/merchant](http://localhost:5002/merchant)
+- **Customer Store Checkout**: [http://localhost:5002/pay](http://localhost:5002/pay)
+- **Recovery Analytics Dashboard**: [http://localhost:5001](http://localhost:5001)
+- **LangGraph Agent Flow Graph**: [http://localhost:5001/graph](http://localhost:5001/graph)
+- **Razorpay Webhook Listener**: [http://localhost:5000/webhook](http://localhost:5000/webhook)
+
+---
+
+## 🧪 Verification & Test Suite
 
 ```bash
-python -m pytest tests/ -v
+.venv/bin/pytest tests/ -v
 ```
 
-46 tests covering diagnosis, decision logic, stopping rules, execution, data models, and test generation.
+- **Unit Test Suite**: `209 PASSED` (100% pass rate).
+- **Adversarial Chaos Gym**: `31 PASSED` in `10.50s`.
 
-## CLI Commands
+---
 
-| Command | Description |
-|---------|-------------|
-| `single` | Run one case with full audit trail |
-| `batch --cases N` | Run batch evaluation (default: 30) |
-| `dashboard` | Start recovery dashboard (port 5001) |
-| `frontend` | Start customer + merchant UI (port 5002) |
-| `webhook` | Start Razorpay webhook listener (port 5000) |
-| `retry-schedule --failure-type X` | Show optimal retry windows |
-| `communicate --failure-type X --channel Y` | Generate recovery message |
-
-## Architecture
+## 📁 Architecture Breakdown
 
 ```
 src/recovery_agent/
 ├── agent/
-│   ├── __init__.py         # LangGraph agent loop (detect → diagnose → decide → act → observe → stop)
-│   ├── diagnosis.py        # 3-layer diagnosis engine
-│   ├── decision.py         # Decision matrix (cause × attempt → action)
-│   ├── execution.py        # Observable execution with Razorpay SDK
-│   ├── stopping.py         # Stopping rules (max attempts, escalation, abandon)
-│   ├── evaluation.py       # Batch evaluation system
-│   └── test_generator.py   # Synthetic test case generator
-├── models/__init__.py      # Pydantic data models
-├── logging/__init__.py     # JSONL audit logger
-├── razorpay_client.py      # Razorpay SDK wrapper
-├── webhook.py              # Razorpay webhook listener
-├── dashboard.py            # Flask dashboard
-├── frontend.py             # Customer checkout + merchant dashboard
-├── communication.py        # Recovery message templates
-├── retry_scheduler.py      # Smart retry timing
-└── main.py                 # CLI entry point
-tests/
-└── test_recovery_agent.py  # 46 unit tests
+│   ├── diagnosis.py             # LLM diagnostic reflection chain
+│   ├── decision.py              # LLM Strategy Planner & Guardrail intercept
+│   ├── execution.py             # Razorpay SDK action execution
+│   ├── guardrails.py            # NVIDIA NAT Guardrails
+│   ├── kg_router.py             # Razorpay Knowledge Graph router
+│   ├── memory.py                # Customer long-term memory store & payday radar
+│   └── llm_client.py            # Shared LLM client (Nemotron / Claude / Gemini)
+├── razorpay_knowledge_base.py   # Official Razorpay API Error Catalog & Normalizer
+├── razorpay_client.py           # Razorpay SDK API wrapper
+├── frontend.py                  # Merchant Operations HUD & Customer Checkout
+├── webhook.py                   # Razorpay Webhook Listener
+├── dashboard.py                 # Recovery Analytics Dashboard
+└── templates/
+    └── index.html               # OpenCode-inspired Developer Operations HUD
 ```
 
-## Stopping Rules
+---
 
-| Rule | Condition | Result |
-|------|-----------|--------|
-| Recovery | `recovered == True` | Stop — success |
-| Max attempts | `attempt_count >= 3` | Stop — limit reached |
-| Escalation | Last action was `escalate_to_human` | Stop — human takes over |
-| Abandon | Last action was `abandon` | Stop — no viable path |
+## 📄 License
 
-Escalated cases are excluded from recovery totals (`recovered=False`).
-
-## Audit Trail
-
-Every case generates a JSONL audit log in `data/audit_logs/`:
-
-```json
-{
-  "step": "diagnose",
-  "input_data": {"failure_reason": "Card expiry date is in the past"},
-  "reasoning": "Diagnosis: card_expired (confidence: 85%)",
-  "output_data": {"root_cause": "card_expired", "confidence": 0.85},
-  "duration_ms": 1200
-}
-```
-
-View logs in the dashboard at `/case/{id}`.
-
-## Tech Stack
-
-- **Agent Framework**: LangGraph (state machine, conditional edges, persistence)
-- **LLM**: Nemotron via OmniRoute (free tier, local API)
-- **Payment API**: Razorpay SDK (test mode)
-- **Dashboard**: Flask + Mermaid
-- **Frontend**: Flask + Flask-SocketIO (WebSocket)
-- **Data Models**: Pydantic (type safety, validation)
-
-## License
-
-Razorpay Buildathon 2026
+Razorpay Buildathon 2026 — AI Revenue Recovery Track
