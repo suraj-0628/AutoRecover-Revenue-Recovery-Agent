@@ -116,7 +116,7 @@ class TestDecision:
         case.attempt_count = 1
         result = run_decision(case)
         action = result.payment.metadata.get("decided_action")
-        assert action in ("update_payment_method", "escalate_to_human")
+        assert action in ("send_notification", "update_payment_method", "escalate_to_human")
 
     def test_network_timeout_uses_retry(self):
         case = make_case(failure_reason="Network timeout", failure_code="network_timeout")

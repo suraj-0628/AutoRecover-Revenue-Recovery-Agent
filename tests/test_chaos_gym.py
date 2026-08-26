@@ -9,6 +9,8 @@ Covers:
 """
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from recovery_agent.eval.chaos_gym import (
     AdversarialChaosEngine,
     PayloadSanitizer,
@@ -290,8 +292,9 @@ class TestFullEpisode:
         episode = env.run_episode()
         assert episode["steps"] <= 10
 
-    def test_run_chaos_gym_summary(self):
+    def test_run_chaos_gym_returns_metrics(self):
         result = run_chaos_gym(episodes=5, seed=42)
+        assert "episodes" in result
         assert result["episodes"] == 5
         assert 0 <= result["recovery_rate"] <= 1
         assert result["avg_reward"] != 0 or result["recovery_rate"] == 0
@@ -299,10 +302,11 @@ class TestFullEpisode:
         assert "by_persona" in result
 
     def test_run_chaos_gym_deterministic(self):
-        r1 = run_chaos_gym(episodes=5, seed=42)
-        r2 = run_chaos_gym(episodes=5, seed=42)
-        assert r1["recovery_rate"] == r2["recovery_rate"]
-        assert r1["total_reward"] == r2["total_reward"]
+        with patch("recovery_agent.agent.llm_client.invoke_llm_json", return_value=None):
+            r1 = run_chaos_gym(episodes=5, seed=42)
+            r2 = run_chaos_gym(episodes=5, seed=42)
+            assert r1["recovery_rate"] == r2["recovery_rate"]
+            assert r1["total_reward"] == r2["total_reward"]
 
     def test_run_chaos_gym_multiple_personas(self):
         result = run_chaos_gym(episodes=20, seed=42)
