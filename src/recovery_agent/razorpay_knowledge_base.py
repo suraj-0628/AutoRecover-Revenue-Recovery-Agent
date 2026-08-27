@@ -36,7 +36,7 @@ RAZORPAY_ERROR_CATALOG: dict[str, dict[str, Any]] = {
     "gateway_timeout": {
         "error_code": "BAD_REQUEST_PAYMENT_TEMPORARY_TECHNICAL_ISSUE",
         "failure_code": "gateway_timeout",
-        "failure_reason": "Gateway Timeout 504 (HDFC Netbanking drop)",
+        "failure_reason": "Gateway timeout during payment authorization",
         "error_source": "gateway",
         "error_step": "payment_authorization",
         "error_description": "Your payment could not be completed due to a temporary technical issue. To complete the payment, use another payment instrument.",

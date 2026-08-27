@@ -1,7 +1,12 @@
-"""Webhook listener for Razorpay payment events.
+"""Webhook listener — PURE SECURE INGESTOR.
 
-Real-time failure detection via Razorpay webhooks.
-Source: https://razorpay.com/docs/payments/webhooks/
+Stripped of all agent logic. This module:
+1. Verifies HMAC SHA256 signature (STRICT — no bypasses)
+2. Deduplicates events by event_id (idempotency)
+3. Parses the Razorpay payload
+4. Forwards the event to frontend.py via HTTP POST to /api/webhook-forward
+
+The frontend is the SINGLE SOURCE OF TRUTH for agent execution and UI broadcasting.
 
 Usage:
     python -m recovery_agent.main webhook
@@ -11,139 +16,194 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import sys
+import threading
+from datetime import datetime, timezone
 from typing import Any
 
 from flask import Flask, request, jsonify
 
-from recovery_agent.agent import RecoveryAgent
-from recovery_agent.models import Case, PaymentEvent
-
 app = Flask(__name__)
 
 WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-active_cases: dict[str, Case] = {}
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5002")
+
+# --- Idempotency: in-memory event_id dedup with TTL expiry ---
+_processed_events: dict[str, datetime] = {}
+_event_lock = threading.Lock()
+_IDEMPOTENCY_TTL_SECONDS = 86400  # 24 hours
+
+
+def _is_duplicate_event(event_id: str) -> bool:
+    """Check if event_id was already processed. Deduplicates within TTL window."""
+    if not event_id:
+        return False  # No event_id = can't deduplicate, allow through
+
+    now = datetime.now(timezone.utc)
+    with _event_lock:
+        # Purge expired entries
+        expired = [k for k, v in _processed_events.items()
+                   if (now - v).total_seconds() > _IDEMPOTENCY_TTL_SECONDS]
+        for k in expired:
+            del _processed_events[k]
+
+        # Check if already processed
+        if event_id in _processed_events:
+            return True
+
+        # Record this event as processed
+        _processed_events[event_id] = now
+        return False
 
 
 def verify_signature(payload: bytes, signature: str) -> bool:
-    """Verify Razorpay webhook HMAC SHA256 signature."""
+    """Verify Razorpay webhook HMAC SHA256 signature.
+
+    STRICT: If WEBHOOK_SECRET is not configured, REJECT all requests.
+    No bypasses. No silent passes.
+    """
     if not WEBHOOK_SECRET:
-        return True
+        print("[webhook] CRITICAL: RAZORPAY_WEBHOOK_SECRET not configured. Rejecting request.", file=sys.stderr)
+        return False
+    if not signature:
+        print("[webhook] CRITICAL: No X-Razorpay-Signature header. Rejecting request.", file=sys.stderr)
+        return False
     expected = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
 
 
+def forward_to_frontend(event_type: str, payload: dict) -> dict[str, Any]:
+    """Forward parsed webhook event to frontend.py via HTTP POST."""
+    import urllib.request
+    import urllib.error
+    import json
+
+    forward_payload = {
+        "event": event_type,
+        "payload": payload,
+        "source": "razorpay_webhook",
+    }
+
+    url = f"{FRONTEND_URL}/api/webhook-forward"
+    data = json.dumps(forward_payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except urllib.error.URLError as e:
+        print(f"[webhook] ERROR: Failed to forward to frontend: {e}", file=sys.stderr)
+        return {"status": "error", "message": str(e)}
+    except Exception as e:
+        print(f"[webhook] ERROR: Unexpected error forwarding to frontend: {e}", file=sys.stderr)
+        return {"status": "error", "message": str(e)}
+
+
+@app.route("/webhook", methods=["POST"])
+def handle_webhook():
+    """Receive Razorpay webhook, verify signature, deduplicate, forward to frontend."""
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not verify_signature(request.data, signature):
+        return jsonify({"error": "Invalid signature"}), 401
+
+    payload = request.json
+    event = payload.get("event", "")
+
+    # Idempotency: extract event_id from Razorpay payload
+    # Razorpay includes event_id at payload.event or payload.payload.payment.entity.id
+    event_id = payload.get("event_id", "")
+    if not event_id:
+        # Fallback: construct from event type + payment entity ID
+        payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        entity_id = payment_entity.get("id", "")
+        event_id = f"{event}:{entity_id}" if entity_id else ""
+
+    if _is_duplicate_event(event_id):
+        print(f"[webhook] Duplicate event ignored: {event_id}", file=sys.stderr)
+        return jsonify({"status": "duplicate", "event_id": event_id}), 200
+
+    print(f"[webhook] Received event: {event}")
+
+    # Forward ALL events to frontend — let frontend decide what to process
+    result = forward_to_frontend(event, payload)
+
+    if result.get("status") == "error":
+        return jsonify(result), 502
+
+    return jsonify({
+        "status": "forwarded",
+        "event": event,
+        "frontend_response": result,
+    }), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Webhook ingestor health check."""
+    return jsonify({
+        "status": "ok",
+        "service": "webhook_ingestor",
+        "hmac_configured": bool(WEBHOOK_SECRET),
+        "frontend_url": FRONTEND_URL,
+    })
+
+
 def process_webhook_payload(payload: dict) -> dict:
-    """Process a raw webhook event dictionary programmatically."""
+    """Process a raw webhook event dictionary programmatically.
+
+    Backward-compatible wrapper for tests and direct API usage.
+    Parses the payload and returns a result dict without forwarding to frontend.
+    """
     event = payload.get("event", "")
     data = payload.get("payload", {})
 
     if event == "payment.failed":
-        response, status = _handle_payment_failed(data)
-        return {"event": event, "status": "processed", "status_code": status}
+        payment = data.get("payment", {}).get("entity", {})
+        payment_id = payment.get("id", "")
+        amount = payment.get("amount", 0) / 100
+        error_code = payment.get("error_code", "")
+        error_reason = payment.get("error_reason", "")
+
+        return {
+            "event": event,
+            "status": "processed",
+            "payment_id": payment_id,
+            "amount": amount,
+            "error_code": error_code,
+            "error_reason": error_reason,
+            "status_code": 200,
+        }
     elif event == "payment.captured":
-        response, status = _handle_payment_captured(data)
-        return {"event": event, "status": "processed", "status_code": status}
+        payment = data.get("payment", {}).get("entity", {})
+        payment_id = payment.get("id", "")
+        amount = payment.get("amount", 0) / 100
+
+        return {
+            "event": event,
+            "status": "processed",
+            "payment_id": payment_id,
+            "amount": amount,
+            "status_code": 200,
+        }
     elif "dispute" in event:
         return {"event": event, "status": "handled", "status_code": 200}
 
     return {"event": event, "status": "ignored", "status_code": 200}
 
 
-@app.route("/webhook", methods=["POST"])
-def handle_webhook():
-    signature = request.headers.get("X-Razorpay-Signature", "")
-    if not verify_signature(request.data, signature):
-        return jsonify({"error": "Invalid signature"}), 400
-
-    payload = request.json
-    res = process_webhook_payload(payload)
-    return jsonify(res), res.get("status_code", 200)
-
-
-def _handle_payment_failed(data: dict) -> tuple[Any, int]:
-    payment = data.get("payment", {}).get("entity", {})
-    payment_id = payment.get("id", "")
-    amount = payment.get("amount", 0) / 100
-    error_code = payment.get("error_code", "")
-    error_reason = payment.get("error_reason", "")
-    error_step = payment.get("error_step", "")
-    contact = payment.get("contact", "")
-    email = payment.get("email", "")
-    notes = payment.get("notes", {})
-    customer_id = notes.get("customer_id", payment.get("customer_id", f"cust_{payment_id}"))
-
-    print(f"[webhook] Payment failed: {payment_id} — {error_code}: {error_reason}")
-
-    event = PaymentEvent(
-        event_type="payment_failed",
-        payment_id=payment_id,
-        customer_id=customer_id,
-        amount=amount,
-        currency=payment.get("currency", "INR"),
-        status="failed",
-        failure_reason=f"{error_code}: {error_reason}",
-        failure_code=error_code or "BAD_REQUEST_PAYMENT_FAILED",
-        metadata={
-            "order_id": payment.get("order_id", ""),
-            "error_code": error_code,
-            "error_reason": error_reason,
-            "error_step": error_step,
-            "contact": contact,
-            "email": email,
-            "razorpay_payment_id": payment_id,
-            "razorpay_error": {
-                "error_code": error_code,
-                "error_reason": error_reason,
-                "error_step": error_step,
-            },
-        },
-    )
-
-    case = Case(payment=event)
-    agent = RecoveryAgent()
-    final_case = agent.run(case)
-
-    active_cases[payment_id] = final_case
-
-    return {
-        "status": "processed",
-        "case_id": final_case.id,
-        "recovered": final_case.recovered,
-        "recovered_amount": final_case.recovered_amount,
-    }, 200
-
-
-def _handle_payment_captured(data: dict) -> tuple[Any, int]:
-    payment = data.get("payment", {}).get("entity", {})
-    payment_id = payment.get("id", "")
-    amount = payment.get("amount", 0) / 100
-
-    print(f"[webhook] Payment captured: {payment_id} — INR {amount:,.2f}")
-
-    if payment_id in active_cases:
-        case = active_cases[payment_id]
-        case.recovered = True
-        case.recovered_amount = amount
-        del active_cases[payment_id]
-
-    return {"status": "processed"}, 200
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "active_cases": len(active_cases)})
-
-
-@app.route("/cases", methods=["GET"])
-def list_cases():
-    cases = [{"payment_id": k, "case_id": v.id, "recovered": v.recovered} for k, v in active_cases.items()]
-    return jsonify({"cases": cases, "total": len(cases)})
-
-
 def main():
     port = int(os.getenv("WEBHOOK_PORT", "5000"))
-    print(f"Webhook listener: http://localhost:{port}/webhook")
+    if not WEBHOOK_SECRET:
+        print("[webhook] WARNING: RAZORPAY_WEBHOOK_SECRET is empty. All requests will be REJECTED.", file=sys.stderr)
+    print(f"Webhook ingestor: http://localhost:{port}/webhook")
     print(f"Health check: http://localhost:{port}/health")
+    print(f"Forwarding to: {FRONTEND_URL}/api/webhook-forward")
     app.run(host="0.0.0.0", port=port)
 
 
