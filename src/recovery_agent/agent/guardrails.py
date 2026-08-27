@@ -314,7 +314,6 @@ class HardDeclineGuardrail:
         failure_code = case.payment.failure_code
 
         if failure_code in HARD_DECLINES:
-            # Increment penalties prevented counter
             case.penalties_prevented += 1
 
             return GuardrailCheckResult(
@@ -338,14 +337,176 @@ class HardDeclineGuardrail:
         )
 
 
+class SemanticGuardrail:
+    """LLM-based semantic evaluation for complex safety policy decisions.
+
+    Uses NeMo Colang-style reasoning to evaluate if an action violates
+    broad safety policies that cannot be captured by static IF statements.
+
+    Falls back to deterministic rules if LLM is unavailable.
+    """
+
+    SEMANTIC_EVAL_PROMPT = """You are a payment recovery safety guardrail evaluating whether an action is safe.
+
+ACTION TO EVALUATE:
+  Type: {action_type}
+  Customer opted out: {opt_out}
+  Communication count (24h): {comm_count_24h}
+  Failure code: {failure_code}
+  Attempt count: {attempt_count}
+  Amount: INR {amount}
+
+POLICY RULES:
+1. Do NOT send communications to customers who have opted out
+2. Do NOT exceed 3 communications per 24 hours
+3. Do NOT retry a payment that has already been captured
+4. Do NOT execute high-value retries (>INR 1,00,000) without human review
+5. Do NOT send notifications during quiet hours (9 PM - 8 AM IST)
+6. If the customer has complained or the case is disputed, escalate to human
+
+Determine if this action is SAFE, UNSAFE, or REQUIRES_REVIEW.
+Output JSON:
+{{
+  "verdict": "safe" | "unsafe" | "requires_review",
+  "reason": "Brief explanation",
+  "suggested_action": "If unsafe, suggest the correct action"
+}}"""
+
+    def __init__(self):
+        self._use_llm = True
+
+    def check(
+        self,
+        action: ActionType,
+        profile: CustomerProfile | None = None,
+        case: Case | None = None,
+        **kwargs: Any,
+    ) -> GuardrailCheckResult:
+        """Semantic safety evaluation using LLM (with deterministic fallback)."""
+        # Fast path: deterministic checks first
+        if action == ActionType.ESCALATE_TO_HUMAN:
+            return GuardrailCheckResult(
+                guardrail="semantic",
+                verdict=GuardrailVerdict.PASS,
+                reason="Escalation to human is always safe",
+                original_action=action.value,
+            )
+
+        if not self._use_llm:
+            return self._deterministic_fallback(action, profile, case)
+
+        # LLM-based semantic evaluation
+        try:
+            from recovery_agent.agent.llm_client import invoke_llm_json
+
+            comm_count = 0
+            if profile:
+                from recovery_agent.agent.memory import CustomerMemoryStore
+                store = CustomerMemoryStore()
+                comm_count = store.get_communication_count_24h(profile.customer_id)
+
+            prompt = self.SEMANTIC_EVAL_PROMPT.format(
+                action_type=action.value,
+                opt_out=profile.opt_out if profile else False,
+                comm_count_24h=comm_count,
+                failure_code=case.payment.failure_code if case else "unknown",
+                attempt_count=case.attempt_count if case else 0,
+                amount=case.payment.amount if case else 0,
+            )
+
+            result = invoke_llm_json(
+                prompt=prompt,
+                system="You are a payment recovery safety guardrail. Output only JSON.",
+                temperature=0,
+                max_tokens=256,
+            )
+
+            if result is None:
+                return self._deterministic_fallback(action, profile, case)
+
+            verdict = result.get("verdict", "safe")
+            reason = result.get("reason", "LLM semantic evaluation")
+            suggested = result.get("suggested_action", "")
+
+            if verdict == "unsafe":
+                try:
+                    modified = ActionType(suggested) if suggested else ActionType.WAIT_AND_RETRY
+                except ValueError:
+                    modified = ActionType.WAIT_AND_RETRY
+                return GuardrailCheckResult(
+                    guardrail="semantic",
+                    verdict=GuardrailVerdict.BLOCKED,
+                    reason=f"Semantic evaluation: {reason}",
+                    original_action=action.value,
+                    modified_action=modified.value,
+                )
+            elif verdict == "requires_review":
+                return GuardrailCheckResult(
+                    guardrail="semantic",
+                    verdict=GuardrailVerdict.MODIFIED,
+                    reason=f"Semantic evaluation: {reason}",
+                    original_action=action.value,
+                    modified_action=ActionType.ESCALATE_TO_HUMAN.value,
+                )
+            else:
+                return GuardrailCheckResult(
+                    guardrail="semantic",
+                    verdict=GuardrailVerdict.PASS,
+                    reason=f"Semantic evaluation: {reason}",
+                    original_action=action.value,
+                )
+
+        except Exception as e:
+            return self._deterministic_fallback(action, profile, case)
+
+    def _deterministic_fallback(
+        self,
+        action: ActionType,
+        profile: CustomerProfile | None,
+        case: Case | None,
+    ) -> GuardrailCheckResult:
+        """Deterministic fallback when LLM is unavailable."""
+        if profile and profile.opt_out:
+            if action in (ActionType.SEND_NOTIFICATION, ActionType.UPDATE_PAYMENT_METHOD):
+                return GuardrailCheckResult(
+                    guardrail="semantic",
+                    verdict=GuardrailVerdict.BLOCKED,
+                    reason="Customer opted out (deterministic fallback)",
+                    original_action=action.value,
+                    modified_action=ActionType.WAIT_AND_RETRY.value,
+                )
+
+        if case and case.payment.amount > 100_000:
+            if action == ActionType.RETRY_PAYMENT:
+                return GuardrailCheckResult(
+                    guardrail="semantic",
+                    verdict=GuardrailVerdict.MODIFIED,
+                    reason=f"High value INR {case.payment.amount:,.2f} requires human review (deterministic fallback)",
+                    original_action=action.value,
+                    modified_action=ActionType.ESCALATE_TO_HUMAN.value,
+                )
+
+        return GuardrailCheckResult(
+            guardrail="semantic",
+            verdict=GuardrailVerdict.PASS,
+            reason="Deterministic fallback: action appears safe",
+            original_action=action.value,
+        )
+
+
 # --- Guardrail Engine ---
 
 class GuardrailEngine:
     """Pre-execution interceptor that validates actions against all guardrails.
 
-    Runs 6 guardrails in sequence (including hard decline prevention).
-    If any guardrail blocks or modifies the action, the final action is
-    adjusted accordingly.
+    Runs 7 guardrails in sequence:
+    1. Hard Decline (highest priority) — prevents network penalties
+    2. Quiet Hours — communication timing
+    3. Frequency Cap — communication rate limiting
+    4. Double-Debit Lock — duplicate payment prevention
+    5. Opt-Out — customer preference compliance
+    6. Monetary Cap — high-value transaction safety
+    7. Semantic — LLM-based safety evaluation for complex cases
     """
 
     def __init__(self) -> None:
@@ -355,6 +516,7 @@ class GuardrailEngine:
         self.opt_out = OptOutGuardrail()
         self.monetary_cap = MonetaryCapGuardrail()
         self.hard_decline = HardDeclineGuardrail()
+        self.semantic = SemanticGuardrail()
 
     def validate_action(
         self,
@@ -379,6 +541,7 @@ class GuardrailEngine:
             ("double_debit_lock", lambda: self.double_debit.check(current_action, profile, case=case)),
             ("opt_out", lambda: self.opt_out.check(current_action, profile)),
             ("monetary_cap", lambda: self.monetary_cap.check(current_action, profile, case=case)),
+            ("semantic", lambda: self.semantic.check(current_action, profile, case=case)),
         ]
 
         for name, check_fn in guardrail_checks:

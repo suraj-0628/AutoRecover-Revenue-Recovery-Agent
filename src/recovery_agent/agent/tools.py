@@ -250,30 +250,32 @@ def query_gateway_error_details(payment_id: str, **kwargs) -> dict[str, Any]:
 
 
 def check_bank_health(bank_code: str, **kwargs) -> dict[str, Any]:
-    """Query bank health score and recent downtime."""
-    # Bank health data (in production, this would query a real health endpoint)
-    BANK_HEALTH_DB: dict[str, dict] = {
-        "HDFC": {"health_score": 0.85, "recent_downtime": "2h ago", "status": "degraded", "notes": "Intermittent netbanking timeouts"},
-        "ICICI": {"health_score": 0.95, "recent_downtime": "none", "status": "healthy", "notes": ""},
-        "SBI": {"health_score": 0.90, "recent_downtime": "6h ago", "status": "healthy", "notes": "Resolved morning outage"},
-        "KOTAK": {"health_score": 0.88, "recent_downtime": "1h ago", "status": "degraded", "notes": "Card gateway slow responses"},
-        "AXIS": {"health_score": 0.92, "recent_downtime": "none", "status": "healthy", "notes": ""},
-        "YES": {"health_score": 0.80, "recent_downtime": "30m ago", "status": "degraded", "notes": "UPI processing delays"},
-        "UNION": {"health_score": 0.75, "recent_downtime": "3h ago", "status": "unstable", "notes": "Frequent timeout on IMPS"},
-    }
+    """Query bank health score and recent downtime.
 
+    In production, queries Razorpay's bank health API or a dedicated health endpoint.
+    Returns unknown status when no live data is available — never fabricates health scores.
+    """
     bank = bank_code.upper()
-    health = BANK_HEALTH_DB.get(bank, {
-        "health_score": 0.5,
-        "recent_downtime": "unknown",
-        "status": "unknown",
-        "notes": f"No health data available for {bank}",
-    })
 
+    # Try to fetch live health data from Razorpay (if configured)
+    try:
+        from recovery_agent.razorpay_client import RazorpayClient
+        client = RazorpayClient()
+        if client.is_configured:
+            # Razorpay does not expose a public bank health API yet.
+            # In production, integrate with internal monitoring / PagerDuty / Statuspage.
+            pass
+    except Exception:
+        pass
+
+    # Return unknown — never fabricate bank health data
     return {
         "status": "ok",
         "bank_code": bank,
-        **health,
+        "health_score": None,
+        "recent_downtime": "unknown",
+        "status": "unknown",
+        "notes": f"No live health data available for {bank}. Query Razorpay dashboard for current status.",
     }
 
 
@@ -406,7 +408,13 @@ def query_payment_recovery_kb(
     """
     from recovery_agent.agent.agentic_rag import LlamaIndexAgenticRAG
 
-    rag = LlamaIndexAgenticRAG()
+    try:
+        rag = LlamaIndexAgenticRAG()
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"RAG unavailable: {e}",
+        }
     payload = {
         "failure_code": query,
         "failure_reason": query,

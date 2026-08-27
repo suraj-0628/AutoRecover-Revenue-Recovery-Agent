@@ -357,7 +357,13 @@ def run_diagnosis(case: Case) -> Case:
     case.status = CaseStatus.DIAGNOSING
 
     # Layer 1a: LlamaIndex RAG — retrieve grounded knowledge base context
-    rag_diagnosis = diagnose_with_rag(case)
+    rag_diagnosis = None
+    try:
+        rag_diagnosis = diagnose_with_rag(case)
+    except Exception as e:
+        # RAG requires ChromaDB with working embedding model.
+        # Fail loudly in VectorIndex, gracefully degrade here.
+        print(f"[diagnosis] RAG unavailable: {e}")
 
     # Layer 1b: LLM diagnostic reflection with RAG context injected into prompt
     llm_diagnosis = diagnose_with_llm(case)
