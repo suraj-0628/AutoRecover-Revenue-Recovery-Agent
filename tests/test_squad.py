@@ -116,7 +116,7 @@ class TestComplianceOverseerAgent:
         action, checks = agent.intercept(case, ActionType.RETRY_PAYMENT, profile)
         assert isinstance(action, ActionType)
         assert isinstance(checks, list)
-        assert len(checks) == 5  # 5 guardrails
+        assert len(checks) == 6  # 6 guardrails (including hard decline)
 
     def test_intercept_blocks_opt_out(self):
         agent = ComplianceOverseerAgent()

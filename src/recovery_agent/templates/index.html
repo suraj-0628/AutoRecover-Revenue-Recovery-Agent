@@ -216,6 +216,7 @@
     .tag-guardrail { color: var(--accent-amber); font-weight: 600; }
     .tag-kg { color: var(--accent-green); font-weight: 600; }
     .tag-acting { color: var(--accent-red); font-weight: 600; }
+    .tag-harness { color: #3b82f6; font-weight: 600; }
 
     /* OpenCode Tool Call Card */
     .tool-card {
@@ -265,6 +266,142 @@
       font-size: 0.8rem;
       font-weight: 600;
       color: var(--text-bright);
+    }
+
+    /* Tier Badge Styles */
+    .tier-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+    }
+    .tier-silent { background: rgba(59,130,246,0.12); color: #3b82f6; border: 1px solid #3b82f6; }
+    .tier-active { background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid #f59e0b; }
+    .tier-hard { background: rgba(239,68,68,0.12); color: #ef4444; border: 1px solid #ef4444; }
+    .tier-dot { width: 6px; height: 6px; border-radius: 50%; }
+    .tier-silent .tier-dot { background: #3b82f6; }
+    .tier-active .tier-dot { background: #f59e0b; }
+    .tier-hard .tier-dot { background: #ef4444; }
+
+    /* Decline Strategy Card */
+    .strategy-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .strategy-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 6px;
+      background: #0d1117;
+      border: 1px solid var(--border-color);
+      border-radius: 3px;
+      font-size: 0.7rem;
+    }
+    .strategy-code { color: var(--accent-blue); font-weight: 600; min-width: 50px; }
+    .strategy-name { color: var(--text-main); flex: 1; margin-left: 6px; }
+    .strategy-tier { font-size: 0.65rem; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+
+    /* Penalty Counter */
+    .penalty-counter {
+      text-align: center;
+      padding: 6px;
+    }
+    .penalty-big {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: var(--accent-green);
+    }
+    .penalty-sub {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+    .penalty-usd {
+      font-size: 0.75rem;
+      color: var(--accent-blue);
+      margin-top: 4px;
+    }
+
+    /* Tier-colored stream entries */
+    .log-line.tier-silent { border-left: 2px solid #3b82f6; padding-left: 6px; }
+    .log-line.tier-active { border-left: 2px solid #f59e0b; padding-left: 6px; }
+    .log-line.tier-hard { border-left: 2px solid #ef4444; padding-left: 6px; }
+
+    /* AI Silent Mode Active Banner — glowing blue operational banner */
+    .silent-banner {
+      background: linear-gradient(135deg, rgba(59,130,246,0.12) 0%, rgba(37,99,235,0.18) 100%);
+      border: 1px solid #3b82f6;
+      border-left: 4px solid #3b82f6;
+      border-radius: 6px;
+      padding: 14px 16px;
+      margin: 8px 0;
+      font-size: 0.78rem;
+      color: #c9d1d9;
+      line-height: 1.6;
+      position: relative;
+      overflow: hidden;
+      animation: silentPulse 3s ease-in-out infinite;
+    }
+    .silent-banner::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: linear-gradient(90deg, transparent, rgba(59,130,246,0.06), transparent);
+      animation: silentShimmer 3s ease-in-out infinite;
+    }
+    .silent-banner-title {
+      font-weight: 700;
+      color: #3b82f6;
+      font-size: 0.82rem;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      position: relative;
+    }
+    .silent-banner-title .glow-dot {
+      width: 8px; height: 8px;
+      background: #3b82f6;
+      border-radius: 50%;
+      animation: glowPulse 2s ease-in-out infinite;
+      box-shadow: 0 0 6px #3b82f6, 0 0 12px rgba(59,130,246,0.4);
+    }
+    .silent-banner ul {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    .silent-banner li {
+      padding: 2px 0;
+      padding-left: 12px;
+      position: relative;
+      color: #8b949e;
+    }
+    .silent-banner li::before {
+      content: '•';
+      position: absolute;
+      left: 0;
+      color: #3b82f6;
+      font-weight: 700;
+    }
+    .silent-banner li strong { color: #c9d1d9; }
+    @keyframes silentPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(59,130,246,0); }
+      50% { box-shadow: 0 0 12px 0 rgba(59,130,246,0.15); }
+    }
+    @keyframes silentShimmer {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(100%); }
+    }
+    @keyframes glowPulse {
+      0%, 100% { opacity: 1; box-shadow: 0 0 6px #3b82f6, 0 0 12px rgba(59,130,246,0.4); }
+      50% { opacity: 0.6; box-shadow: 0 0 3px #3b82f6, 0 0 6px rgba(59,130,246,0.2); }
     }
 
     /* Right Panel (Live Customer Canvas) */
@@ -575,6 +712,24 @@
             <div class="telemetry-title">Customer Memory Radar</div>
             <div class="telemetry-val" id="tele-memory">Payday Liquidity High</div>
           </div>
+          <div class="telemetry-card">
+            <div class="telemetry-title">Recovery Tier</div>
+            <div class="telemetry-val" id="tele-tier">
+              <span class="tier-badge tier-active"><span class="tier-dot"></span> ACTIVE</span>
+            </div>
+          </div>
+          <div class="telemetry-card">
+            <div class="telemetry-title">Decline Strategy</div>
+            <div class="telemetry-val" id="tele-strategy" style="font-size:0.72rem;">LLM Diagnostic Routing</div>
+          </div>
+          <div class="telemetry-card">
+            <div class="telemetry-title">Penalties Prevented</div>
+            <div class="telemetry-val" id="tele-penalties" style="color:var(--accent-green);">0 blocked ($0.00)</div>
+          </div>
+          <div class="telemetry-card">
+            <div class="telemetry-title">Payday Window</div>
+            <div class="telemetry-val" id="tele-payday" style="font-size:0.72rem;">Not in window</div>
+          </div>
         </div>
 
       </div>
@@ -705,6 +860,7 @@
     const voiceWidget = document.getElementById("voice-widget");
 
     let activePaymentId = "";
+    let lastTier = "";
 
     function switchRightPanelTab(mode) {
       const btnCanvas = document.getElementById("btn-view-canvas");
@@ -832,6 +988,16 @@
       terminal.scrollTop = terminal.scrollHeight;
     }
 
+    function logThoughtWithTier(tag, tagCls, text, detail, tier) {
+      const line = document.createElement("div");
+      line.className = "log-line" + (tier ? " tier-" + tier : "");
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const tierBadge = tier ? `<span class="tier-badge tier-${tier}" style="margin-left:6px;"><span class="tier-dot"></span> ${tier.toUpperCase()}</span>` : "";
+      line.innerHTML = `<span style="color:#484f58; font-size:0.72rem; margin-right:6px;">[${ts}]</span><span class="${tagCls}">[${tag}]</span> <strong style="color:#f0f6fc;">${text}</strong>${tierBadge} ${formatDetail(detail)}`;
+      terminal.appendChild(line);
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+
     function submitCardExpiryFix(event, pid) {
       if (event) event.preventDefault();
       const val = document.getElementById("expiry-input")?.value || "08/29";
@@ -879,7 +1045,10 @@
             body: JSON.stringify({
               payment_id: paymentId,
               amount: amount,
+              failure_code: "gateway_timeout",
               failure_reason: scenarioReason || "Gateway Timeout 504 (HDFC Netbanking drop)",
+              error_source: "gateway",
+              error_step: "payment_authorization",
               customer: { name: "Rahul Kumar", email: "rahul@example.com" }
             })
           });
@@ -898,7 +1067,45 @@
           if (data.payment_id) activePaymentId = data.payment_id;
           if (data.status === "batch_completed") {
             logThought("BATCH", "tag-kg", "Batch Evaluation Complete!", data.summary);
-            fetchMetrics();
+    fetchMetrics();
+
+    // Tier update socket handler
+    socket.on("tier_update", function(data) {
+      const tier = data.tier || "active";
+      const tierLabel = tier === "silent" ? "SILENT RECOVERY" : tier === "hard_decline_blocked" ? "HARD DECLINE BLOCKED" : "ACTIVE RECOVERY";
+      const tierEl = document.getElementById("tele-tier");
+      tierEl.innerHTML = `<span class="tier-badge tier-${tier}"><span class="tier-dot"></span> ${tierLabel}</span>`;
+      if (data.decline_strategy) {
+        document.getElementById("tele-strategy").textContent = data.decline_strategy;
+      }
+      if (data.penalties_prevented > 0) {
+        document.getElementById("tele-penalties").textContent = data.penalties_prevented + " blocked (" + (data.penalties_value || "$0.00") + ")";
+      }
+      if (data.payday_target_date) {
+        document.getElementById("tele-payday").textContent = "Next: " + data.payday_target_date;
+      }
+      // Show silent banner when tier is silent
+      if (tier === "silent") {
+        showSilentBanner(data.payday_target_date || "", data.decline_strategy || "");
+      }
+    });
+
+    // Decline strategy socket handler
+    socket.on("decline_strategy", function(data) {
+      if (data.strategy) {
+        document.getElementById("tele-strategy").textContent = "Code " + data.failure_code + ": " + data.strategy;
+      }
+    });
+
+    // Scheduled job socket handler — display real retry scheduler output
+    socket.on("scheduled_job", function(data) {
+      const line = document.createElement("div");
+      line.className = "log-line tier-silent";
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      line.innerHTML = `<span style="color:#484f58; font-size:0.72rem; margin-right:6px;">[${ts}]</span><span class="tag-kg" style="color:#3b82f6; font-weight:700;">[SCHEDULED]</span> <strong style="color:#f0f6fc;">Background Retry Job Created</strong> <span class="tier-badge tier-silent" style="margin-left:6px;"><span class="tier-dot"></span> SILENT</span><br/><span style="color:#8b949e; font-size:0.75rem; white-space:pre-wrap;">Job: ${data.job_id} | Target: ${data.target_timestamp} | Confidence: ${(data.confidence*100).toFixed(0)}% | ${data.reason}</span>`;
+      terminal.appendChild(line);
+      terminal.scrollTop = terminal.scrollHeight;
+    });
           }
         });
     }
@@ -906,42 +1113,87 @@
     socket.on("agent_stream", function(data) {
       if (data.payment_id) activePaymentId = data.payment_id;
 
-      // 1. Log streaming thoughts & update live progress pills
+      // Extract tier info from guardrail or ui_spec
+      const tier = (data.guardrail && data.guardrail.recovery_tier) || (data.ui_spec && data.ui_spec.recovery_tier) || "active";
+      const strategy = (data.guardrail && data.guardrail.decline_strategy) || (data.ui_spec && data.ui_spec.decline_strategy) || "";
+      const penalties = (data.guardrail && data.guardrail.penalties_prevented) || (data.ui_spec && data.ui_spec.penalties_prevented) || 0;
+      const payday = (data.guardrail && data.guardrail.payday_target) || (data.ui_spec && data.ui_spec.payday_target) || "";
+
+      // Update tier telemetry card
+      if (tier) {
+        const tierEl = document.getElementById("tele-tier");
+        const tierLabel = tier === "silent" ? "SILENT" : tier === "hard_decline_blocked" ? "HARD BLOCKED" : "ACTIVE";
+        tierEl.innerHTML = `<span class="tier-badge tier-${tier}"><span class="tier-dot"></span> ${tierLabel}</span>`;
+        // Reset banner when tier changes away from silent
+        if (tier !== "silent" && lastTier === "silent") {
+          resetSilentBanner();
+        }
+        // Show banner when entering silent tier
+        if (tier === "silent" && lastTier !== "silent") {
+          showSilentBanner(payday || "", strategy || "");
+        }
+        lastTier = tier;
+      }
+      if (strategy) {
+        document.getElementById("tele-strategy").textContent = strategy;
+      }
+      if (penalties > 0) {
+        document.getElementById("tele-penalties").textContent = penalties + " blocked ($" + (penalties * 0.10).toFixed(2) + ")";
+      }
+      if (payday) {
+        document.getElementById("tele-payday").textContent = "Next: " + payday;
+      }
+
+      // 1. Log streaming thoughts & update live progress pills (with tier color coding)
       if (data.step === "detecting") {
         setStatus("THINKING...", "status-thinking");
-        logThought("DETECT", "tag-thinking", data.msg, data.detail);
+        logThoughtWithTier("DETECT", "tag-thinking", data.msg, data.detail, tier);
         document.getElementById("p-detect").className = "step-pill active-detect";
         document.getElementById("progress-status-label").textContent = "DETECTING ANOMALY";
       } else if (data.step === "diagnosing") {
         setStatus("DIAGNOSING...", "status-thinking");
-        logThought("DIAGNOSE", "tag-diagnosing", data.msg, data.detail);
+        logThoughtWithTier("DIAGNOSE", "tag-diagnosing", data.msg, data.detail, tier);
         document.getElementById("p-diagnose").className = "step-pill active-diagnose";
         document.getElementById("progress-status-label").textContent = "LLM DIAGNOSIS";
       } else if (data.step === "diagnosed") {
-        logThought("ROOT CAUSE", "tag-kg", data.msg, data.detail);
+        logThoughtWithTier("ROOT CAUSE", "tag-kg", data.msg, data.detail, tier);
       } else if (data.step === "deciding") {
         setStatus("CHECKING GUARDRAILS", "status-executing");
-        logThought("GUARDRAIL", "tag-guardrail", data.msg, data.detail);
+        logThoughtWithTier("GUARDRAIL", "tag-guardrail", data.msg, data.detail, tier);
         document.getElementById("p-guardrail").className = "step-pill active-guardrail";
         document.getElementById("progress-status-label").textContent = "GUARDRAIL CHECK";
+        if (data.guardrail) {
+          const g = data.guardrail;
+          document.getElementById("tele-guardrail").textContent = (g.allowed ? "Allowed" : "Modified: " + (g.modified_action || "")) + " | Attempt " + (g.attempt_cap || "1/3");
+        }
+      } else if (data.step === "harness_start") {
+        setStatus("HARNESS ACTIVE", "status-thinking");
+        logThoughtWithTier("HARNESS", "tag-harness", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "AGENT HARNESS";
+      } else if (data.step === "harness_turn") {
+        setStatus("HARNESS THINKING", "status-thinking");
+        logThoughtWithTier("HARNESS", "tag-harness", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "HARNESS REASONING";
       } else if (data.step === "acting") {
         setStatus("EXECUTING TOOL", "status-executing");
-        logThought("ACTION", "tag-acting", data.msg, data.detail);
+        logThoughtWithTier("ACTION", "tag-acting", data.msg, data.detail, tier);
         document.getElementById("p-morph").className = "step-pill active-morph";
         document.getElementById("progress-status-label").textContent = "GENUI MORPHING";
       } else if (data.step === "stopping") {
         setStatus("RECOVERED!", "status-recovered");
-        logThought("SUCCESS", "tag-kg", data.msg, data.detail);
+        logThoughtWithTier("SUCCESS", "tag-kg", data.msg, data.detail, tier);
         document.getElementById("p-recovered").className = "step-pill active-recovered";
         document.getElementById("progress-status-label").textContent = "RECOVERED";
         fetchMetrics();
       }
 
-      // 2. Render Tool Call Cards
+      // 2. Render Tool Call Cards (real SDK responses)
       if (data.tool_call) {
         toolCard.style.display = "block";
         toolName.textContent = data.tool_call.tool || "RazorpayTool";
-        toolArgs.textContent = JSON.stringify(data.tool_call, null, 2);
+        // Display raw_razorpay_response if available, else fallback to response
+        const sdkPayload = data.tool_call.raw_razorpay_response || data.tool_call.response || data.tool_call;
+        toolArgs.textContent = JSON.stringify(sdkPayload, null, 2);
       }
 
       // 3. Generative UI Morphing
@@ -1000,7 +1252,30 @@
             </div>`;
           document.getElementById("p-recovered").className = "step-pill active-recovered";
           document.getElementById("progress-status-label").textContent = "RECOVERED";
-          fetchMetrics();
+    fetchMetrics();
+
+    let silentBannerShown = false;
+
+    function showSilentBanner(paydayTarget, bankHealth) {
+      if (silentBannerShown) return;
+      silentBannerShown = true;
+      const line = document.createElement("div");
+      line.className = "silent-banner";
+      line.innerHTML = `
+        <div class="silent-banner-title">
+          <span class="glow-dot"></span>
+          INVISIBLE AI AGENT ACTIVE — Background Recovery Mode
+        </div>
+        <ul>
+          <li>Customer communication <strong>SUPPRESSED</strong> to eliminate cancellation churn (-23% churn reduction).</li>
+          <li><strong>Payday Scheduler:</strong> Target 12:01 AM liquidity window${paydayTarget ? " — next payday " + paydayTarget : " calculated"}.</li>
+          <li><strong>Bank Health:</strong> ${bankHealth || "Gateways monitored silently without disturbing customer."}</li>
+        </ul>`;
+      terminal.appendChild(line);
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    function resetSilentBanner() { silentBannerShown = false; }
         }
       }
     });

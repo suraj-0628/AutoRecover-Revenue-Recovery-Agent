@@ -320,3 +320,109 @@ class TestFullEpisode:
             assert "recovery_rate" in stats
             assert stats["total"] > 0
             assert 0 <= stats["recovery_rate"] <= 1
+
+
+class TestBenchmarkAndZTest:
+    """Tests for run_before_after_benchmark and _z_test_proportions."""
+
+    def test_z_test_equal_proportions(self):
+        from recovery_agent.eval.chaos_gym import _z_test_proportions
+        result = _z_test_proportions(0.5, 100, 0.5, 100)
+        assert abs(result["z"]) < 0.01
+        assert result["p_value"] > 0.05
+        assert not result["significant"]
+
+    def test_z_test_different_proportions(self):
+        from recovery_agent.eval.chaos_gym import _z_test_proportions
+        result = _z_test_proportions(0.7, 100, 0.4, 100)
+        assert result["z"] > 0
+        assert result["significant"]
+        assert result["effect_size"] == 0.3
+
+    def test_z_test_zero_sample(self):
+        from recovery_agent.eval.chaos_gym import _z_test_proportions
+        result = _z_test_proportions(0.5, 0, 0.5, 100)
+        assert result["p_value"] == 1.0
+        assert not result["significant"]
+
+    def test_z_test_edge_cases(self):
+        from recovery_agent.eval.chaos_gym import _z_test_proportions
+        # All success vs 50%: should be significant (100% is very different from 50%)
+        r1 = _z_test_proportions(1.0, 50, 0.5, 50)
+        assert r1["z"] > 0  # Large positive z
+        # All failure vs 50%: should be significant
+        r2 = _z_test_proportions(0.0, 50, 0.5, 50)
+        assert r2["z"] < 0  # Large negative z
+
+    def test_benchmark_returns_all_sections(self):
+        from recovery_agent.eval.chaos_gym import run_before_after_benchmark
+        result = run_before_after_benchmark(seed=42, count=3)
+        assert "benchmark_config" in result
+        assert "baseline" in result
+        assert "enhanced" in result
+        assert "comparison" in result
+        assert "statistical_significance" in result
+        assert "persona_comparison" in result
+        assert "summary" in result
+
+    def test_benchmark_config_matches(self):
+        from recovery_agent.eval.chaos_gym import run_before_after_benchmark
+        result = run_before_after_benchmark(seed=99, count=3)
+        assert result["benchmark_config"]["episodes"] == 3
+        assert result["benchmark_config"]["seed"] == 99
+        assert result["benchmark_config"]["identical_seeds"] is True
+
+    def test_benchmark_baseline_structure(self):
+        from recovery_agent.eval.chaos_gym import run_before_after_benchmark
+        result = run_before_after_benchmark(seed=42, count=3)
+        b = result["baseline"]
+        assert 0 <= b["recovery_rate"] <= 1
+        assert b["recovered"] <= 3
+        assert b["total_amount"] > 0
+        assert b["penalties_prevented"] >= 0
+
+    def test_benchmark_enhanced_structure(self):
+        from recovery_agent.eval.chaos_gym import run_before_after_benchmark
+        result = run_before_after_benchmark(seed=42, count=3)
+        e = result["enhanced"]
+        assert 0 <= e["recovery_rate"] <= 1
+        assert e["recovered"] <= 3
+        assert e["silent_tier_recoveries"] >= 0
+        assert e["silent_tier_total"] >= 0
+
+    def test_benchmark_comparison_structure(self):
+        from recovery_agent.eval.chaos_gym import run_before_after_benchmark
+        result = run_before_after_benchmark(seed=42, count=3)
+        c = result["comparison"]
+        assert "recovery_rate_lift" in c
+        assert "yield_lift" in c
+        assert "friction_delta" in c
+        assert "penalties_saved" in c
+        assert "penalties_value_usd" in c
+        assert "penalties_value_inr" in c
+
+    def test_benchmark_significance_structure(self):
+        from recovery_agent.eval.chaos_gym import run_before_after_benchmark
+        result = run_before_after_benchmark(seed=42, count=3)
+        sig = result["statistical_significance"]
+        assert "z" in sig
+        assert "p_value" in sig
+        assert "significant" in sig
+        assert isinstance(sig["significant"], bool)
+
+    def test_benchmark_summary_is_string(self):
+        from recovery_agent.eval.chaos_gym import run_before_after_benchmark
+        result = run_before_after_benchmark(seed=42, count=3)
+        assert isinstance(result["summary"], str)
+        assert "Benchmark:" in result["summary"]
+
+    def test_baseline_episode_returns_dict(self):
+        from recovery_agent.eval.chaos_gym import _run_baseline_episode, RevenueLossEnvironment
+        env = RevenueLossEnvironment(seed=42)
+        episode = _run_baseline_episode(env, 42)
+        assert isinstance(episode, dict)
+        assert "recovered" in episode
+        assert "amount" in episode
+        assert "steps" in episode
+        assert "penalties_prevented" in episode
+        assert episode["steps"] >= 1

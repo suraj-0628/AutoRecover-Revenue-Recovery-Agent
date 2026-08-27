@@ -8,7 +8,7 @@ from recovery_agent.agent.evaluation import run_batch_evaluation
 from recovery_agent.models import Case
 
 
-def run_single(payment_id: str = "pay_test_001") -> None:
+def run_single(payment_id: str = "pay_test_001", use_harness: bool = False) -> None:
     """Run a single case for demo."""
     from recovery_agent.agent.test_generator import generate_payment_event, FAILURE_SCENARIOS
 
@@ -20,9 +20,10 @@ def run_single(payment_id: str = "pay_test_001") -> None:
     print(f"  Amount: {event.currency} {event.amount}")
     print(f"  Reason: {event.failure_reason}")
     print(f"  Code: {event.failure_code}")
+    print(f"  Mode: {'AgentHarness' if use_harness else 'LangGraph'}")
     print()
 
-    agent = RecoveryAgent()
+    agent = RecoveryAgent(use_harness=use_harness)
     case = Case(payment=event)
     final_case = agent.run(case)
 
@@ -96,12 +97,12 @@ def run_frontend():
     main()
 
 
-def run_chaos_gym(episodes: int = 10, seed: int | None = None):
+def run_chaos_gym(episodes: int = 10, seed: int | None = None, use_harness: bool = False):
     """Run the Adversarial Chaos Gym evaluation with trajectory benchmarking."""
     from recovery_agent.eval.chaos_gym import run_chaos_gym as _run_chaos_gym
     from recovery_agent.eval.trajectory_benchmark import TrajectoryBenchmark
 
-    result = _run_chaos_gym(episodes=episodes, seed=seed)
+    result = _run_chaos_gym(episodes=episodes, seed=seed, use_harness=use_harness)
 
     # Run trajectory benchmarking on all episodes
     benchmark = TrajectoryBenchmark()
@@ -151,11 +152,12 @@ def main():
     parser.add_argument("--failure-type", type=str, default="card_expired", help="Failure type for retry-schedule/communicate")
     parser.add_argument("--channel", type=str, default="email", help="Channel for communicate command")
     parser.add_argument("--attempt", type=int, default=1, help="Attempt number for retry-schedule")
+    parser.add_argument("--harness", action="store_true", help="Use TrueForge AgentHarness (multi-turn tool-calling loop)")
 
     args = parser.parse_args()
 
     if args.command == "single":
-        run_single(args.payment_id)
+        run_single(args.payment_id, use_harness=args.harness)
     elif args.command == "batch":
         run_batch(args.cases, args.seed)
     elif args.command == "webhook":
@@ -169,7 +171,7 @@ def main():
     elif args.command == "communicate":
         run_communicate(args.failure_type, args.channel)
     elif args.command == "chaos-gym":
-        run_chaos_gym(args.cases, args.seed)
+        run_chaos_gym(args.cases, args.seed, use_harness=args.harness)
 
 
 if __name__ == "__main__":

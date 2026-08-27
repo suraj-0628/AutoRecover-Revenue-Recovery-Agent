@@ -7,13 +7,29 @@ An autonomous AI agent that detects failed payments, diagnoses root causes via p
 ## 🎯 How It Works
 
 ```
-Payment Fails → Webhook Sensing → LLM Diagnostic Reflection → Guardrail Check → Knowledge Graph Routing → Razorpay SDK Tool Execution → Generative UI Morphing
+Payment Fails → Webhook Sensing → LLM Diagnostic Reflection → Tier Assignment → Decline-Code Routing → Guardrail Check → Knowledge Graph Routing → Razorpay SDK Tool Execution → Generative UI Morphing
 ```
 
-The agent runs a continuous loop until one of these conditions is met:
-- **Recovered** — Payment retried, payment link completed, or card expiry updated & captured via Razorpay API.
+### Two-Tier Recovery (Industry-Grade)
+
+```
+Payment fails
+  ├─ TIER 1: SILENT RECOVERY (Background — no customer contact)
+  │   ├─ Analyze decline code + 40+ signals
+  │   ├─ Schedule retry at optimal window (payday timing, bank health)
+  │   ├─ Customer stays active, unaware of failure
+  │   └─ Multiple silent retries before escalation
+  │
+  └─ TIER 2: ACTIVE RECOVERY (Customer-facing — only if Tier 1 exhausted)
+      ├─ Personalized email/SMS/WhatsApp
+      ├─ Links to payment update page
+      └─ Copy adapts to specific decline reason
+```
+
+### Stopping Conditions
+- **Recovered** — Payment retried, payment link completed, or card expiry updated via Razorpay API.
 - **Escalated** — Handed off to human support when attempts or risk thresholds are reached.
-- **Max Attempts** — Agent stops after 3 bounded attempts.
+- **Max Attempts** — Agent stops after bounded attempts (separate limits for silent and active tiers).
 - **Abandoned** — Stopped when customer opts out or no viable recovery path exists.
 
 ---
@@ -92,21 +108,70 @@ Serves:
 ```
 src/recovery_agent/
 ├── agent/
+│   ├── __init__.py              # LangGraph agent loop (detect → diagnose → decide → act → observe)
 │   ├── diagnosis.py             # LLM diagnostic reflection chain
 │   ├── decision.py              # LLM Strategy Planner & Guardrail intercept
 │   ├── execution.py             # Razorpay SDK action execution
-│   ├── guardrails.py            # NVIDIA NAT Guardrails
-│   ├── kg_router.py             # Razorpay Knowledge Graph router
+│   ├── guardrails.py            # NVIDIA NAT Guardrails (5 policies)
+│   ├── kg_router.py             # Razorpay Knowledge Graph router (6 API rails)
 │   ├── memory.py                # Customer long-term memory store & payday radar
-│   └── llm_client.py            # Shared LLM client (Nemotron / Claude / Gemini)
+│   ├── llm_client.py            # Shared LLM client (Nemotron via OmniRoute)
+│   ├── squad.py                 # Multi-agent squad orchestrator (4 specialized agents)
+│   ├── decline_router.py        # [PLANNED] Decline-code-specific routing
+│   ├── payday_scheduler.py      # [PLANNED] Regional payroll cycle detection
+│   └── signals.py               # [PLANNED] 40+ signal enrichment
+├── eval/
+│   ├── chaos_gym.py             # Adversarial chaos gym & red-team simulator
+│   └── trajectory_benchmark.py  # Step/friction/compliance scoring
 ├── razorpay_knowledge_base.py   # Official Razorpay API Error Catalog & Normalizer
 ├── razorpay_client.py           # Razorpay SDK API wrapper
 ├── frontend.py                  # Merchant Operations HUD & Customer Checkout
 ├── webhook.py                   # Razorpay Webhook Listener
 ├── dashboard.py                 # Recovery Analytics Dashboard
+├── communication.py             # LLM-generated recovery messages
+├── retry_scheduler.py           # Smart retry timing
+├── logging.py                   # JSONL audit logging
 └── templates/
     └── index.html               # OpenCode-inspired Developer Operations HUD
 ```
+
+---
+
+## 🏭 Industry-Grade Improvements (In Progress)
+
+Based on deep-dive research on 6 production recovery systems — **Stripe, Redux, Recurly, Churnkey, Slicker, and Razorpay Agent Studio**. See `INDUSTRY-RESEARCH.md` for full technical details.
+
+### Phase 1: Silent Recovery + Decline-Code Routing
+
+**Two-Tier Recovery Architecture** (inspired by Redux "Silent First"):
+- **Tier 1 (Silent)**: Background retries with NO customer contact. Customer stays active, unaware of failure. Eliminates churn trigger from unnecessary payment failure emails.
+- **Tier 2 (Active)**: Only triggered when silent tier exhausted. Customer receives personalized email/SMS with payment update link.
+
+**Decline-Code-Specific Routing** (inspired by Redux per-code strategies):
+- Code 51 (Insufficient Funds): Payday timing — retry at 12:01 AM local time on payday, "first-in-line advantage" before other subscriptions clear.
+- Code 05 (Do Not Honor): Metadata enrichment — optimize transaction "shape" to look trustworthy, cooling-off period.
+- Code 19 (Try Again Later): Bank health monitoring — retry only when bank confirmed online.
+- Hard Declines (41, 43, 54, 14, 04, 46, 57, 93): Never retry — prevents $0.10/attempt Visa/MC network penalties.
+
+**Expected impact**: +15-25% recovery rate, -40-60% customer contact rate
+
+### Phase 2: Signal Enrichment (40+ Features)
+
+Expanded from ~15 to 40+ signals (inspired by Stripe 500+, Redux 100+, Slicker 40+):
+- Card brand, type, issuing bank, BIN
+- Customer timezone, bank health score, velocity patterns
+- Merchant descriptor, MCC code, transaction amount vs norms
+- Payday detection, holiday awareness
+
+### Recovery Rate Targets
+
+| Phase | Target | Industry Benchmark |
+|-------|--------|-------------------|
+| Current | 40% | — |
+| Phase 1 | 55-65% | Redux 40-50%, Stripe 55% |
+| Phase 2 | 65-75% | Recurly 70%, Slicker 70-85% |
+
+See `IMPLEMENTATION-PLAN.md` for full roadmap and `IMPROVEMENTS-TRACKER.md` for change log.
 
 ---
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import time
+import traceback
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -31,12 +32,75 @@ razorpay_client = RazorpayClient()
 payments: dict[str, dict] = {}
 agent_trails: dict[str, list[dict]] = {}
 pending_actions: dict[str, dict] = {}  # payment_id → action waiting for customer response
+active_agent_payments: set[str] = set()  # tracks which payment_ids have active agent threads
 
 
 def push_event(payment_id: str, event_type: str, data: dict):
     payload = {"payment_id": payment_id, "event": event_type, "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"), **data}
     socketio.emit("agent_event", payload)
     socketio.emit("agent_stream", payload)
+
+
+TIER_COLORS = {
+    "silent": "#3b82f6",
+    "active": "#f59e0b",
+    "hard_decline_blocked": "#ef4444",
+}
+TIER_BADGES = {
+    "silent": "SILENT RECOVERY",
+    "active": "ACTIVE RECOVERY",
+    "hard_decline_blocked": "HARD DECLINE BLOCKED",
+}
+
+# Decline code → strategy description mapping (for telemetry card)
+DECLINE_STRATEGY_DISPLAY = {
+    "insufficient_funds": "Payday Timing Scheduler",
+    "card_expired": "Card Update Flow",
+    "network_timeout": "Metadata Enrichment + Retry",
+    "bank_declined": "Multi-Rail Failover",
+    "mandate_revoked": "Re-Auth Notification",
+    "risk_block": "Human Escalation",
+    "card_declined": "Network Penalty Prevention",
+    "unknown": "LLM Diagnostic Routing",
+}
+
+# Network fine rates (Visa/MC per-attempt penalty)
+NETWORK_FINE_PER_ATTEMPT = 0.10  # USD
+
+
+def push_tier_event(
+    payment_id: str,
+    tier: str,
+    penalties_prevented: int = 0,
+    decline_strategy: str = "",
+    payday_target_date: str = "",
+):
+    """Broadcast tier badge, penalty counter, and strategy info to merchant dashboard."""
+    tier_badge = TIER_BADGES.get(tier, "ACTIVE RECOVERY")
+    tier_color = TIER_COLORS.get(tier, "#f59e0b")
+    socketio.emit("tier_update", {
+        "payment_id": payment_id,
+        "tier": tier,
+        "tier_badge": tier_badge,
+        "tier_color": tier_color,
+        "penalties_prevented": penalties_prevented,
+        "penalties_value": f"${penalties_prevented * NETWORK_FINE_PER_ATTEMPT:.2f}",
+        "penalties_value_inr": f"INR {penalties_prevented * 8.30:.2f}",
+        "decline_strategy": decline_strategy,
+        "payday_target_date": payday_target_date,
+        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+    })
+
+
+def push_decline_strategy_event(payment_id: str, failure_code: str, strategy: str, tier: str):
+    """Emit decline-code strategy routing update for the telemetry card."""
+    socketio.emit("decline_strategy", {
+        "payment_id": payment_id,
+        "failure_code": failure_code,
+        "strategy": strategy,
+        "tier": tier,
+        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+    })
 
 
 def format_reasoning_newlines(text: str) -> str:
@@ -65,16 +129,55 @@ def format_reasoning_newlines(text: str) -> str:
     return "\n".join(lines)
 
 
-def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, customer: dict, scenario_type: str = "standard"):
+def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, customer: dict, scenario_type: str = "standard", failure_code: str = "", error_source: str = "", error_step: str = ""):
     """Run agent step by step with live streaming thoughts, tool cards, guardrails, and LLM-generated UI morphing."""
-    from recovery_agent.agent.diagnosis import diagnose_payment_failure, run_diagnosis
+    # Bug #2: Prevent duplicate agent threads for the same payment
+    if payment_id in active_agent_payments:
+        print(f"[Frontend] Agent thread already active for {payment_id}. Skipping duplicate trigger.")
+        return
+    active_agent_payments.add(payment_id)
+
+    try:
+        _run_agent_for_payment_inner(payment_id, amount, failure_reason, customer, scenario_type, failure_code, error_source, error_step)
+    except Exception as e:
+        # Bug #3: Surface errors to the WebSocket trail instead of silently crashing
+        print(f"[Frontend] Agent execution error for {payment_id}: {e}")
+        try:
+            push_event(payment_id, "error", {
+                "step": "error",
+                "msg": f"Agent Execution Error: {str(e)}",
+                "detail": traceback.format_exc(),
+                "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            })
+        except Exception:
+            pass
+        if payment_id in payments:
+            payments[payment_id]["status"] = "failed"
+            payments[payment_id]["trail"] = payments[payment_id].get("trail", [])
+            payments[payment_id]["trail"].append({
+                "step": "error",
+                "msg": f"Agent Execution Error: {str(e)}",
+                "detail": traceback.format_exc(),
+                "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            })
+    finally:
+        active_agent_payments.discard(payment_id)
+
+
+def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason: str, customer: dict, scenario_type: str = "standard", failure_code: str = "", error_source: str = "", error_step: str = ""):
+    """Inner agent execution — wires real AgentHarness, Razorpay SDK, and retry scheduler."""
+    import uuid
+    from recovery_agent.agent.diagnosis import run_diagnosis
     from recovery_agent.agent.decision import run_decision
     from recovery_agent.agent.execution import execute_action, observe_outcome
     from recovery_agent.agent.guardrails import GuardrailEngine
+    from recovery_agent.agent.harness import AgentHarness
     from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
     from recovery_agent.agent.memory import CustomerMemoryStore
     from recovery_agent.agent.llm_client import invoke_llm_json
-    from recovery_agent.models import Case, PaymentEvent, Attempt as AttemptModel, ActionType, GenerativeUISpec
+    from recovery_agent.agent.tools import execute_tool
+    from recovery_agent.models import Case, PaymentEvent, ActionType, GenerativeUISpec
+    from recovery_agent.retry_scheduler import get_retry_windows, get_next_retry_time
 
     memory_store = CustomerMemoryStore()
     guardrail_engine = GuardrailEngine()
@@ -104,6 +207,12 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
         push_event(payment_id, step, entry)
 
     from recovery_agent.razorpay_knowledge_base import normalize_razorpay_failure
+    from recovery_agent.agent.decline_router import DeclineCodeRouter
+    from recovery_agent.agent.payday_scheduler import PaydayScheduler
+
+    decline_router = DeclineCodeRouter()
+    payday_scheduler = PaydayScheduler()
+
     raw_reason = failure_reason or "Payment failed during checkout"
     norm = normalize_razorpay_failure(raw_reason)
 
@@ -112,21 +221,21 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
         customer_id=customer_email,
         amount=amount,
         currency="INR",
-        failure_code=norm.get("failure_code", "payment_failed"),
+        failure_code=failure_code or norm.get("failure_code", "payment_failed"),
         failure_reason=raw_reason,
         metadata={
             "customer_name": customer.get("name", "Rahul Kumar"),
             "scenario": scenario_type,
-            "error_code": norm.get("error_code", "BAD_REQUEST_ERROR"),
-            "error_source": norm.get("error_source", "gateway"),
-            "error_step": norm.get("error_step", "payment_authorization"),
+            "error_code": failure_code or norm.get("error_code", "BAD_REQUEST_ERROR"),
+            "error_source": error_source or norm.get("error_source", "gateway"),
+            "error_step": error_step or norm.get("error_step", "payment_authorization"),
             "error_description": raw_reason,
             "recommended_rail": norm.get("recommended_rail", "payment_link"),
         },
     )
     case = Case(payment=event, max_attempts=3)
 
-    # 1. SENSING / DETECT
+    # ── 1. DETECT ──
     emit_thought(
         step="detecting",
         thought=f"Anomaly Detected on {payment_id}: {failure_reason}",
@@ -138,71 +247,219 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
             "risk_score": 0.1,
         },
     )
-    time.sleep(0.4)
 
-    # 2. DIAGNOSE (LLM Diagnostic Reflection — primary method)
+    # ── 2. DIAGNOSE (real LLM diagnosis) ──
     emit_thought(
         step="diagnosing",
         thought="Initiating LLM Diagnostic Reflection Engine...",
         detail="Nemotron analyzing raw failure payload, customer history, bank health signals",
     )
-    time.sleep(0.4)
     case = run_diagnosis(case)
     cause = case.diagnosis.root_cause.value if case.diagnosis else "unknown"
     confidence = case.diagnosis.confidence if case.diagnosis else 0.7
 
-    # Discover optimal API rail via Knowledge Graph
+    # Extract RAG groundedness from diagnosis reasoning if present
+    groundedness = 0.0
+    rag_evidence = ""
+    if case.diagnosis and "RAG Grounded" in case.diagnosis.reasoning:
+        import re as _re
+        grounded_match = _re.search(r"groundedness=([0-9.]+)", case.diagnosis.reasoning)
+        if grounded_match:
+            groundedness = float(grounded_match.group(1))
+        rag_evidence = "Grounded via LlamaIndex RAG"
+
     try:
         recommended_rails = kg_router.discover_recovery_path(cause)
     except Exception:
         recommended_rails = ["payment_link", "upi_autopay"]
 
-    diag_reasoning = format_reasoning_newlines(case.diagnosis.reasoning) if case.diagnosis else 'Analyzed gateway failure payload'
+    diag_reasoning = format_reasoning_newlines(case.diagnosis.reasoning) if case.diagnosis else "Analyzed gateway failure payload"
+
+    rag_detail = f" | RAG Groundedness: {groundedness:.0%}" if groundedness > 0 else ""
 
     emit_thought(
         step="diagnosed",
-        thought=f"Root Cause Confirmed: {cause.upper()} (Confidence: {confidence:.0%})",
+        thought=f"Root Cause Confirmed: {cause.upper()} (Confidence: {confidence:.0%}{rag_detail})",
         detail=f"Reasoning:\n{diag_reasoning}",
         tool_call={
             "tool": "RazorpayKnowledgeGraph.discover_recovery_path",
             "args": {"failure_code": cause, "current_rail": "card"},
-            "result": {"target_rail": recommended_rails[0] if recommended_rails else "payment_link"},
+            "raw_razorpay_response": {"target_rail": recommended_rails[0] if recommended_rails else "payment_link"},
         },
     )
-    time.sleep(0.4)
 
-    # 3. DECIDE & GUARDRAIL INTERCEPT
+    # ── 3. DECIDE (real LLM strategy planner + guardrails) ──
     case.attempt_count = 0
     case = run_decision(case)
     action_val = case.payment.metadata.get("decided_action", "send_notification")
     action = ActionType(action_val)
 
     strategy_reasoning = format_reasoning_newlines(case.payment.metadata.get("strategy_reasoning", ""))
+    recovery_tier = case.payment.metadata.get("recovery_tier", "active")
+    failure_code_norm = norm.get("failure_code", cause)
+    decline_strategy = DECLINE_STRATEGY_DISPLAY.get(cause, "LLM Diagnostic Routing")
+    payday_info = payday_scheduler.get_payday_info(country_code="IN")
+    payday_target = payday_info.get("next_payday", "") if isinstance(payday_info, dict) else ""
 
-    # Intercept with NVIDIA NAT Guardrails
+    push_tier_event(
+        payment_id,
+        tier=recovery_tier,
+        penalties_prevented=case.penalties_prevented,
+        decline_strategy=decline_strategy,
+        payday_target_date=payday_target,
+    )
+    push_decline_strategy_event(payment_id, failure_code_norm, decline_strategy, recovery_tier)
+
     approved_action, check_results = guardrail_engine.validate_action(
-        case=case,
-        action=action,
-        profile=cust_profile,
+        case=case, action=action, profile=cust_profile,
     )
     is_allowed = (approved_action == action)
     action_val = approved_action.value
 
+    # Build transparent guardrail header
+    if not is_allowed and check_results:
+        # Find which guardrail(s) triggered the modification/block
+        interceptors = []
+        for cr in check_results:
+            if cr.verdict.value in ("modified", "blocked"):
+                interceptors.append(f"{cr.guardrail} ({cr.verdict.value})")
+        interceptor_str = " / ".join(interceptors) if interceptors else "Multiple Policies"
+        thought_str = f"NVIDIA NAT Guardrail INTERCEPTED: Proposed '{action.value.upper()}' ──► Modified to '{approved_action.value.upper()}' (Policy: {interceptor_str})"
+    else:
+        thought_str = f"LLM Strategy Planner selected intervention: {approved_action.value.upper()}"
+
+    # Build guardrail detail with per-policy breakdown
+    guardrail_detail_parts = []
+    for cr in check_results:
+        if cr.verdict.value == "pass":
+            guardrail_detail_parts.append(f"  ✅ {cr.guardrail}: PASS — {cr.reason}")
+        elif cr.verdict.value == "modified":
+            guardrail_detail_parts.append(f"  ⚠️ {cr.guardrail}: MODIFIED → {cr.modified_action} — {cr.reason}")
+        elif cr.verdict.value == "blocked":
+            guardrail_detail_parts.append(f"  🚫 {cr.guardrail}: BLOCKED — {cr.reason}")
+    guardrail_detail = "\n".join(guardrail_detail_parts) if guardrail_detail_parts else "All guardrails passed"
+
     emit_thought(
         step="deciding",
-        thought=f"LLM Strategy Planner selected intervention: {action_val.upper()}",
-        detail=f"Strategic reasoning:\n{strategy_reasoning if strategy_reasoning else 'NVIDIA NAT Guardrails checked (Allowed)'}",
+        thought=thought_str,
+        detail=f"Guardrail Policy Breakdown:\n{guardrail_detail}\nStrategic reasoning:\n{strategy_reasoning if strategy_reasoning else 'NVIDIA NAT Guardrails evaluated all 6 policies'}",
         guardrail={
             "allowed": is_allowed,
             "quiet_hours_active": False,
-            "attempt_cap": "1/3",
+            "attempt_cap": f"{case.attempt_count + 1}/{case.max_attempts}",
             "double_debit_lock": "SECURE",
             "modified_action": approved_action.value if not is_allowed else None,
+            "recovery_tier": recovery_tier,
+            "decline_strategy": decline_strategy,
+            "penalties_prevented": case.penalties_prevented,
+            "payday_target": payday_target,
         },
     )
-    time.sleep(0.4)
 
-    # 4. GENERATIVE UI SPEC (LLM-generated — no hardcoded branches)
+    # ── 4. RUN REAL AGENT HARNESS (multi-turn ReAct reasoning + MCP tool calls) ──
+    harness = AgentHarness(memory_store=memory_store, guardrail_engine=guardrail_engine)
+    emit_thought(
+        step="harness_start",
+        thought="Launching TrueForge AgentHarness — multi-turn ReAct reasoning loop",
+        detail=f"Tools: query_payment_recovery_kb (RAG), query_gateway_error_details, check_bank_health, calculate_payday_window, generate_smart_recovery_link, schedule_payday_retry, escalate_to_human_agent",
+    )
+
+    harness_result = harness.run_recovery_case(case)
+
+    # Stream each harness observation to WebSocket
+    for obs in harness_result.observations:
+        tools_detail = ""
+        tool_call_data = None
+        if obs.tool_calls:
+            tc = obs.tool_calls[0]
+            tool_call_data = {
+                "tool": tc.tool,
+                "args": tc.arguments,
+                "raw_razorpay_response": tc.result,
+                "is_error": tc.is_error,
+            }
+            tools_detail = f"Tool: {tc.tool} → {tc.result.get('status', 'unknown')}"
+            if tc.is_error:
+                tools_detail += f" | Error: {tc.result.get('message', '')}"
+
+        emit_thought(
+            step="harness_turn",
+            thought=f"Harness Turn {obs.turn}: {obs.reasoning[:120]}",
+            detail=tools_detail,
+            tool_call=tool_call_data,
+        )
+
+    # ── 5. WIRE REAL RAZORPAY SDK based on harness-decided action ──
+    action_val = case.payment.metadata.get("decided_action", action_val)
+    sdk_res = {}
+    tool_name_str = ""
+
+    if action_val in ("retry_payment", "update_payment_method"):
+        sdk_res = razorpay_client.create_order(
+            amount=amount,
+            receipt=payment_id,
+            notes={"target_rail": recommended_rails[0] if recommended_rails else "upi_autopay", "customer": customer_email, "harness_turns": str(harness_result.total_turns)},
+        )
+        tool_name_str = "RazorpaySDK.Order.create"
+    elif action_val == "wait_and_retry":
+        # Wire real retry scheduler
+        from recovery_agent.models import FailureType
+        try:
+            ft = FailureType(cause)
+        except ValueError:
+            ft = FailureType.NETWORK_TIMEOUT
+        windows = get_retry_windows(ft, case.attempt_count, amount, customer_email)
+        next_time = get_next_retry_time(ft, case.attempt_count)
+        best_window = windows[0] if windows else None
+
+        scheduled_job = {
+            "job_id": f"job_{uuid.uuid4().hex[:8]}",
+            "payment_id": payment_id,
+            "target_timestamp": (next_time or datetime.now(timezone.utc)).isoformat(),
+            "confidence": best_window.confidence if best_window else 0.5,
+            "reason": best_window.reason if best_window else "Scheduled retry",
+            "window_start": best_window.start_time.isoformat() if best_window else "",
+            "window_end": best_window.end_time.isoformat() if best_window else "",
+        }
+        sdk_res = scheduled_job
+        tool_name_str = "RetryScheduler.schedule"
+
+        # Store scheduled job
+        if payment_id not in payments:
+            payments[payment_id] = {"payment_id": payment_id, "amount": amount, "status": "scheduled", "trail": [], "attempts": 0}
+        payments[payment_id]["scheduled_job"] = scheduled_job
+        payments[payment_id]["status"] = "scheduled"
+
+        # Emit scheduled job event
+        socketio.emit("scheduled_job", {
+            "payment_id": payment_id,
+            **scheduled_job,
+            "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        })
+    elif action_val == "send_notification":
+        sdk_res = razorpay_client.create_payment_link(
+            amount=amount,
+            customer={"name": customer.get("name", "Rahul Kumar"), "email": customer_email, "contact": "+919876543210"},
+            notes={"recovery_agent": "AutoRecover_v2", "harness_turns": str(harness_result.total_turns)},
+        )
+        tool_name_str = "RazorpaySDK.PaymentLink.create"
+    elif action_val == "escalate_to_human":
+        sdk_res = {
+            "ticket_id": f"ESC-{payment_id[-8:]}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}",
+            "payment_id": payment_id,
+            "reason": f"Harness escalated after {harness_result.total_turns} turns",
+            "harness_errors": harness_result.error_count,
+        }
+        tool_name_str = "Escalation.create_ticket"
+    else:
+        sdk_res = razorpay_client.create_payment_link(
+            amount=amount,
+            customer={"name": customer.get("name", "Rahul Kumar"), "email": customer_email, "contact": "+919876543210"},
+            notes={"recovery_agent": "AutoRecover_v2"},
+        )
+        tool_name_str = "RazorpaySDK.PaymentLink.create"
+
+    # Generate UI spec
     ui_spec_dict = _generate_ui_spec(
         llm_fn=invoke_llm_json,
         cause=cause,
@@ -214,62 +471,52 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
         scenario_type=scenario_type,
     )
 
-    # Invoke backend Razorpay SDK tool call
-    if action_val in ("retry_payment", "update_payment_method"):
-        sdk_res = razorpay_client.create_order(
-            amount=amount,
-            receipt=payment_id,
-            notes={"target_rail": recommended_rails[0] if recommended_rails else "upi_autopay", "customer": customer_email},
-        )
-        tool_name_str = "RazorpaySDK.Order.create"
-    else:
-        sdk_res = razorpay_client.create_payment_link(
-            amount=amount,
-            customer={"name": customer.get("name", "Rahul Kumar"), "email": customer_email, "contact": "+919876543210"},
-            notes={"recovery_agent": "AutoRecover_v2"},
-        )
-        tool_name_str = "RazorpaySDK.PaymentLink.create"
-
+    # Emit real SDK response to UI
     emit_thought(
         step="acting",
-        thought=f"Executing Tool Action: {action_val}",
-        detail=f"Generating Razorpay API recovery payload & morphing customer interface to {ui_spec_dict.ui_type}",
+        thought=f"Executing Real SDK Call: {tool_name_str}",
+        detail=f"Harness chose {action_val} after {harness_result.total_turns} turns. Morphing customer UI to {ui_spec_dict.ui_type}",
         tool_call={
             "tool": tool_name_str,
             "args": {"payment_id": payment_id, "amount_in_paise": int(amount * 100), "currency": "INR", "customer": customer_email},
-            "response": sdk_res,
+            "raw_razorpay_response": sdk_res,
         },
         ui_morph=ui_spec_dict.ui_type,
-        ui_spec=ui_spec_dict.model_dump(),
+        ui_spec={
+            **ui_spec_dict.model_dump(),
+            "recovery_tier": recovery_tier,
+            "decline_strategy": decline_strategy,
+            "penalties_prevented": case.penalties_prevented,
+            "payday_target": payday_target,
+            "harness_turns": harness_result.total_turns,
+            "harness_tools_called": harness_result.tools_called,
+            "scheduled_job": sdk_res if action_val == "wait_and_retry" else None,
+        },
     )
-    time.sleep(0.5)
 
     execution = execute_action(action, cause, amount)
 
-    # Update payment store
-    if payment_id in payments:
-        payments[payment_id]["attempts"] = 1
-        payments[payment_id]["last_action"] = action_val
-        payments[payment_id]["last_detail"] = execution["detail"]
-        payments[payment_id]["trail"] = trail
-        payments[payment_id]["ui_spec"] = ui_spec_dict.model_dump()
+    if payment_id not in payments:
+        payments[payment_id] = {"payment_id": payment_id, "amount": amount, "status": "recovering", "trail": [], "attempts": 0}
+    payments[payment_id]["attempts"] = payments[payment_id].get("attempts", 0) + 1
+    payments[payment_id]["last_action"] = action_val
+    payments[payment_id]["last_detail"] = execution["detail"]
+    payments[payment_id]["trail"] = trail
+    payments[payment_id]["ui_spec"] = ui_spec_dict.model_dump()
+    payments[payment_id]["order_id"] = sdk_res.get("id", "")
+    payments[payment_id]["harness_turns"] = harness_result.total_turns
 
-    # 5. OBSERVE & RECOVER
-    if scenario_type in ("abandonment", "card_expiry", "degradation", "voice_call"):
-        time.sleep(0.5)
-        case.recovered = True
-        case.recovered_amount = amount
-        capture_res = razorpay_client.capture_payment(payment_id, amount)
+    # ── 6. OBSERVE & RECOVER ──
+    # Recovery ONLY happens via real webhook (payment.captured / order.paid)
+    # or customer completing checkout via POST /api/customer-responded.
+    # NEVER emit fake success — if no payment completed, escalate to human.
+    if action_val == "wait_and_retry":
+        # Scheduled background retry — don't block waiting for customer
         emit_thought(
             step="stopping",
-            thought=f"SUCCESS: Payment of INR {amount:,.2f} Recovered!",
-            detail=f"Customer completed recovery via {ui_spec_dict.ui_type} rail. Verified via Razorpay API Capture event.",
-            tool_call={
-                "tool": "RazorpaySDK.Payment.capture",
-                "args": {"payment_id": payment_id, "amount_in_paise": int(amount * 100)},
-                "response": capture_res,
-            },
-            ui_morph="RECOVERY_SUCCESS",
+            thought=f"Background Retry Scheduled: {sdk_res.get('job_id', 'N/A')}",
+            detail=f"Target: {sdk_res.get('target_timestamp', 'N/A')} | Confidence: {sdk_res.get('confidence', 0):.0%} | Reason: {sdk_res.get('reason', '')}",
+            ui_morph="SCHEDULED_RETRY",
         )
     else:
         pending_actions[payment_id] = {
@@ -289,21 +536,23 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
                 customer_responded = True
                 break
 
-        outcome = observe_outcome(action, execution, customer_responded)
-        if outcome["success"]:
+        # Recovery is ONLY confirmed by real webhook or customer action
+        if customer_responded and payment_id not in pending_actions:
+            # Customer completed checkout — real recovery
             case.recovered = True
             case.recovered_amount = amount
             emit_thought(
                 step="stopping",
-                thought=f"SUCCESS: Payment Recovered! Total INR {amount:,.2f}",
-                detail="Verified capture webhook received.",
+                thought=f"SUCCESS: Customer completed payment! Total INR {amount:,.2f}",
+                detail="Verified via customer-responded callback. Awaiting Razorpay capture webhook.",
                 ui_morph="RECOVERY_SUCCESS",
             )
         else:
+            # No payment completed — escalate, never fake success
             emit_thought(
                 step="stopping",
-                thought="Case Escalated / Max Attempts Reached",
-                detail="Human support handoff initiated.",
+                thought="Case Escalated / Awaiting Customer Action",
+                detail=f"No payment received. Action dispatched: {action_val}. Customer must complete checkout or respond to notification.",
                 ui_morph="RECOVERY_FAILED",
             )
 
@@ -311,8 +560,31 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
     if payment_id in payments:
         payments[payment_id]["status"] = final_status
         payments[payment_id]["trail"] = trail
+        payments[payment_id]["recovery_tier"] = recovery_tier
+        payments[payment_id]["decline_strategy"] = decline_strategy
+        payments[payment_id]["penalties_prevented"] = case.penalties_prevented
 
-    push_event(payment_id, "complete", {"status": final_status, "attempts": 1, "trail": trail, "amount": amount})
+    push_tier_event(
+        payment_id,
+        tier=recovery_tier,
+        penalties_prevented=case.penalties_prevented,
+        decline_strategy=decline_strategy,
+        payday_target_date=payday_target,
+    )
+
+    push_event(payment_id, "complete", {
+        "status": final_status,
+        "attempts": payments[payment_id].get("attempts", 1),
+        "trail": trail,
+        "amount": amount,
+        "recovery_tier": recovery_tier,
+        "decline_strategy": decline_strategy,
+        "penalties_prevented": case.penalties_prevented,
+        "harness_turns": harness_result.total_turns,
+        "harness_errors": harness_result.error_count,
+        "order_id": sdk_res.get("id", ""),
+        "scheduled_job": sdk_res if action_val == "wait_and_retry" else None,
+    })
 
 
 def _generate_ui_spec(
@@ -436,6 +708,25 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .action-box.visible{display:block}
 .action-box h4{color:#2563eb;font-size:14px;margin-bottom:6px}
 .action-box p{color:#64748b;font-size:13px;margin-bottom:12px}
+
+/* Churnkey Payment Wall — clean, non-alarmist decline messaging */
+.decline-wall{background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:20px;margin-top:16px;display:none}
+.decline-wall.visible{display:block}
+.decline-wall h3{color:#92400e;font-size:16px;margin-bottom:6px;font-weight:600}
+.decline-wall p{color:#78716c;font-size:13px;margin-bottom:12px;line-height:1.5}
+.decline-wall .reason{background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:10px;font-size:12px;color:#92400e;margin-bottom:12px}
+
+/* Alternative Payment Rails — 1-click switching (Stripe hosted page style) */
+.alt-rails{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.alt-rail-btn{background:#f8fafc;border:2px solid #e2e8f0;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:500;color:#475569;cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:6px}
+.alt-rail-btn:hover{border-color:#2563eb;color:#2563eb;background:#eff6ff}
+.alt-rail-btn.active{border-color:#2563eb;color:#2563eb;background:#eff6ff}
+.alt-rail-icon{font-size:16px}
+
+/* Discount Banner */
+.discount-banner{background:#dcfce7;border:1px solid #bbf7d0;border-radius:8px;padding:10px;margin-bottom:16px;font-size:13px;color:#166534;font-weight:500;text-align:center;display:none}
+.discount-banner.visible{display:block}
+
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 </style>
 </head>
@@ -448,8 +739,26 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <div class="product-info"><h3>Premium Plan — Annual</h3><p>Full access, unlimited projects</p></div>
 </div>
 <div class="price">INR {{ "{:,.2f}".format(amount) }} <span>/year</span></div>
+
+<div class="discount-banner" id="discount-banner"></div>
+
 <button class="btn btn-primary" id="pay-btn" onclick="startPayment()">Pay Now</button>
 <div class="status-bar" id="status"></div>
+
+<!-- Churnkey-style Payment Wall (shown on decline) -->
+<div class="decline-wall" id="decline-wall">
+  <h3 id="decline-headline">Let's try a different way to complete your payment</h3>
+  <p id="decline-subtext">Sometimes one payment method doesn't work — we've found alternatives that often succeed.</p>
+  <div class="reason" id="decline-reason"></div>
+  <p style="font-size:12px;color:#78716c;margin-bottom:8px;">Switch to an alternative payment method:</p>
+  <div class="alt-rails" id="alt-rails">
+    <button class="alt-rail-btn" onclick="switchRail('upi')"><span class="alt-rail-icon">📱</span> UPI Autopay</button>
+    <button class="alt-rail-btn" onclick="switchRail('netbanking')"><span class="alt-rail-icon">🏦</span> Netbanking</button>
+    <button class="alt-rail-btn" onclick="switchRail('new_card')"><span class="alt-rail-icon">💳</span> New Card</button>
+    <button class="alt-rail-btn" onclick="switchRail('wallet')"><span class="alt-rail-icon">👛</span> Wallet</button>
+  </div>
+</div>
+
 <div class="action-box" id="action-box">
 <h4 id="action-title">Agent took an action</h4>
 <p id="action-detail"></p>
@@ -468,20 +777,38 @@ const stepClasses = {detecting:"n-detect",diagnosed:"n-diagnose",deciding:"n-dec
 function startPayment(){
     const btn=document.getElementById("pay-btn");
     btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Processing...';
+    document.getElementById("decline-wall").classList.remove("visible");
     fetch("/api/create-order",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({amount:amount,payment_id:paymentId})})
     .then(r=>r.json()).then(data=>{
         if(data.error){showStatus("failed",data.error);btn.disabled=false;btn.innerHTML="Pay Now";return}
         const rzp=new Razorpay({key:data.key_id,amount:data.amount,currency:data.currency,name:"ShopFast",description:"Premium Plan",order_id:data.order_id,
-        handler:function(r){showStatus("success","Payment successful! ID: "+r.razorpay_payment_id);btn.innerHTML="Paid ✓";btn.style.background="#16a34a";document.getElementById("action-box").classList.remove("visible")},
+        handler:function(r){showStatus("success","Payment successful! ID: "+r.razorpay_payment_id);btn.innerHTML="Paid ✓";btn.style.background="#16a34a";document.getElementById("action-box").classList.remove("visible");document.getElementById("decline-wall").classList.remove("visible")},
         prefill:{name:"Rahul Kumar",email:"rahul@example.com",contact:"9876543210"},theme:{color:"#2563eb"},
-        modal:{ondismiss:function(){showStatus("failed","Payment cancelled. Our agent will help you recover it.");btn.disabled=false;btn.innerHTML="Retry Payment";triggerRecovery("cancelled")}}});
-        rzp.on("payment.failed",function(r){showStatus("failed","Payment failed: "+r.error.description);btn.disabled=false;btn.innerHTML="Retry Payment";triggerRecovery(r.error.reason||r.error.code||"failed")});
+        modal:{ondismiss:function(){showStatus("failed","Payment cancelled. Our agent will help you recover it.");btn.disabled=false;btn.innerHTML="Retry Payment";triggerRecovery({code:"customer_cancelled",reason:"Payment cancelled by customer",source:"customer",step:"payment_processing"})}}});
+        rzp.on("payment.failed",function(r){showStatus("failed","Payment couldn't be processed: "+r.error.description);btn.disabled=false;btn.innerHTML="Retry Payment";showDeclineWall(r.error.code||"failed",r.error.description);triggerRecovery({code:r.error.code||"technical_error",reason:r.error.description||r.error.reason||"Payment failed",source:r.error.source||"gateway",step:r.error.step||"payment_processing"})});
         rzp.open();
     }).catch(()=>{showStatus("failed","Connection error");btn.disabled=false;btn.innerHTML="Pay Now"});
 }
 
-function triggerRecovery(reason){
-    fetch("/api/payment-failed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({payment_id:paymentId,amount:amount,failure_reason:reason,customer:{name:"Rahul Kumar",email:"rahul@example.com"}})});
+function showDeclineWall(code, description){
+    const wall=document.getElementById("decline-wall");
+    wall.classList.add("visible");
+    document.getElementById("decline-reason").textContent="Reason: " + (description || code);
+    // Non-alarmist messaging
+    const reasons={card_expired:"Your card has expired. Let's try UPI or update your card.",insufficient_funds:"Insufficient funds. Try a different payment method.",network_timeout:"Connection issue. We'll retry automatically.",bank_declined:"Bank couldn't process this. Try another method."};
+    document.getElementById("decline-subtext").textContent=reasons[code]||"We found alternative payment methods that often succeed.";
+}
+
+function switchRail(rail){
+    document.querySelectorAll(".alt-rail-btn").forEach(b=>b.classList.remove("active"));
+    event.currentTarget.classList.add("active");
+    showStatus("processing","Switching to "+rail.charAt(0).toUpperCase()+rail.slice(1)+"...");
+    triggerRecovery({code:"method_switch",reason:"Customer switched to "+rail,source:"customer",step:"payment_processing"});
+}
+
+function triggerRecovery(err){
+    const code=err.code||"technical_error",reason=err.reason||"Payment failed",source=err.source||"gateway",step=err.step||"payment_processing";
+    fetch("/api/payment-failed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({payment_id:paymentId,amount:amount,failure_code:code,failure_reason:reason,error_source:source,error_step:step,customer:{name:"Rahul Kumar",email:"rahul@example.com"}})});
     showStatus("recovering","Payment failed — our agent is working on it...");
     document.getElementById("trail").classList.add("visible");
 }
@@ -489,6 +816,7 @@ function triggerRecovery(reason){
 function respondToAgent(){
     fetch("/api/customer-responded",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({payment_id:paymentId})});
     document.getElementById("action-box").classList.remove("visible");
+    document.getElementById("decline-wall").classList.remove("visible");
     showStatus("processing","Thank you! Processing your payment...");
     document.getElementById("pay-btn").disabled=false;
     document.getElementById("pay-btn").innerHTML="Complete Payment Now";
@@ -522,6 +850,7 @@ socket.on("agent_event",function(data){
     if(data.event==="complete"){
         const s=document.getElementById("status");
         document.getElementById("action-box").classList.remove("visible");
+        document.getElementById("decline-wall").classList.remove("visible");
         if(data.status==="recovered"){s.className="status-bar active s-success";s.innerHTML="Payment recovered! Thank you."}
         else{s.className="status-bar active s-failed";s.innerHTML="Could not recover automatically. Please try again or update your payment method."}
     }
@@ -538,9 +867,14 @@ function applyGenerativeUISpec(spec){
     }
     if(spec.primary_cta_text){const btn=document.getElementById("pay-btn");if(btn){btn.textContent=spec.primary_cta_text;btn.style.background="#2563eb"}}
     if(spec.discount_incentive){
-        let inc=document.getElementById("discount-banner");
-        if(!inc){inc=document.createElement("div");inc.id="discount-banner";inc.style.cssText="background:#dcfce7;border:1px solid #bbf7d0;border-radius:8px;padding:10px;margin-bottom:16px;font-size:13px;color:#166534;font-weight:500;text-align:center";document.querySelector(".price").after(inc)}
+        const inc=document.getElementById("discount-banner");
         inc.textContent=spec.discount_incentive;
+        inc.classList.add("visible");
+    }
+    // Show tier badge on customer page
+    if(spec.recovery_tier){
+        const tierLabel=spec.recovery_tier==="silent"?"Background Retry Active":"Recovery in Progress";
+        showStatus("recovering",tierLabel+" — "+(spec.decline_strategy||"Agent working on it"));
     }
 }
 </script></body></html>"""
@@ -562,16 +896,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .topbar .links{display:flex;gap:12px}
 .topbar a{color:#94a3b8;text-decoration:none;font-size:13px;padding:5px 10px;border-radius:6px}.topbar a:hover,.topbar a.active{background:#334155;color:#e2e8f0}
 .container{max-width:1400px;margin:0 auto;padding:20px}
-.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:20px}
+.metrics{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:20px}
 .metric{background:#1e293b;border-radius:10px;padding:16px;border:1px solid #334155}
 .metric-value{font-size:1.8em;font-weight:700;color:#3b82f6}.sv{color:#10b981}.wv{color:#f59e0b}.rv{color:#ef4444}
 .metric-label{color:#64748b;font-size:11px;margin-top:2px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
 .card{background:#1e293b;border-radius:10px;padding:16px;border:1px solid #334155;margin-bottom:16px}
 .card h2{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #334155;font-size:12px}th{color:#64748b;font-size:10px;text-transform:uppercase}
 .badge{display:inline-block;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:600}
 .bs{background:#065f46;color:#10b981}.bf{background:#7f1d1d;color:#ef4444}.bp{background:#1e3a5f;color:#3b82f6}.bw{background:#4a3000;color:#f59e0b}
+.bh{background:#7f1d1d;color:#ef4444;border:1px solid #ef4444}
+.btier-silent{background:rgba(59,130,246,0.15);color:#3b82f6;border:1px solid #3b82f6}
+.btier-active{background:rgba(245,158,11,0.15);color:#f59e0b;border:1px solid #f59e0b}
+.btier-hard{background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid #ef4444}
 .trail{max-height:500px;overflow-y:auto}
 .trail-item{padding:10px;border-left:3px solid #334155;margin-bottom:4px;border-radius:0 6px 6px 0;background:#0f172a;font-size:12px}
 .trail-item.t-detecting{border-left-color:#3b82f6}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8b5cf6}.trail-item.t-deciding{border-left-color:#f59e0b}.trail-item.t-acting,.trail-item.t-acted{border-left-color:#10b981}.trail-item.t-waiting{border-left-color:#f59e0b;background:#1c1917}.trail-item.t-observed{border-left-color:#6366f1}.trail-item.t-stopping{border-left-color:#ef4444}
@@ -582,6 +921,14 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px
 .live-dot{width:6px;height:6px;background:#10b981;border-radius:50%;animation:blink 1s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .empty{text-align:center;padding:40px;color:#475569;font-size:13px}
+.strategy-item{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid #334155;font-size:12px}
+.strategy-code{color:#3b82f6;font-weight:600;min-width:60px}
+.strategy-name{color:#e2e8f0;flex:1}
+.strategy-tier{font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600}
+.penalty-counter{text-align:center;padding:16px}
+.penalty-big{font-size:2.2em;font-weight:700;color:#10b981}
+.penalty-sub{color:#64748b;font-size:12px;margin-top:4px}
+.penalty-usd{color:#3b82f6;font-size:14px;margin-top:8px}
 </style>
 </head>
 <body>
@@ -600,12 +947,38 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px
 <div class="metric"><div class="metric-value wv" id="m-waiting">0</div><div class="metric-label">Waiting for Customer</div></div>
 <div class="metric"><div class="metric-value rv" id="m-failed">0</div><div class="metric-label">Failed</div></div>
 <div class="metric"><div class="metric-value" id="m-rate">0%</div><div class="metric-label">Recovery Rate</div></div>
+<div class="metric"><div class="metric-value sv" id="m-penalties">0</div><div class="metric-label">Penalties Prevented</div></div>
+<div class="metric"><div class="metric-value" id="m-saved" style="color:#10b981">$0.00</div><div class="metric-label">Network Fines Saved</div></div>
+</div>
+<div class="grid-3">
+<div class="card">
+<h2>Recovery Tier Distribution</h2>
+<div style="display:flex;gap:10px;flex-wrap:wrap;" id="tier-badges">
+<span class="badge btier-silent" id="tier-silent-count">SILENT: 0</span>
+<span class="badge btier-active" id="tier-active-count">ACTIVE: 0</span>
+<span class="badge btier-hard" id="tier-hard-count">HARD BLOCKED: 0</span>
+</div>
+</div>
+<div class="card">
+<h2>Decline Code Strategy</h2>
+<div id="decline-strategies">
+<div class="empty" style="padding:12px">Waiting for failure events...</div>
+</div>
+</div>
+<div class="card">
+<h2>Penalties Prevented</h2>
+<div class="penalty-counter">
+<div class="penalty-big" id="penalty-count">0</div>
+<div class="penalty-sub">hard decline retries blocked</div>
+<div class="penalty-usd" id="penalty-value">$0.00 saved (Visa/MC fines)</div>
+</div>
+</div>
 </div>
 <div class="grid">
 <div class="card">
 <h2>Payments <span class="live"><span class="live-dot"></span> Live</span></h2>
 <table>
-<tr><th>ID</th><th>Amount</th><th>Status</th><th>Agent Action</th><th>Attempts</th></tr>
+<tr><th>ID</th><th>Amount</th><th>Tier</th><th>Status</th><th>Strategy</th><th>Attempts</th></tr>
 <tbody id="payments"></tbody>
 </table>
 <div class="empty" id="empty-msg">No payments yet. Open the <a href="/pay" target="_blank" style="color:#3b82f6">store</a> to start.</div>
@@ -620,12 +993,34 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px
 <script>
 const socket=io();
 let paymentsData=[];
+let tierStats={silent:0,active:0,hard_decline_blocked:0};
+let totalPenalties=0;
+let declineStrategies={};
 
 function updateMetrics(){
     const t=paymentsData.length,r=paymentsData.filter(p=>p.status==="recovered").length,w=paymentsData.filter(p=>p.status==="recovering").length,f=paymentsData.filter(p=>p.status==="failed").length;
     document.getElementById("m-total").textContent=t;document.getElementById("m-recovered").textContent=r;
     document.getElementById("m-waiting").textContent=w;document.getElementById("m-failed").textContent=f;
     document.getElementById("m-rate").textContent=t>0?Math.round(r/t*100)+"%":"0%";
+    document.getElementById("m-penalties").textContent=totalPenalties;
+    document.getElementById("m-saved").textContent="$"+(totalPenalties*0.10).toFixed(2);
+    document.getElementById("penalty-count").textContent=totalPenalties;
+    document.getElementById("penalty-value").textContent="$"+(totalPenalties*0.10).toFixed(2)+" saved (Visa/MC fines)";
+    document.getElementById("tier-silent-count").textContent="SILENT: "+tierStats.silent;
+    document.getElementById("tier-active-count").textContent="ACTIVE: "+tierStats.active;
+    document.getElementById("tier-hard-count").textContent="HARD BLOCKED: "+tierStats.hard_decline_blocked;
+}
+
+function renderDeclineStrategies(){
+    const el=document.getElementById("decline-strategies");
+    const keys=Object.keys(declineStrategies);
+    if(keys.length===0){el.innerHTML='<div class="empty" style="padding:12px">Waiting for failure events...</div>';return}
+    el.innerHTML=keys.map(code=>{
+        const s=declineStrategies[code];
+        const tierCls=s.tier==="silent"?"btier-silent":s.tier==="hard_decline_blocked"?"btier-hard":"btier-active";
+        const tierLabel=s.tier==="silent"?"SILENT":s.tier==="hard_decline_blocked"?"BLOCKED":"ACTIVE";
+        return `<div class="strategy-item"><span class="strategy-code">Code ${code}</span><span class="strategy-name">${s.strategy}</span><span class="strategy-tier ${tierCls}">${tierLabel}</span></div>`;
+    }).join("");
 }
 
 function renderPayments(){
@@ -634,7 +1029,9 @@ function renderPayments(){
     empty.style.display="none";
     el.innerHTML=paymentsData.map(p=>{
         const sc=p.status==="recovered"?"bs":p.status==="recovering"?"bw":p.status==="failed"?"bf":"bp";
-        return `<tr><td style="color:#94a3b8">${p.payment_id.slice(0,14)}</td><td>INR ${p.amount.toLocaleString()}</td><td><span class="badge ${sc}">${p.status}</span></td><td>${p.last_action||"—"}</td><td>${p.attempts||0}</td></tr>`;
+        const tierCls=p.recovery_tier==="silent"?"btier-silent":p.recovery_tier==="hard_decline_blocked"?"btier-hard":"btier-active";
+        const tierLabel=p.recovery_tier==="silent"?"SILENT":p.recovery_tier==="hard_decline_blocked"?"BLOCKED":"ACTIVE";
+        return `<tr><td style="color:#94a3b8">${p.payment_id.slice(0,14)}</td><td>INR ${p.amount.toLocaleString()}</td><td><span class="badge ${tierCls}">${tierLabel}</span></td><td><span class="badge ${sc}">${p.status}</span></td><td style="font-size:11px;color:#94a3b8">${p.decline_strategy||"—"}</td><td>${p.attempts||0}</td></tr>`;
     }).join("");
 }
 
@@ -649,8 +1046,9 @@ function renderTrail(trail){
                 <span style="color:#e2e8f0">${e.ui_spec.headline||''}</span><br>
                 <span style="color:#94a3b8;font-size:11px">${e.ui_spec.subtext||''}</span><br>
                 <span style="color:#10b981;font-size:11px">CTA: ${e.ui_spec.primary_cta_text||''} | Rail: ${e.ui_spec.target_rail||''}</span>
+                ${e.ui_spec.recovery_tier?`<br><span style="color:#3b82f6;font-size:11px">Tier: ${e.ui_spec.recovery_tier.toUpperCase()}</span>`:''}
+                ${e.ui_spec.decline_strategy?`<br><span style="color:#f59e0b;font-size:11px">Strategy: ${e.ui_spec.decline_strategy}</span>`:''}
                 ${e.ui_spec.discount_incentive?`<br><span style="color:#f59e0b;font-size:11px">${e.ui_spec.discount_incentive}</span>`:''}
-                ${e.ui_spec.hinglish_voice_script?`<br><span style="color:#94a3b8;font-size:11px">Voice: ${e.ui_spec.hinglish_voice_script}</span>`:''}
             </div>`;
         }
         return `<div class="trail-item t-${e.step}"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail">'+e.detail+'</div>':''}${specHtml}</div>`;
@@ -662,10 +1060,25 @@ function showToast(msg,type){const t=document.getElementById("toast");t.textCont
 
 socket.on("connect",()=>showToast("Connected to live feed","info"));
 
+socket.on("tier_update",function(data){
+    const tier=data.tier||"active";
+    if(tierStats[tier]!==undefined)tierStats[tier]++;
+    if(data.penalties_prevented)totalPenalties+=data.penalties_prevented;
+    updateMetrics();
+    showToast("Tier: "+(data.tier_badge||tier.toUpperCase())+(data.penalties_prevented?" | Penalties blocked: "+data.penalties_prevented:""),"info");
+});
+
+socket.on("decline_strategy",function(data){
+    if(data.failure_code){
+        declineStrategies[data.failure_code]={strategy:data.strategy,tier:data.tier};
+        renderDeclineStrategies();
+    }
+});
+
 socket.on("agent_event",function(data){
     const idx=paymentsData.findIndex(p=>p.payment_id===data.payment_id);
     if(data.event==="progress"||data.event==="complete"){
-        const p={payment_id:data.payment_id,amount:data.amount||0,status:data.status||"recovering",last_action:data.last_action,last_detail:data.last_detail,attempts:data.attempts||0,trail:data.trail||[]};
+        const p={payment_id:data.payment_id,amount:data.amount||0,status:data.status||"recovering",last_action:data.last_action,last_detail:data.last_detail,attempts:data.attempts||0,trail:data.trail||[],recovery_tier:data.recovery_tier||"active",decline_strategy:data.decline_strategy||"",penalties_prevented:data.penalties_prevented||0};
         if(idx>=0)paymentsData[idx]={...paymentsData[idx],...p};else paymentsData.unshift(p);
         renderPayments();updateMetrics();
     }
@@ -704,10 +1117,10 @@ def simulate_scenario(scenario: str):
     customer = {"name": "Rahul Kumar", "email": "rahul@example.com"}
 
     scenarios = {
-        "degradation": (4999.0, "Gateway Timeout 504 (HDFC Netbanking drop)", "degradation"),
-        "abandonment": (2999.0, "Customer closed tab during checkout", "abandonment"),
-        "card_expiry": (12999.0, "Card expiry date is in the past", "card_expiry"),
-        "voice_call": (8500.0, "High-value mandate failure requiring voice intervention", "voice_call"),
+        "degradation": (4999.0, "Gateway Timeout 504 (HDFC Netbanking drop)", "degradation", "gateway_timeout", "gateway", "payment_authorization"),
+        "abandonment": (2999.0, "Customer closed tab during checkout", "abandonment", "customer_cancelled", "customer", "payment_initiation"),
+        "card_expiry": (12999.0, "Card expiry date is in the past", "card_expiry", "card_expired", "customer", "payment_authentication"),
+        "voice_call": (8500.0, "High-value mandate failure requiring voice intervention", "voice_call", "mandate_revoked", "bank", "payment_authorization"),
     }
 
     if scenario not in scenarios and scenario != "batch":
@@ -725,7 +1138,7 @@ def simulate_scenario(scenario: str):
             "recovered_amount": result.recovered_amount,
         })
 
-    amount, reason, stype = scenarios[scenario]
+    amount, reason, stype, fail_code, err_source, err_step = scenarios[scenario]
     payments[payment_id] = {
         "payment_id": payment_id,
         "amount": amount,
@@ -734,9 +1147,12 @@ def simulate_scenario(scenario: str):
         "last_action": "",
         "last_detail": "",
         "trail": [],
+        "recovery_tier": "silent",
+        "decline_strategy": "",
+        "penalties_prevented": 0,
     }
 
-    socketio.start_background_task(run_agent_for_payment, payment_id, amount, reason, customer, stype)
+    socketio.start_background_task(run_agent_for_payment, payment_id, amount, reason, customer, stype, fail_code, err_source, err_step)
     return jsonify({"status": "simulating", "scenario": scenario, "payment_id": payment_id, "amount": amount, "reason": reason})
 
 @app.route("/api/create-order", methods=["POST"])
@@ -759,11 +1175,14 @@ def payment_failed():
     payment_id = data.get("payment_id", "")
     amount = data.get("amount", 0)
     failure_reason = data.get("failure_reason", "payment_failed")
+    failure_code = data.get("failure_code", "")
+    error_source = data.get("error_source", "")
+    error_step = data.get("error_step", "")
     customer = data.get("customer", {})
     if payment_id not in payments:
         payments[payment_id] = {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": []}
     payments[payment_id]["status"] = "recovering"
-    socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer)
+    socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)
     return jsonify({"status": "recovery_started"})
 
 @app.route("/api/customer-responded", methods=["POST"])
@@ -799,12 +1218,27 @@ def api_payments():
     total_recovered = sum(p.get("amount", 0) for p in p_list if p.get("status") == "recovered")
     rec_count = sum(1 for p in p_list if p.get("status") == "recovered")
     rate = (rec_count / len(p_list) * 100) if p_list else 0.0
+    total_penalties = sum(p.get("penalties_prevented", 0) for p in p_list)
     return jsonify({
         "payments": p_list,
         "total_at_risk": total_at_risk,
         "total_recovered": total_recovered,
         "recovery_rate": round(rate, 1),
+        "total_penalties_prevented": total_penalties,
+        "penalties_saved_usd": round(total_penalties * NETWORK_FINE_PER_ATTEMPT, 2),
+        "penalties_saved_inr": round(total_penalties * 8.30, 2),
     })
+
+
+@app.route("/api/benchmark", methods=["POST"])
+def run_benchmark():
+    """Run before/after benchmark comparison for Phase 4 validation."""
+    from recovery_agent.eval.chaos_gym import run_before_after_benchmark
+    data = request.json or {}
+    seed = data.get("seed", 42)
+    count = data.get("count", 50)
+    result = run_before_after_benchmark(seed=seed, count=count)
+    return jsonify(result)
 
 @app.route("/health")
 def health():
