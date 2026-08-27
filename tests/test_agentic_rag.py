@@ -98,7 +98,7 @@ class TestVectorIndex:
         except RuntimeError:
             pytest.skip("ChromaDB embedding model unavailable")
         result = idx.query("test query", top_k=3)
-        assert len(result.chunks) == 0
+        assert len(result.chunks) > 0
 
     def test_query_score_is_positive(self):
         chunks = _chunk_markdown(SAMPLE_RAZORPAY_DOC, "razorpay_error_docs.md")

@@ -152,7 +152,9 @@ class VectorIndex:
             cache_dir = Path.home() / ".cache" / "chroma" / "onnx_models"
             model_dir = cache_dir / "all-MiniLM-L6-v2"
 
-            if not model_dir.exists() or not any(model_dir.glob("*.onnx")):
+            if not model_dir.exists() or not (
+                any(model_dir.glob("*.onnx")) or any(model_dir.glob("onnx/*.onnx"))
+            ):
                 raise RuntimeError(
                     "[agentic_rag] FATAL: ChromaDB ONNX embedding model not cached. "
                     f"Expected at: {model_dir}. "
@@ -630,6 +632,10 @@ Output ONLY the rewritten query, nothing else."""
 
         If groundedness < MIN_GROUNDEDNESS, rewrites query and retries
         up to MAX_REWRITE_ATTEMPTS times.
+
+        If ChromaDB throws at runtime (network drop, model corruption),
+        raises RuntimeError so the AgentHarness catches it and the LLM
+        can pivot to an alternate tool (e.g., query_gateway_error_details).
         """
         self._ensure_loaded()
 
@@ -637,17 +643,23 @@ Output ONLY the rewritten query, nothing else."""
         best_groundedness = 0.0
 
         for attempt in range(MAX_REWRITE_ATTEMPTS):
-            if attempt == 0:
-                # First attempt: normal query
-                rag_response = self._sub_question_engine.query(payment_payload)
-            else:
-                # Rewrite: modify the payment payload with a more specific query
-                rewritten_query = self._rewrite_query(
-                    payment_payload.get("failure_reason", ""),
-                    {"groundedness_score": best_groundedness, "evidence": "Low groundedness", "unsupported_claims": []},
-                )
-                modified_payload = {**payment_payload, "failure_reason": rewritten_query, "error_description": rewritten_query}
-                rag_response = self._sub_question_engine.query(modified_payload)
+            try:
+                if attempt == 0:
+                    rag_response = self._sub_question_engine.query(payment_payload)
+                else:
+                    rewritten_query = self._rewrite_query(
+                        payment_payload.get("failure_reason", ""),
+                        {"groundedness_score": best_groundedness, "evidence": "Low groundedness", "unsupported_claims": []},
+                    )
+                    modified_payload = {**payment_payload, "failure_reason": rewritten_query, "error_description": rewritten_query}
+                    rag_response = self._sub_question_engine.query(modified_payload)
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(
+                    f"Vector Database unavailable: {e}. "
+                    "Please use alternate diagnostic tools."
+                ) from e
 
             if evaluate and rag_response.retrieved_chunks:
                 context = "\n---\n".join(c.text for c in rag_response.retrieved_chunks)
@@ -672,10 +684,8 @@ Output ONLY the rewritten query, nothing else."""
                 if rag_response.groundedness_score >= MIN_GROUNDEDNESS:
                     return rag_response
             else:
-                # No evaluation needed — return immediately
                 return rag_response
 
-        # Return best response even if below threshold
         return best_response or rag_response
 
     def query_by_error_code(self, error_code: str, method: str = "unknown") -> RAGResponse:
