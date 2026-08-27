@@ -15,6 +15,17 @@ fi
 
 source .venv/bin/activate
 
+# --- Pre-flight: Download ChromaDB ONNX embedding model if not cached ---
+echo "Running pre-flight checks..."
+.venv/bin/python3 -m recovery_agent.scripts.download_models
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "ERROR: Failed to download ChromaDB embedding models. Check internet connection."
+    echo "The RAG engine requires the ONNX model to be cached locally."
+    echo "You can also download it manually: python -m recovery_agent.scripts.download_models"
+    exit 1
+fi
+
 echo "Starting Revenue Recovery Agent services..."
 
 # Kill any existing instances
