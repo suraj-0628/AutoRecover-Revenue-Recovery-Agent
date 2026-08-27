@@ -183,7 +183,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
     guardrail_engine = GuardrailEngine()
     kg_router = RazorpayKnowledgeGraph()
 
-    customer_email = customer.get("email", "rahul@example.com")
+    customer_email = customer.get("email", "")
     cust_profile = memory_store.get_or_create_profile(customer_email)
 
     trail = []
@@ -224,7 +224,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         failure_code=failure_code or norm.get("failure_code", "payment_failed"),
         failure_reason=raw_reason,
         metadata={
-            "customer_name": customer.get("name", "Rahul Kumar"),
+            "customer_name": customer.get("name", ""),
             "scenario": scenario_type,
             "error_code": failure_code or norm.get("error_code", "BAD_REQUEST_ERROR"),
             "error_source": error_source or norm.get("error_source", "gateway"),
@@ -439,7 +439,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
     elif action_val == "send_notification":
         sdk_res = razorpay_client.create_payment_link(
             amount=amount,
-            customer={"name": customer.get("name", "Rahul Kumar"), "email": customer_email, "contact": "+919876543210"},
+            customer={"name": customer.get("name", ""), "email": customer_email, "contact": ""},
             notes={"recovery_agent": "AutoRecover_v2", "harness_turns": str(harness_result.total_turns)},
         )
         tool_name_str = "RazorpaySDK.PaymentLink.create"
@@ -454,7 +454,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
     else:
         sdk_res = razorpay_client.create_payment_link(
             amount=amount,
-            customer={"name": customer.get("name", "Rahul Kumar"), "email": customer_email, "contact": "+919876543210"},
+            customer={"name": customer.get("name", ""), "email": customer_email, "contact": ""},
             notes={"recovery_agent": "AutoRecover_v2"},
         )
         tool_name_str = "RazorpaySDK.PaymentLink.create"
@@ -466,7 +466,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         amount=amount,
         failure_reason=failure_reason,
         recommended_rail=recommended_rails[0] if recommended_rails else "payment_link",
-        customer_name=customer.get("name", "Rahul Kumar"),
+        customer_name=customer.get("name", ""),
         action=action_val,
         scenario_type=scenario_type,
     )
@@ -769,6 +769,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <script>
 const paymentId = "pay_" + Math.random().toString(36).substr(2,9);
 const amount = {{ amount }};
+const customerData = {{ customer | tojson }};
 const socket = io();
 
 const stepNames = {detecting:"Detecting failure",diagnosed:"Root cause found",deciding:"Selecting action",acting:"Executing recovery",acted:"Action complete",waiting:"Waiting for you",observed:"Outcome observed",stopping:"Recovery complete",continuing:"Retrying"};
@@ -783,7 +784,7 @@ function startPayment(){
         if(data.error){showStatus("failed",data.error);btn.disabled=false;btn.innerHTML="Pay Now";return}
         const rzp=new Razorpay({key:data.key_id,amount:data.amount,currency:data.currency,name:"ShopFast",description:"Premium Plan",order_id:data.order_id,
         handler:function(r){showStatus("success","Payment successful! ID: "+r.razorpay_payment_id);btn.innerHTML="Paid ✓";btn.style.background="#16a34a";document.getElementById("action-box").classList.remove("visible");document.getElementById("decline-wall").classList.remove("visible")},
-        prefill:{name:"Rahul Kumar",email:"rahul@example.com",contact:"9876543210"},theme:{color:"#2563eb"},
+        prefill:customerData||{},theme:{color:"#2563eb"},
         modal:{ondismiss:function(){showStatus("failed","Payment cancelled. Our agent will help you recover it.");btn.disabled=false;btn.innerHTML="Retry Payment";triggerRecovery({code:"customer_cancelled",reason:"Payment cancelled by customer",source:"customer",step:"payment_processing"})}}});
         rzp.on("payment.failed",function(r){showStatus("failed","Payment couldn't be processed: "+r.error.description);btn.disabled=false;btn.innerHTML="Retry Payment";showDeclineWall(r.error.code||"failed",r.error.description);triggerRecovery({code:r.error.code||"technical_error",reason:r.error.description||r.error.reason||"Payment failed",source:r.error.source||"gateway",step:r.error.step||"payment_processing"})});
         rzp.open();
@@ -808,7 +809,7 @@ function switchRail(rail){
 
 function triggerRecovery(err){
     const code=err.code||"technical_error",reason=err.reason||"Payment failed",source=err.source||"gateway",step=err.step||"payment_processing";
-    fetch("/api/payment-failed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({payment_id:paymentId,amount:amount,failure_code:code,failure_reason:reason,error_source:source,error_step:step,customer:{name:"Rahul Kumar",email:"rahul@example.com"}})});
+    fetch("/api/payment-failed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({payment_id:paymentId,amount:amount,failure_code:code,failure_reason:reason,error_source:source,error_step:step,customer:customerData})});
     showStatus("recovering","Payment failed — our agent is working on it...");
     document.getElementById("trail").classList.add("visible");
 }
@@ -1103,7 +1104,7 @@ def merchant_page():
 
 @app.route("/pay")
 def pay_page():
-    return render_template_string(PAY_PAGE, amount=2999.0)
+    return render_template_string(PAY_PAGE, amount=2999.0, customer={})
 
 @app.route("/graph")
 def graph_page():
@@ -1114,10 +1115,10 @@ def graph_page():
 def simulate_scenario(scenario: str):
     import random
     payment_id = f"pay_sim_{random.randint(1000, 9999)}"
-    customer = {"name": "Rahul Kumar", "email": "rahul@example.com"}
+    customer = {}
 
     scenarios = {
-        "degradation": (4999.0, "Gateway Timeout 504 (HDFC Netbanking drop)", "degradation", "gateway_timeout", "gateway", "payment_authorization"),
+        "degradation": (4999.0, "Gateway timeout during payment processing", "degradation", "gateway_timeout", "gateway", "payment_authorization"),
         "abandonment": (2999.0, "Customer closed tab during checkout", "abandonment", "customer_cancelled", "customer", "payment_initiation"),
         "card_expiry": (12999.0, "Card expiry date is in the past", "card_expiry", "card_expired", "customer", "payment_authentication"),
         "voice_call": (8500.0, "High-value mandate failure requiring voice intervention", "voice_call", "mandate_revoked", "bank", "payment_authorization"),
@@ -1210,6 +1211,125 @@ def customer_responded():
         return jsonify({"status": "recovered", "payment_id": payment_id, "amount": amount})
 
     return jsonify({"status": "no_pending_action"})
+
+
+@app.route("/api/webhook-forward", methods=["POST"])
+def webhook_forward():
+    """Receive forwarded webhook events from webhook.py ingestor.
+
+    This is the SINGLE ENTRY POINT for all Razorpay webhook events.
+    The frontend is the single source of truth for agent execution and UI broadcasting.
+    """
+    data = request.json or {}
+    event = data.get("event", "")
+    payload = data.get("payload", {})
+
+    print(f"[frontend] Webhook forwarded: {event}")
+
+    if event == "payment.failed":
+        payment_entity = payload.get("payment", {}).get("entity", {})
+        payment_id = payment_entity.get("id", "")
+        amount = payment_entity.get("amount", 0) / 100
+        error_code = payment_entity.get("error_code", "")
+        error_reason = payment_entity.get("error_reason", "")
+        error_step = payment_entity.get("error_step", "")
+        contact = payment_entity.get("contact", "")
+        email = payment_entity.get("email", "")
+        notes = payment_entity.get("notes", {})
+        customer_id = notes.get("customer_id", payment_entity.get("customer_id", f"cust_{payment_id}"))
+
+        if payment_id not in payments:
+            payments[payment_id] = {
+                "payment_id": payment_id,
+                "amount": amount,
+                "status": "recovering",
+                "attempts": 0,
+                "last_action": "",
+                "last_detail": "",
+                "trail": [],
+            }
+        payments[payment_id]["status"] = "recovering"
+
+        socketio.start_background_task(
+            run_agent_for_payment,
+            payment_id,
+            amount,
+            f"{error_code}: {error_reason}",
+            {"id": customer_id, "name": contact, "email": email},
+            "standard",
+            error_code,
+            payment_entity.get("error_source", ""),
+            error_step,
+        )
+
+        return jsonify({"status": "recovery_started", "payment_id": payment_id})
+
+    elif event == "payment.captured":
+        payment_entity = payload.get("payment", {}).get("entity", {})
+        payment_id = payment_entity.get("id", "")
+        amount = payment_entity.get("amount", 0) / 100
+
+        if payment_id in pending_actions:
+            del pending_actions[payment_id]
+
+        if payment_id in payments:
+            payments[payment_id]["status"] = "recovered"
+            payments[payment_id]["recovered_amount"] = amount
+
+        push_event(payment_id, "webhook_captured", {
+            "status": "recovered",
+            "amount": amount,
+            "payment_id": payment_id,
+        })
+
+        return jsonify({"status": "captured", "payment_id": payment_id})
+
+    # All other events (disputes, refunds, etc.) — log but don't process
+    return jsonify({"status": "ignored", "event": event})
+
+
+@app.route("/api/daemon-retry-complete", methods=["POST"])
+def daemon_retry_complete():
+    """Receive retry execution results from the background daemon worker.
+
+    The daemon executes retries independently of the frontend.
+    This endpoint receives the results and broadcasts them to the UI.
+    """
+    data = request.json or {}
+    job_id = data.get("job_id", "")
+    payment_id = data.get("payment_id", "")
+    action = data.get("action", "")
+    result = data.get("result", {})
+    source = data.get("source", "daemon_worker")
+
+    print(f"[frontend] Daemon retry complete: job={job_id} payment={payment_id} status={result.get('status')}")
+
+    # Update payment state
+    if payment_id in payments:
+        payments[payment_id]["last_action"] = action
+        payments[payment_id]["last_detail"] = result.get("message", "")
+
+        # If retry created an order, store it
+        if result.get("order_id"):
+            payments[payment_id]["order_id"] = result["order_id"]
+
+        # If link created, store it
+        if result.get("link_url"):
+            payments[payment_id]["payment_link"] = result["link_url"]
+
+    # Broadcast to WebSocket
+    push_event(payment_id, "daemon_retry_executed", {
+        "job_id": job_id,
+        "action": action,
+        "result_status": result.get("status", "unknown"),
+        "message": result.get("message", ""),
+        "order_id": result.get("order_id", ""),
+        "link_url": result.get("link_url", ""),
+        "source": source,
+    })
+
+    return jsonify({"status": "received", "payment_id": payment_id})
+
 
 @app.route("/api/payments")
 def api_payments():

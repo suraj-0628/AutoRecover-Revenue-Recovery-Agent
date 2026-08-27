@@ -240,12 +240,12 @@ class TestPersistence:
                 success=True,
                 channel="sms",
             )
-            # Verify JSON file was created
-            path = Path(tmpdir) / "cust_001.json"
+            # Verify unified JSON store was created
+            path = Path(tmpdir) / "memory_store.json"
             assert path.exists()
             data = json.loads(path.read_text())
-            assert data["customer_id"] == "cust_001"
-            assert data["total_recovered"] == 500
+            assert "cust_001" in data
+            assert data["cust_001"]["total_recovered"] == 500
 
             # Load in fresh store
             store2 = CustomerMemoryStore(persist_dir=tmpdir)
@@ -255,10 +255,10 @@ class TestPersistence:
 
     def test_load_corrupted_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "bad.json"
+            path = Path(tmpdir) / "memory_store.json"
             path.write_text("not json")
             store = CustomerMemoryStore(persist_dir=tmpdir)
-            # Should not raise, just skip corrupted files
+            # Should not raise, just skip corrupted data
             assert len(store.list_profiles()) == 0
 
 
@@ -392,3 +392,48 @@ class TestMemoryAwareDecision:
         )
         action = decide_intervention(case)
         assert action == ActionType.RETRY_PAYMENT  # attempt 0 -> RETRY
+
+
+# --- File Locking (Cross-Platform) ---
+
+class TestFileLocking:
+    def test_filelock_creates_lock_file(self):
+        """Test that filelock creates a .lock file alongside memory_store.json."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CustomerMemoryStore(persist_dir=tmpdir)
+            profile = store.get_or_create_profile("cust_lock_1")
+            profile.total_recovered = 50.0
+            store.save_profile(profile)
+
+            lock_files = list(Path(tmpdir).glob("*.lock"))
+            assert len(lock_files) >= 1, "filelock should create .lock files"
+
+    def test_concurrent_writes_no_corruption(self):
+        """Test that concurrent writes don't corrupt the JSON store."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CustomerMemoryStore(persist_dir=tmpdir)
+            errors = []
+
+            def write_profile(cid: str):
+                try:
+                    profile = store.get_or_create_profile(cid)
+                    profile.total_recovered = 100.0
+                    store.save_profile(profile)
+                except Exception as e:
+                    errors.append(e)
+
+            threads = [threading.Thread(target=write_profile, args=(f"cust_{i}",)) for i in range(10)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert len(errors) == 0, f"Concurrent write errors: {errors}"
+
+            # Verify JSON is valid
+            store_path = Path(tmpdir) / "memory_store.json"
+            if store_path.exists():
+                data = json.loads(store_path.read_text())
+                assert isinstance(data, dict)

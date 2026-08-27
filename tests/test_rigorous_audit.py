@@ -231,3 +231,68 @@ class TestDisputeAndPartialPayments:
         assert approved_action == ActionType.ESCALATE_TO_HUMAN
         dd_check = next(c for c in checks if c.guardrail == "double_debit_lock")
         assert dd_check.verdict == GuardrailVerdict.BLOCKED
+
+
+# --- Test 6: Webhook Idempotency ---
+
+class TestWebhookIdempotency:
+    def test_duplicate_event_id_returns_duplicate(self):
+        """Test that duplicate event_id returns 200 with status=duplicate."""
+        from recovery_agent.webhook import _is_duplicate_event, _processed_events, _event_lock
+        from datetime import datetime, timezone
+
+        # Reset state
+        with _event_lock:
+            _processed_events.clear()
+
+        event_id = "evt_test_dup_001"
+
+        # First call — not duplicate
+        assert _is_duplicate_event(event_id) is False
+
+        # Second call — duplicate
+        assert _is_duplicate_event(event_id) is True
+
+        # Third call — still duplicate
+        assert _is_duplicate_event(event_id) is True
+
+    def test_different_event_ids_not_duplicate(self):
+        """Test that different event_ids are not considered duplicates."""
+        from recovery_agent.webhook import _is_duplicate_event, _processed_events, _event_lock
+
+        with _event_lock:
+            _processed_events.clear()
+
+        assert _is_duplicate_event("evt_001") is False
+        assert _is_duplicate_event("evt_002") is False
+        assert _is_duplicate_event("evt_001") is True  # duplicate of first
+        assert _is_duplicate_event("evt_002") is True  # duplicate of second
+
+    def test_empty_event_id_not_deduplicated(self):
+        """Test that empty event_id is allowed through (can't deduplicate)."""
+        from recovery_agent.webhook import _is_duplicate_event, _processed_events, _event_lock
+
+        with _event_lock:
+            _processed_events.clear()
+
+        # Empty event_id should always return False (not duplicate)
+        assert _is_duplicate_event("") is False
+        assert _is_duplicate_event("") is False
+        assert _is_duplicate_event("") is False
+
+    def test_idempotency_expiry_after_ttl(self):
+        """Test that old event_ids expire after TTL window."""
+        from recovery_agent.webhook import _is_duplicate_event, _processed_events, _event_lock, _IDEMPOTENCY_TTL_SECONDS
+
+        with _event_lock:
+            _processed_events.clear()
+
+        event_id = "evt_ttl_test"
+
+        # Record event with old timestamp (beyond TTL)
+        from datetime import datetime, timezone, timedelta
+        with _event_lock:
+            _processed_events[event_id] = datetime.now(timezone.utc) - timedelta(seconds=_IDEMPOTENCY_TTL_SECONDS + 1)
+
+        # Should NOT be considered duplicate (expired)
+        assert _is_duplicate_event(event_id) is False
