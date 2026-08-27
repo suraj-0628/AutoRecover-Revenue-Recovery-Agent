@@ -10,6 +10,105 @@ An autonomous AI agent that detects failed payments, diagnoses root causes via p
 Payment Fails → Webhook Sensing → LLM Diagnostic Reflection → Tier Assignment → Decline-Code Routing → Guardrail Check → Knowledge Graph Routing → Razorpay SDK Tool Execution → Generative UI Morphing
 ```
 
+### System Architecture
+
+```mermaid
+flowchart TB
+    %% External Entities
+    Razorpay((Razorpay Gateway))
+    Customer((Customer Checkout))
+    Merchant((Merchant Dashboard))
+
+    %% Webhook Ingestion Subsystem
+    subgraph Ingestion ["Webhook Ingestion (Port 5000)"]
+        Listener[webhook.py]
+        HMAC{HMAC Verification}
+        Idempotency[(Idempotency Cache\n24h TTL)]
+        EventBus[Event Bus / Message Queue]
+    end
+
+    %% Active Daemon
+    subgraph Daemon ["Background Workers"]
+        Scheduler[Daemon Worker]
+        JobQueue[(Job Queue\nScheduled Retries)]
+    end
+
+    %% State Management
+    subgraph Storage ["Persistent State"]
+        MemStore[(CustomerMemoryStore\nJSON with FileLocks)]
+    end
+
+    %% Core Agent Engine
+    subgraph Agent ["TrueForge Agentic Engine"]
+        Harness{Agent Harness\nReAct Loop}
+        
+        Diagnosis[Diagnosis Engine\n3-Layer Logic]
+        Guardrails[Semantic Guardrails\nSafety Interceptor]
+        KGRouter[Knowledge Graph Router\nNetworkX Pathing]
+        
+        subgraph RAG ["Agentic RAG Engine"]
+            SubQ[Sub-Question Decomposer]
+            Triad[Triad Evaluator\nGroundedness Check]
+            ChromaDB[(ChromaDB Vector Store\nONNX Embeddings)]
+        end
+        
+        Tools[Tool Executor]
+        SDK[Razorpay SDK Client]
+    end
+
+    %% Frontend Subsystem
+    subgraph Frontend ["Frontend UI (Port 5001/5002)"]
+        DashboardUI[dashboard.py\nReal-time Agent Stream]
+        CheckoutUI[frontend.py\nDynamic Smart Failover]
+        WebSockets((Socket.io))
+    end
+
+    %% Eval
+    subgraph Eval ["Adversarial Testing"]
+        ChaosGym[Chaos Gym\nRed Team Simulator]
+    end
+
+    %% --- Connections ---
+    Razorpay -- "payment.failed" --> Listener
+    Listener --> HMAC
+    HMAC -- Valid --> Idempotency
+    Idempotency -- New Event --> EventBus
+    EventBus -- "Trigger Case" --> Harness
+    Harness <--> Storage
+    Harness --> Diagnosis
+    Harness --> RAG
+    RAG --> ChromaDB
+    Harness --> KGRouter
+    Harness --> Guardrails
+    Guardrails -- "Policy Passed" --> Tools
+    Tools -- "Execute Action" --> SDK
+    Tools -- "Wait & Retry" --> JobQueue
+    Scheduler -- "Polls" --> JobQueue
+    Scheduler -- "Execute" --> SDK
+    SDK -- "API Call" --> Razorpay
+    Harness -- "Live Logs" --> WebSockets
+    WebSockets --> DashboardUI
+    WebSockets --> CheckoutUI
+    Customer <--> CheckoutUI
+    Merchant <--> DashboardUI
+    ChaosGym -. "Simulates Outages" .-> Ingestion
+
+    %% Styling
+    classDef external stroke:#888,stroke-width:2px,color:inherit;
+    classDef agent stroke:#03a9f4,stroke-width:2px,color:inherit;
+    classDef db stroke:#ff9800,stroke-width:2px,color:inherit;
+    classDef ui stroke:#9c27b0,stroke-width:2px,color:inherit;
+    classDef ingest stroke:#4caf50,stroke-width:2px,color:inherit;
+    classDef test stroke:#f44336,stroke-width:2px,color:inherit;
+
+    class Razorpay,Customer,Merchant external;
+    class Harness,Diagnosis,Guardrails,KGRouter,RAG,SubQ,Triad,Tools,SDK agent;
+    class MemStore,Idempotency,ChromaDB,JobQueue db;
+    class DashboardUI,CheckoutUI,WebSockets ui;
+    class Listener,HMAC,EventBus ingest;
+    class ChaosGym test;
+```
+
 ### Two-Tier Recovery (Industry-Grade)
 
 ```
