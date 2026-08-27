@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from recovery_agent.models import ActionType, Case, CustomerProfile
+from recovery_agent.models import ActionType, Case, CustomerProfile, HARD_DECLINES
 
 
 class GuardrailVerdict(str, Enum):
@@ -279,13 +279,73 @@ class MonetaryCapGuardrail:
         )
 
 
+class HardDeclineGuardrail:
+    """Intercepts retry attempts on hard decline codes.
+
+    Prevents $0.10/attempt Visa/Mastercard network penalties.
+    Hard decline codes: 41, 43, 54, 14, 04, 46, 57, 93
+
+    Source: Redux hard decline handling, Stripe Schedule+Skip
+    """
+
+    def check(
+        self,
+        action: ActionType,
+        profile: CustomerProfile | None = None,
+        case: Case | None = None,
+        **kwargs: Any,
+    ) -> GuardrailCheckResult:
+        if action not in (ActionType.RETRY_PAYMENT, ActionType.WAIT_AND_RETRY):
+            return GuardrailCheckResult(
+                guardrail="hard_decline",
+                verdict=GuardrailVerdict.PASS,
+                reason="Action is not a retry, no hard decline check applies",
+                original_action=action.value,
+            )
+
+        if not case:
+            return GuardrailCheckResult(
+                guardrail="hard_decline",
+                verdict=GuardrailVerdict.PASS,
+                reason="No case data, allowing action",
+                original_action=action.value,
+            )
+
+        failure_code = case.payment.failure_code
+
+        if failure_code in HARD_DECLINES:
+            # Increment penalties prevented counter
+            case.penalties_prevented += 1
+
+            return GuardrailCheckResult(
+                guardrail="hard_decline",
+                verdict=GuardrailVerdict.BLOCKED,
+                reason=(
+                    f"Hard decline code {failure_code} detected. "
+                    f"Retrying would incur $0.10/attempt Visa/MC network penalty. "
+                    f"Penalties prevented: {case.penalties_prevented}. "
+                    f"Blocking retry and escalating to human."
+                ),
+                original_action=action.value,
+                modified_action=ActionType.ESCALATE_TO_HUMAN.value,
+            )
+
+        return GuardrailCheckResult(
+            guardrail="hard_decline",
+            verdict=GuardrailVerdict.PASS,
+            reason=f"Decline code {failure_code} is not a hard decline",
+            original_action=action.value,
+        )
+
+
 # --- Guardrail Engine ---
 
 class GuardrailEngine:
     """Pre-execution interceptor that validates actions against all guardrails.
 
-    Runs all 5 guardrails in sequence. If any guardrail blocks or modifies
-    the action, the final action is adjusted accordingly.
+    Runs 6 guardrails in sequence (including hard decline prevention).
+    If any guardrail blocks or modifies the action, the final action is
+    adjusted accordingly.
     """
 
     def __init__(self) -> None:
@@ -294,6 +354,7 @@ class GuardrailEngine:
         self.double_debit = DoubleDebitLockGuardrail()
         self.opt_out = OptOutGuardrail()
         self.monetary_cap = MonetaryCapGuardrail()
+        self.hard_decline = HardDeclineGuardrail()
 
     def validate_action(
         self,
@@ -310,7 +371,9 @@ class GuardrailEngine:
         current_action = action
 
         # Run each guardrail — they may modify or block the action
+        # Hard decline check runs FIRST (highest priority)
         guardrail_checks = [
+            ("hard_decline", lambda: self.hard_decline.check(current_action, profile, case=case)),
             ("quiet_hours", lambda: self.quiet_hours.check(current_action, profile, now)),
             ("frequency_cap", lambda: self.frequency_cap.check(current_action, profile, now)),
             ("double_debit_lock", lambda: self.double_debit.check(current_action, profile, case=case)),

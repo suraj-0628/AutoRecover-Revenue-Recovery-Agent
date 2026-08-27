@@ -42,6 +42,42 @@ class ActionType(str, Enum):
     ABANDON = "abandon"
 
 
+class RecoveryTier(str, Enum):
+    """Recovery tier — silent (background) vs active (customer-contacting).
+
+    Inspired by Redux 'Silent First' architecture:
+    "Every unnecessary email is a cancellation opportunity."
+    """
+    SILENT = "silent"       # Background retries, no customer contact
+    ACTIVE = "active"       # Customer-facing: emails, SMS, payment link updates
+
+
+# Actions that do NOT contact the customer (safe for silent tier)
+SILENT_ACTIONS = frozenset({
+    ActionType.RETRY_PAYMENT,
+    ActionType.WAIT_AND_RETRY,
+})
+
+# Actions that DO contact the customer (active tier only)
+ACTIVE_ACTIONS = frozenset({
+    ActionType.SEND_NOTIFICATION,
+    ActionType.UPDATE_PAYMENT_METHOD,
+})
+
+# Hard decline codes — NEVER retry (Visa/MC network penalty prevention)
+# Source: Redux hard decline handling, Stripe Schedule+Skip behavior
+HARD_DECLINES = frozenset({
+    "41",  # Lost card
+    "43",  # Stolen card
+    "54",  # Expired card
+    "14",  # Invalid card number
+    "04",  # Pick up card (fraud)
+    "46",  # Closed account
+    "57",  # Transaction not permitted
+    "93",  # Transaction cannot be completed
+})
+
+
 class AuditStep(str, Enum):
     DETECT = "detect"
     DIAGNOSE = "diagnose"
@@ -75,6 +111,8 @@ class Attempt(BaseModel):
     action_details: dict[str, Any] = Field(default_factory=dict)
     result: str = "pending"  # success, failed, pending
     error: str = ""
+    signals: dict[str, Any] = Field(default_factory=dict)
+    tier: RecoveryTier = RecoveryTier.ACTIVE
 
 
 class PaymentEvent(BaseModel):
@@ -102,6 +140,10 @@ class Case(BaseModel):
     max_attempts: int = 5
     recovered: bool = False
     recovered_amount: float = 0.0
+    recovery_tier: RecoveryTier = RecoveryTier.SILENT
+    silent_attempts: int = 0
+    max_silent_attempts: int = 3
+    penalties_prevented: int = 0
 
 
 class AgentState(BaseModel):

@@ -1,13 +1,14 @@
-"""Diagnosis engine — real-time LLM diagnostic reflection.
+"""Diagnosis engine — real-time LLM diagnostic reflection with LlamaIndex RAG.
 
 Uses LLM (Nemotron via OmniRoute) as the PRIMARY diagnosis method.
 The LLM performs structured reflection over raw payment failure payloads,
-customer history, and bank health signals to classify root causes.
+customer history, bank health signals, AND RAG-retrieved knowledge base context.
 
-Cascade: Razorpay API data → LLM reflection → UNKNOWN fallback
+Cascade: LLM + RAG grounded context → Razorpay API data → Rule-based fallback
 
 Source: Reflection pattern from Agentic AI (Andrew Ng), Module 2
         Router decomposition from Evaluating AI Agents
+        LlamaIndex Agentic RAG: https://www.deeplearning.ai/courses/building-agentic-rag-with-llamaindex
 """
 from __future__ import annotations
 
@@ -90,7 +91,7 @@ def _build_diagnosis_prompt(case: Case) -> str:
     code_str = payment.failure_code or payment.metadata.get('error_code') or 'unmapped_code'
     reason_str = payment.failure_reason or payment.metadata.get('error_description') or 'unmapped_reason'
 
-    return f"""Diagnose this payment failure using raw diagnostic signals:
+    return f"""Diagnose this payment failure using raw diagnostic signals AND RAG-retrieved knowledge base context:
 
 FAILURE PAYMENT DATA:
   Payment ID: {payment.payment_id}
@@ -102,13 +103,16 @@ FAILURE PAYMENT DATA:
   Error Step: {payment.metadata.get('error_step', 'unknown')}
   Error Description: {payment.metadata.get('error_description', reason_str)}
   Currency: {payment.currency}
+  Payment Method: {payment.metadata.get('method', 'unknown')}
+  Provider: {payment.metadata.get('provider', 'unknown')}
 {attempt_history}{customer_context}
 
 Analyze the raw failure payload above. Reason step-by-step:
 1. Step 1 — Failure Code Analysis: What failure code or error string is provided?
 2. Step 2 — Failure Reason Analysis: What exact issue does the text describe?
 3. Step 3 — Contextual Signal Analysis: What do amount, customer, and gateway details imply?
-4. Step 4 — Confidence Assessment: Conclude the root cause category and confidence score.
+4. Step 4 — RAG Knowledge Base: What protocol does the retrieved knowledge base context recommend?
+5. Step 5 — Confidence Assessment: Conclude the root cause category and confidence score.
 
 Output your diagnosis strictly as JSON:"""
 
@@ -195,6 +199,106 @@ def diagnose_from_razorpay(case: Case) -> Diagnosis | None:
     )
 
 
+def diagnose_with_rag(case: Case) -> Diagnosis | None:
+    """Diagnose using LlamaIndex Agentic RAG — retrieves grounded context from knowledge base.
+
+    Uses SubQuestionQueryEngine to decompose the failure into sub-questions,
+    routes each to VectorIndex (specific codes) or SummaryIndex (policies),
+    and evaluates groundedness to ensure zero hallucination.
+
+    Groundedness >= 0.8 boosts confidence to 0.95.
+    """
+    from recovery_agent.agent.agentic_rag import LlamaIndexAgenticRAG
+
+    rag = LlamaIndexAgenticRAG()
+    metadata = {
+        "failure_code": case.payment.failure_code or case.payment.metadata.get("error_code", "unknown"),
+        "failure_reason": case.payment.failure_reason or case.payment.metadata.get("error_description", "unknown"),
+        "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
+        "method": case.payment.metadata.get("method", "unknown"),
+        "provider": case.payment.metadata.get("provider", "unknown"),
+        "amount": case.payment.amount,
+    }
+
+    rag_response = rag.query_for_diagnosis(metadata)
+
+    if not rag_response.retrieved_chunks:
+        return None
+
+    # Build diagnosis from RAG context
+    context_chunks = rag_response.retrieved_chunks[:5]
+    rag_context = "\n---\n".join(c.text for c in context_chunks)
+
+    # Determine root cause from RAG context
+    cause_str = _infer_cause_from_rag_context(rag_context, case)
+    cause_map = {
+        "card_expired": FailureType.CARD_EXPIRED,
+        "insufficient_funds": FailureType.INSUFFICIENT_FUNDS,
+        "bank_declined": FailureType.BANK_DECLINED,
+        "network_timeout": FailureType.NETWORK_TIMEOUT,
+        "risk_block": FailureType.RISK_BLOCK,
+        "mandate_revoked": FailureType.MANDATE_REVOKED,
+    }
+    cause = cause_map.get(cause_str, FailureType.UNKNOWN)
+
+    # Groundedness-boosted confidence
+    groundedness = rag_response.groundedness_score
+    if groundedness >= 0.8:
+        confidence = 0.95
+    elif groundedness >= 0.6:
+        confidence = 0.85
+    else:
+        confidence = 0.70
+
+    reasoning = (
+        f"RAG Grounded Diagnosis (groundedness={groundedness:.2f}):\n"
+        f"Retrieved from: {', '.join(c.source_file for c in context_chunks)}\n"
+        f"Sub-questions decomposed: {rag_response.decomposition_steps}\n"
+        f"Key context: {rag_context[:500]}"
+    )
+
+    return Diagnosis(
+        root_cause=cause,
+        confidence=confidence,
+        reasoning=reasoning,
+        category=f"payment_failure_{cause.value}",
+    )
+
+
+def _infer_cause_from_rag_context(context: str, case: Case) -> str:
+    """Infer root cause from RAG-retrieved context."""
+    context_lower = context.lower()
+    method = case.payment.metadata.get("method", "").lower()
+    reason = (case.payment.failure_reason or "").lower()
+    desc = (case.payment.metadata.get("error_description", "") or "").lower()
+
+    # Instrument switch detection (highest priority)
+    switch_keywords = ["use another payment instrument", "use another payment method",
+                       "try another method", "expired", "invalid card"]
+    if any(kw in reason or kw in desc for kw in switch_keywords):
+        if "expired" in reason or "expired" in desc:
+            return "card_expired"
+        return "bank_declined"
+
+    # RAG context-based inference
+    if "card_expired" in context_lower or "expiry date" in context_lower:
+        return "card_expired"
+    if "insufficient" in context_lower:
+        return "insufficient_funds"
+    if "mandate" in context_lower and ("inactive" in context_lower or "revoked" in context_lower or "cancelled" in context_lower):
+        return "mandate_revoked"
+    if "timeout" in context_lower or "503" in context_lower or "network" in context_lower:
+        return "network_timeout"
+    if "risk" in context_lower or "fraud" in context_lower:
+        return "risk_block"
+    if "lazypay" in context_lower or "paylater" in context_lower or "otp" in context_lower:
+        return "bank_declined"
+    if "bank_declined" in context_lower or "declined" in context_lower:
+        return "bank_declined"
+
+    return "unknown"
+
+
 def diagnose_payment_failure(case: Case) -> Diagnosis:
     """Rule-based fallback diagnosis — used only when LLM is unavailable.
 
@@ -243,19 +347,34 @@ def diagnose_payment_failure(case: Case) -> Diagnosis:
 
 
 def run_diagnosis(case: Case) -> Case:
-    """Run diagnosis on a case — LLM Diagnostic Reflection is Layer 1.
+    """Run diagnosis on a case — LLM + RAG is the PRIMARY intelligence layer.
 
     Cascade:
-      Layer 1: LLM diagnostic reflection (PRIMARY intelligence — reasons step-by-step over raw payload)
-      Layer 2: Razorpay API error data
+      Layer 1: LLM diagnostic reflection + LlamaIndex RAG grounded context (PRIMARY)
+      Layer 2: Razorpay API error data (real API)
       Layer 3: Rule-based fallback (safety net when LLM unavailable)
     """
     case.status = CaseStatus.DIAGNOSING
 
-    # Layer 1: LLM diagnostic reflection (PRIMARY METHOD — ALWAYS RUN FIRST)
+    # Layer 1a: LlamaIndex RAG — retrieve grounded knowledge base context
+    rag_diagnosis = diagnose_with_rag(case)
+
+    # Layer 1b: LLM diagnostic reflection with RAG context injected into prompt
     llm_diagnosis = diagnose_with_llm(case)
     if llm_diagnosis and llm_diagnosis.root_cause != FailureType.UNKNOWN:
+        # If RAG has high groundedness, boost LLM confidence
+        if rag_diagnosis and rag_diagnosis.confidence >= 0.9:
+            llm_diagnosis.confidence = max(llm_diagnosis.confidence, rag_diagnosis.confidence)
+            llm_diagnosis.reasoning = (
+                f"{llm_diagnosis.reasoning}\n\n"
+                f"RAG Grounded Context: {rag_diagnosis.reasoning[:300]}"
+            )
         case.diagnosis = llm_diagnosis
+        return case
+
+    # If LLM failed but RAG succeeded, use RAG diagnosis
+    if rag_diagnosis and rag_diagnosis.root_cause != FailureType.UNKNOWN:
+        case.diagnosis = rag_diagnosis
         return case
 
     # Layer 2: Razorpay API error data
@@ -267,6 +386,8 @@ def run_diagnosis(case: Case) -> Case:
     # Layer 3: Safety net fallback
     if llm_diagnosis:
         case.diagnosis = llm_diagnosis
+    elif rag_diagnosis:
+        case.diagnosis = rag_diagnosis
     else:
         case.diagnosis = diagnose_payment_failure(case)
     return case

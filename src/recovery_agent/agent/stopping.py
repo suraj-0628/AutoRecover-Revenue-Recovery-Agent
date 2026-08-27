@@ -1,5 +1,10 @@
 """Stopping rules — enforces explicit boundaries on the agent.
 
+Two-tier stopping logic:
+- Tier 1 (Silent): Separate max attempts for background retries
+- Tier 2 (Active): Separate max attempts for customer-facing actions
+- Tier transition: Silent exhausted → escalate to Active
+
 Source: Guardrails concept from Multi AI Agent Systems with crewAI
         Governance — risk management pillar from Governing AI Agents
 """
@@ -9,6 +14,7 @@ from recovery_agent.models import (
     ActionType,
     Case,
     CaseStatus,
+    RecoveryTier,
 )
 
 
@@ -17,12 +23,14 @@ def check_stopping_rules(case: Case) -> tuple[bool, str]:
 
     Returns (should_stop, reason).
 
-    Stopping rules:
+    Two-tier stopping rules:
     1. Recovery succeeded -> stop
-    2. Max attempts reached -> stop
-    3. Escalated to human -> stop (human takes over)
-    4. Abandoned -> stop
-    5. Max loops reached -> stop (safety valve)
+    2. Silent tier failed on last attempt -> transition to Active (not stop)
+    3. Silent tier exhausted -> transition to Active (not stop)
+    4. Active tier exhausted -> stop (escalate to human)
+    5. Escalated to human -> stop (human takes over)
+    6. Abandoned -> stop
+    7. Hard decline detected -> stop (escalate immediately)
 
     Source: Guardrails — break infinite loops, handle errors gracefully
     https://www.deeplearning.ai/courses/multi-ai-agent-systems-with-crewai
@@ -31,9 +39,9 @@ def check_stopping_rules(case: Case) -> tuple[bool, str]:
     if case.recovered:
         return True, "Recovery succeeded"
 
-    # Rule 2: Max attempts reached
-    if case.attempt_count >= case.max_attempts:
-        return True, f"Max attempts ({case.max_attempts}) reached"
+    # Rule 2: Hard decline detected → stop immediately
+    if case.payment.metadata.get("hard_decline_blocked"):
+        return True, f"Hard decline code {case.payment.failure_code} — cannot retry"
 
     # Rule 3: Last attempt was escalation (human takes over)
     if case.attempts:
@@ -47,19 +55,73 @@ def check_stopping_rules(case: Case) -> tuple[bool, str]:
         if last_attempt.action_type == ActionType.ABANDON:
             return True, "Case abandoned — no viable recovery path"
 
-    # Rule 5: Safety valve — max loops in the graph
+    # Rule 5: Silent tier — if last silent retry FAILED, escalate to Active immediately
+    # Never waste 3 attempts on the same broken payment method
+    if case.recovery_tier == RecoveryTier.SILENT and case.attempts:
+        last_attempt = case.attempts[-1]
+        if last_attempt.action_type in (ActionType.RETRY_PAYMENT, ActionType.WAIT_AND_RETRY):
+            if last_attempt.result == "failed":
+                return False, "SILENT_RETRY_FAILED"
+
+    # Rule 6: Silent tier exhausted → transition to Active
+    if case.recovery_tier == RecoveryTier.SILENT:
+        if case.silent_attempts >= case.max_silent_attempts:
+            # Don't stop — transition to Active tier
+            return False, "SILENT_TIER_EXHAUSTED"
+
+    # Rule 7: Max attempts reached (any tier) → stop
+    if case.attempt_count >= case.max_attempts:
+        return True, f"Max attempts ({case.max_attempts}) reached"
+
+    # Rule 8: Safety valve — max loops in the graph
     # (checked externally in the agent loop)
 
     return False, ""
 
 
+def transition_to_active_tier(case: Case, reason: str = "") -> Case:
+    """Transition from Silent to Active tier.
+
+    Called when silent tier is exhausted or a silent retry has failed.
+    The agent now switches to customer-facing interventions.
+    """
+    case.recovery_tier = RecoveryTier.ACTIVE
+    case.payment.metadata["tier_transition"] = "silent_to_active"
+    if reason == "SILENT_RETRY_FAILED":
+        case.payment.metadata["tier_transition_reason"] = (
+            f"Silent tier retry FAILED on attempt #{case.attempt_count}. "
+            f"Automatic escalation to Active tier — customer must switch instruments."
+        )
+    else:
+        case.payment.metadata["tier_transition_reason"] = (
+            f"Silent tier exhausted after {case.silent_attempts} attempts. "
+            f"Transitioning to Active tier for customer-facing recovery."
+        )
+    return case
+
+
 def run_stopping_check(case: Case) -> Case:
     """Check stopping rules and update case status.
+
+    Handles tier transitions:
+    - Silent retry failed → transition to Active (immediate)
+    - Silent exhausted → transition to Active
+    - Active exhausted → escalate to human
 
     Source: Governance — observability pillar, track decisions
     https://www.deeplearning.ai/courses/governing-ai-agents
     """
     should_stop, reason = check_stopping_rules(case)
+
+    # Handle silent tier failure (transition, not stop)
+    if reason == "SILENT_RETRY_FAILED":
+        case = transition_to_active_tier(case, reason=reason)
+        return case
+
+    # Handle silent tier exhaustion (transition, not stop)
+    if reason == "SILENT_TIER_EXHAUSTED":
+        case = transition_to_active_tier(case, reason=reason)
+        return case
 
     if should_stop:
         if case.recovered:
