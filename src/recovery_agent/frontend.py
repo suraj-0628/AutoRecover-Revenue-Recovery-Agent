@@ -1417,54 +1417,8 @@ function renderTrail(trail){
       </div>`;
     }
     return `<div class="trail-item t-${e.step}"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail">'+e.detail+'</div>':''}${specHtml}</div>`;
-  }).join("");
-  el.scrollTop=el.scrollHeight;
+  }).join('');
 }
-
-function showToast(msg,type){const t=document.getElementById("toast");t.textContent=msg;t.className="toast "+type+" show";setTimeout(()=>t.className="toast",3000)}
-
-function simulateScenario(scenario){
-  showToast("Running "+scenario+"...","info");
-  fetch("/api/simulate/"+scenario,{method:"POST"}).then(r=>r.json()).then(d=>{
-    showToast(scenario+": "+(d.status||d.cases+" cases"),d.status==="ok"?"success":"info");
-  }).catch(()=>showToast(scenario+": request sent","info"));
-}
-
-socket.on("connect",()=>showToast("Connected to live feed","info"));
-
-socket.on("tier_update",function(data){
-  const tier=data.tier||"active";
-  if(tierStats[tier]!==undefined)tierStats[tier]++;
-  if(data.penalties_prevented)totalPenalties+=data.penalties_prevented;
-  updateMetrics();
-});
-
-socket.on("decline_strategy",function(data){
-  if(data.failure_code){
-    declineStrategies[data.failure_code]={strategy:data.strategy,tier:data.tier};
-    renderDeclineStrategies();
-  }
-});
-
-socket.on("agent_event",function(data){
-  const idx=paymentsData.findIndex(p=>p.payment_id===data.payment_id);
-  if(data.event==="progress"||data.event==="complete"){
-    const p={payment_id:data.payment_id,amount:data.amount||0,status:data.status||"recovering",last_action:data.last_action,last_detail:data.last_detail,attempts:data.attempts||0,trail:data.trail||[],recovery_tier:data.recovery_tier||"active",decline_strategy:data.decline_strategy||"",penalties_prevented:data.penalties_prevented||0};
-    if(idx>=0)paymentsData[idx]={...paymentsData[idx],...p};else paymentsData.unshift(p);
-    renderPayments();updateMetrics();
-  }
-  if(idx>=0&&paymentsData[idx].trail)renderTrail(paymentsData[idx].trail);
-  else if(data.msg){
-    const existing=document.getElementById("trail");
-    if(existing){
-      if(existing.querySelector(".empty"))existing.innerHTML="";
-      existing.innerHTML+=`<div class="trail-item t-${data.event}"><div class="trail-time">${data.ts}</div><div class="trail-msg">${data.msg}</div>${data.detail?'<div class="trail-detail">'+data.detail+'</div>':''}</div>`;
-      existing.scrollTop=existing.scrollHeight;
-    }
-  }
-  if(data.event==="waiting_for_customer")showToast(`[${data.payment_id.slice(0,10)}] Waiting for customer response`,"info");
-  if(data.event==="complete")showToast(`[${data.payment_id.slice(0,10)}] ${data.status}`,data.status==="recovered"?"success":"info");
-});
 </script></body></html>"""
 
 
@@ -1552,7 +1506,6 @@ def payment_failed():
     error_source = data.get("error_source", "")
     error_step = data.get("error_step", "")
     customer = data.get("customer", {})
-    # --- Idempotency: skip if already recovering ---
     if store.has_payment(payment_id):
         if store.get_payment(payment_id).get("status") == "recovering":
             return jsonify({"status": "already_recovering", "payment_id": payment_id})
@@ -1576,7 +1529,6 @@ def customer_responded():
         amount = p.get("amount", 0)
         order_id = p.get("order_id", "")
 
-        # Verify real Razorpay orders before marking recovered
         is_simulated = order_id.startswith("order_rzp_") or order_id.startswith("order_sim_")
         order_paid = False
 
@@ -1585,20 +1537,10 @@ def customer_responded():
             order_status = order_data.get("status", "")
             order_paid = order_status == "paid"
         elif is_simulated or not razorpay_client.is_configured:
-            # Simulated or unconfigured — accept customer click as recovery
             order_paid = True
 
         if order_paid:
             p["status"] = "recovered"
-            # Call observe_outcome to record the real recovery
-            pending = store.get_pending(payment_id) if store.has_pending(payment_id) else {}
-            if pending:
-                from recovery_agent.models import ActionType as AT
-                try:
-                    action_type = AT(pending.get("action", "unknown"))
-                    observe_outcome(action_type, pending.get("execution", {}), customer_responded=True)
-                except (ValueError, KeyError):
-                    pass
             trail_entry = {
                 "step": "stopping",
                 "msg": f"Card Expiry Updated ({updated_expiry}) & Payment Recovered!",
@@ -1615,7 +1557,7 @@ def customer_responded():
             trail_entry = {
                 "step": "stopping",
                 "msg": "Customer clicked complete, but Razorpay capture not found",
-                "detail": f"Order {order_id} status: {order_data.get('status', 'unknown')}. Awaiting Razorpay capture webhook.",
+                "detail": f"Order {order_id} status: not paid. Awaiting Razorpay capture webhook.",
                 "ui_morph": "AWAITING_CAPTURE",
                 "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             }
@@ -1629,11 +1571,6 @@ def customer_responded():
 
 @app.route("/api/webhook-forward", methods=["POST"])
 def webhook_forward():
-    """Receive forwarded webhook events from webhook.py ingestor.
-
-    This is the SINGLE ENTRY POINT for all Razorpay webhook events.
-    The frontend is the single source of truth for agent execution and UI broadcasting.
-    """
     data = request.json or {}
     event = data.get("event", "")
     payload = data.get("payload", {})
@@ -1652,7 +1589,6 @@ def webhook_forward():
         notes = payment_entity.get("notes", {})
         customer_id = notes.get("customer_id", payment_entity.get("customer_id", f"cust_{payment_id}"))
 
-        # --- Idempotency: skip if already recovering ---
         if store.has_payment(payment_id):
             if store.get_payment(payment_id).get("status") == "recovering":
                 return jsonify({"status": "already_recovering", "payment_id": payment_id})
@@ -1704,17 +1640,11 @@ def webhook_forward():
 
         return jsonify({"status": "captured", "payment_id": payment_id})
 
-    # All other events (disputes, refunds, etc.) — log but don't process
     return jsonify({"status": "ignored", "event": event})
 
 
 @app.route("/api/daemon-retry-complete", methods=["POST"])
 def daemon_retry_complete():
-    """Receive retry execution results from the background daemon worker.
-
-    The daemon executes retries independently of the frontend.
-    This endpoint receives the results and broadcasts them to the UI.
-    """
     data = request.json or {}
     job_id = data.get("job_id", "")
     payment_id = data.get("payment_id", "")
@@ -1724,21 +1654,15 @@ def daemon_retry_complete():
 
     print(f"[frontend] Daemon retry complete: job={job_id} payment={payment_id} status={result.get('status')}")
 
-    # Update payment state
     if store.has_payment(payment_id):
         p = store.get_payment(payment_id)
         p["last_action"] = action
         p["last_detail"] = result.get("message", "")
-
-        # If retry created an order, store it
         if result.get("order_id"):
             p["order_id"] = result["order_id"]
-
-        # If link created, store it
         if result.get("link_url"):
             p["payment_link"] = result["link_url"]
 
-    # Broadcast to WebSocket
     push_event(payment_id, "daemon_retry_executed", {
         "job_id": job_id,
         "action": action,
@@ -1774,7 +1698,6 @@ def api_payments():
 
 @app.route("/api/benchmark", methods=["POST"])
 def run_benchmark():
-    """Run before/after benchmark comparison for Phase 4 validation."""
     from recovery_agent.eval.chaos_gym import run_before_after_benchmark
     data = request.json or {}
     seed = data.get("seed", 42)

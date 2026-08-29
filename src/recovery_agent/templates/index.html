@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Razorpay AutoRecover — OpenCode Agentic Operations HUD</title>
+  <title>Razorpay AutoRecover — Revenue Recovery Agent HUD</title>
   
   <!-- Google Fonts: JetBrains Mono + Fira Code -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -327,7 +327,7 @@
     .tag-acting    { color: var(--accent-red);    font-weight: 600; }
     .tag-harness   { color: #3b82f6;             font-weight: 600; }
 
-    /* OpenCode Tool Call Card */
+    /* Tool Call Card */
     .tool-card {
       background: #0d1117;
       border: 1px solid var(--border-color);
@@ -351,30 +351,6 @@
       overflow-y: auto;
       max-height: 160px;
       border: 1px solid #21262d;
-    }
-
-    /* Telemetry Radar Grid */
-    .telemetry-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-    }
-    .telemetry-card {
-      background: #0d1117;
-      border: 1px solid var(--border-color);
-      border-radius: 4px;
-      padding: 8px;
-    }
-    .telemetry-title {
-      font-size: 0.7rem;
-      color: var(--text-muted);
-      margin-bottom: 4px;
-      text-transform: uppercase;
-    }
-    .telemetry-val {
-      font-size: 0.8rem;
-      font-weight: 600;
-      color: var(--text-bright);
     }
 
     /* Tier Badge Styles */
@@ -682,7 +658,7 @@
     }
     .btn-voice-audio:hover { background: var(--accent-purple); color: #0d1117; }
 
-    /* OpenCode View Switcher */
+    /* View Switcher */
     .view-toggle-bar {
       display: flex;
       background: #0d1117;
@@ -759,7 +735,7 @@
   <header>
     <div class="brand">
       Razorpay AutoRecover
-      <span class="brand-badge">OpenCode Agentic Ops</span>
+      <span class="brand-badge">Revenue Recovery Agent</span>
     </div>
 
     <!-- Live Financial KPI Header Chips -->
@@ -803,7 +779,7 @@
           </div>
         </div>
 
-        <!-- OpenCode Tool Call Card -->
+        <!-- Tool Call Card -->
         <div class="tool-card" id="tool-card" style="display:none;">
           <div class="tool-title">
             <span id="tool-name">RazorpaySDK.tool_call</span>
@@ -812,34 +788,13 @@
           <pre class="tool-code" id="tool-args">{}</pre>
         </div>
 
-        <!-- Telemetry Radar Grid -->
-        <div class="telemetry-grid">
-          <div class="telemetry-card">
-            <div class="telemetry-title">NVIDIA NAT Guardrails</div>
-            <div class="telemetry-val" id="tele-guardrail">Quiet Hours OK | Attempt 1/3</div>
-          </div>
-          <div class="telemetry-card">
-            <div class="telemetry-title">Customer Memory Radar</div>
-            <div class="telemetry-val" id="tele-memory">Payday Liquidity High</div>
-          </div>
-          <div class="telemetry-card">
-            <div class="telemetry-title">Recovery Tier</div>
-            <div class="telemetry-val" id="tele-tier">
-              <span class="tier-badge tier-active"><span class="tier-dot"></span> ACTIVE</span>
-            </div>
-          </div>
-          <div class="telemetry-card">
-            <div class="telemetry-title">Decline Strategy</div>
-            <div class="telemetry-val" id="tele-strategy" style="font-size:0.72rem;">LLM Diagnostic Routing</div>
-          </div>
-          <div class="telemetry-card">
-            <div class="telemetry-title">Penalties Prevented</div>
-            <div class="telemetry-val" id="tele-penalties" style="color:var(--accent-green);">0 blocked ($0.00)</div>
-          </div>
-          <div class="telemetry-card">
-            <div class="telemetry-title">Payday Window</div>
-            <div class="telemetry-val" id="tele-payday" style="font-size:0.72rem;">Not in window</div>
-          </div>
+        <!-- Compact Status Bar -->
+        <div id="status-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; padding:4px 0;">
+          <span class="tier-badge tier-active" id="tele-tier"><span class="tier-dot"></span> ACTIVE</span>
+          <span class="trace-chip blue" id="tele-guardrail">Guardrail: Allowed | 1/3</span>
+          <span class="trace-chip purple" id="tele-strategy">Strategy: LLM Routing</span>
+          <span class="trace-chip green" id="tele-penalties">Penalties: 0 blocked</span>
+          <span class="trace-chip amber" id="tele-payday" style="display:none;"></span>
         </div>
 
       </div>
@@ -852,7 +807,7 @@
           Live Customer View
         </span>
 
-        <!-- OpenCode View Switcher -->
+        <!-- View Switcher -->
         <div class="view-toggle-bar">
           <button class="toggle-btn active" id="btn-view-canvas" onclick="switchRightPanelTab('canvas')">
             Canvas View
@@ -1258,17 +1213,20 @@
     // Tier update socket handler
     socket.on("tier_update", function(data) {
       const tier = data.tier || "active";
-      const tierLabel = tier === "silent" ? "SILENT RECOVERY" : tier === "hard_decline_blocked" ? "HARD DECLINE BLOCKED" : "ACTIVE RECOVERY";
+      const tierLabel = tier === "silent" ? "SILENT" : tier === "hard_decline_blocked" ? "BLOCKED" : "ACTIVE";
       const tierEl = document.getElementById("tele-tier");
-      tierEl.innerHTML = `<span class="tier-badge tier-${tier}"><span class="tier-dot"></span> ${tierLabel}</span>`;
+      tierEl.className = "tier-badge tier-" + tier;
+      tierEl.innerHTML = '<span class="tier-dot"></span> ' + tierLabel;
       if (data.decline_strategy) {
-        document.getElementById("tele-strategy").textContent = data.decline_strategy;
+        document.getElementById("tele-strategy").textContent = "Strategy: " + data.decline_strategy;
       }
       if (data.penalties_prevented > 0) {
-        document.getElementById("tele-penalties").textContent = data.penalties_prevented + " blocked (" + (data.penalties_value || "$0.00") + ")";
+        document.getElementById("tele-penalties").textContent = "Penalties: " + data.penalties_prevented + " blocked";
+        document.getElementById("tele-penalties").style.display = "";
       }
       if (data.payday_target_date) {
-        document.getElementById("tele-payday").textContent = "Next: " + data.payday_target_date;
+        document.getElementById("tele-payday").textContent = "Payday: " + data.payday_target_date;
+        document.getElementById("tele-payday").style.display = "";
       }
       if (tier === "silent") {
         showSilentBanner(data.payday_target_date || "", data.decline_strategy || "");
@@ -1316,29 +1274,30 @@
       const penalties = (data.guardrail && data.guardrail.penalties_prevented) || (data.ui_spec && data.ui_spec.penalties_prevented) || 0;
       const payday = (data.guardrail && data.guardrail.payday_target) || (data.ui_spec && data.ui_spec.payday_target) || "";
 
-      // Update tier telemetry card
+      // Update compact status bar
       if (tier) {
         const tierEl = document.getElementById("tele-tier");
-        const tierLabel = tier === "silent" ? "SILENT" : tier === "hard_decline_blocked" ? "HARD BLOCKED" : "ACTIVE";
-        tierEl.innerHTML = `<span class="tier-badge tier-${tier}"><span class="tier-dot"></span> ${tierLabel}</span>`;
-        // Reset banner when tier changes away from silent
+        const tierLabel = tier === "silent" ? "SILENT" : tier === "hard_decline_blocked" ? "BLOCKED" : "ACTIVE";
+        tierEl.className = "tier-badge tier-" + tier;
+        tierEl.innerHTML = '<span class="tier-dot"></span> ' + tierLabel;
         if (tier !== "silent" && lastTier === "silent") {
           resetSilentBanner();
         }
-        // Show banner when entering silent tier
         if (tier === "silent" && lastTier !== "silent") {
           showSilentBanner(payday || "", strategy || "");
         }
         lastTier = tier;
       }
       if (strategy) {
-        document.getElementById("tele-strategy").textContent = strategy;
+        document.getElementById("tele-strategy").textContent = "Strategy: " + strategy;
       }
       if (penalties > 0) {
-        document.getElementById("tele-penalties").textContent = penalties + " blocked ($" + (penalties * 0.10).toFixed(2) + ")";
+        document.getElementById("tele-penalties").textContent = "Penalties: " + penalties + " blocked";
+        document.getElementById("tele-penalties").style.display = "";
       }
       if (payday) {
-        document.getElementById("tele-payday").textContent = "Next: " + payday;
+        document.getElementById("tele-payday").textContent = "Payday: " + payday;
+        document.getElementById("tele-payday").style.display = "";
       }
 
       // 1. Log streaming thoughts & update live progress pills (with tier color coding)
