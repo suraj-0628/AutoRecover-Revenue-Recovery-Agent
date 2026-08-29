@@ -1450,7 +1450,7 @@ socket.on("agent_event",function(data){
 @app.route("/")
 @app.route("/merchant")
 def merchant_page():
-    return render_template("index.html")
+    return render_template_string(MERCHANT_PAGE)
 
 @app.route("/pay")
 def pay_page():
