@@ -46,6 +46,7 @@ htmlcov/
 
 # Logs
 data/audit_logs/*.jsonl
+data/live_*.json
 /tmp/
 
 # Secrets

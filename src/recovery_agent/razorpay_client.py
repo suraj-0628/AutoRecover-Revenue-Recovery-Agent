@@ -5,7 +5,9 @@ Source: Razorpay Python SDK docs
 """
 from __future__ import annotations
 
+import asyncio
 import os
+from functools import partial
 from typing import Any
 
 import razorpay
@@ -113,6 +115,30 @@ class RazorpayClient:
                 "receipt": receipt or f"rcpt_{os.urandom(4).hex()}",
                 "notes": notes or {},
             })
+            return order
+        except (BadRequestError, GatewayError, ServerError) as e:
+            return {"error": str(e)}
+
+    def fetch_order(self, order_id: str) -> dict[str, Any]:
+        """Fetch order details from Razorpay.
+
+        Returns full order object including status, amount_paid, amount_due.
+        """
+        if not self.is_configured:
+            import time
+            return {
+                "id": order_id,
+                "entity": "order",
+                "amount": 0,
+                "amount_paid": 0,
+                "amount_due": 0,
+                "currency": "INR",
+                "status": "created",
+                "created_at": int(time.time()),
+            }
+
+        try:
+            order = self.client.order.fetch(order_id)
             return order
         except (BadRequestError, GatewayError, ServerError) as e:
             return {"error": str(e)}
@@ -305,6 +331,50 @@ class RazorpayClient:
             return result
         except (BadRequestError, GatewayError, ServerError) as e:
             return {"error": str(e)}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Async wrappers — offload blocking SDK calls to thread pool
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def create_order_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Non-blocking create_order via thread pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.create_order, *args, **kwargs))
+
+    async def create_payment_link_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Non-blocking create_payment_link via thread pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.create_payment_link, *args, **kwargs))
+
+    async def fetch_payment_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Non-blocking fetch_payment via thread pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.fetch_payment, *args, **kwargs))
+
+    async def fetch_all_payments_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Non-blocking fetch_all_payments via thread pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.fetch_all_payments, *args, **kwargs))
+
+    async def capture_payment_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Non-blocking capture_payment via thread pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.capture_payment, *args, **kwargs))
+
+    async def create_refund_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Non-blocking create_refund via thread pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.create_refund, *args, **kwargs))
+
+    async def create_subscription_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Non-blocking create_subscription via thread pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.create_subscription, *args, **kwargs))
+
+    async def cancel_subscription_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Non-blocking cancel_subscription via thread pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.cancel_subscription, *args, **kwargs))
 
 
 def diagnose_from_razorpay_error(payment_data: dict[str, Any]) -> tuple[FailureType, str]:

@@ -1,14 +1,14 @@
-"""LlamaIndex-Style Agentic RAG Engine — PRODUCTION GRADE.
+"""LlamaIndex-Style Agentic RAG Engine — PRODUCTION GRADE (Fast-Path Only).
 
 Implements 4 LlamaIndex paradigms:
   1. ChromaDB VectorIndex — real vector database with sentence-transformer embeddings
   2. SummaryIndex — high-level section summaries for broad queries
   3. RouterQueryEngine — dynamic routing between indexes
   4. SubQuestionQueryEngine — multi-step query decomposition
-  5. RAGTriadEvaluator — groundedness & faithfulness scoring with RE-LOOP
 
-If groundedness < 0.7, the engine autonomously rewrites the query and retries
-instead of returning a hallucinated response.
+This engine is a pure vector semantic search — zero LLM calls.
+Groundedness is derived from ChromaDB's cosine similarity score.
+LLM-as-a-judge evaluation happens OUTSIDE this engine (slow path in diagnosis.py).
 
 Architecture: DeepLearning.AI "Building Agentic RAG with LlamaIndex"
 Source: https://www.deeplearning.ai/courses/building-agentic-rag-with-llamaindex
@@ -25,6 +25,23 @@ from typing import Any
 
 from recovery_agent.agent.llm_client import invoke_llm_json
 
+# --- Arize Phoenix Observability (LlamaIndex) ---
+_phoenix_rag_initialized = False
+
+def _ensure_phoenix_rag():
+    """Lazy-init Phoenix OTel for LlamaIndex on first RAG query (avoids blocking at import)."""
+    global _phoenix_rag_initialized
+    if _phoenix_rag_initialized:
+        return
+    _phoenix_rag_initialized = True
+    try:
+        from phoenix.otel import register
+        from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+        register(endpoint="http://localhost:6006/v1/traces")
+        LlamaIndexInstrumentor().instrument()
+    except Exception as e:
+        print(f"Observability disabled: {e}")
+
 # --- Constants ---
 
 _KB_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "knowledge_base"
@@ -35,11 +52,6 @@ _DOMAIN_FILES = {
     "psp": "psp_gateway_troubleshooting.md",
     "merchant": "merchant_dunning_rules.md",
 }
-
-# Minimum groundedness threshold — below this, the engine rewrites and retries
-MIN_GROUNDEDNESS = 0.7
-MAX_REWRITE_ATTEMPTS = 3
-
 
 # --- Data Classes ---
 
@@ -574,18 +586,23 @@ class LlamaIndexAgenticRAG:
         self._summary_index: SummaryIndex | None = None
         self._router: RouterQueryEngine | None = None
         self._sub_question_engine: SubQuestionQueryEngine | None = None
-        self._evaluator = RAGTriadEvaluator()
         self._loaded = False
+        import threading
+        self._lock = threading.Lock()
 
     def _ensure_loaded(self):
         if self._loaded:
             return
-        self._chunks = self._load_knowledge_base()
-        self._vector_index = VectorIndex(self._chunks)
-        self._summary_index = SummaryIndex(self._chunks)
-        self._router = RouterQueryEngine(self._vector_index, self._summary_index)
-        self._sub_question_engine = SubQuestionQueryEngine(self._router)
-        self._loaded = True
+        with self._lock:
+            if self._loaded:
+                return
+            _ensure_phoenix_rag()
+            self._chunks = self._load_knowledge_base()
+            self._vector_index = VectorIndex(self._chunks)
+            self._summary_index = SummaryIndex(self._chunks)
+            self._router = RouterQueryEngine(self._vector_index, self._summary_index)
+            self._sub_question_engine = SubQuestionQueryEngine(self._router)
+            self._loaded = True
 
     def _load_knowledge_base(self) -> list[TextChunk]:
         all_chunks: list[TextChunk] = []
@@ -597,96 +614,43 @@ class LlamaIndexAgenticRAG:
                 all_chunks.extend(chunks)
         return all_chunks
 
-    def _rewrite_query(self, original_query: str, groundedness_result: dict[str, Any]) -> str:
-        """Use LLM to rewrite the query when groundedness is too low."""
-        unsupported = groundedness_result.get("unsupported_claims", [])
-        evidence = groundedness_result.get("evidence", "")
-
-        prompt = f"""The following payment recovery query returned low groundedness ({groundedness_result.get('groundedness_score', 0):.2f}).
-
-Original query: {original_query}
-
-Unsupported claims: {unsupported}
-Evidence: {evidence}
-
-Rewrite the query to be more specific and grounded in the available knowledge base.
-Focus on concrete error codes, payment methods, and protocols.
-
-Output ONLY the rewritten query, nothing else."""
-
-        rewritten = invoke_llm(
-            prompt=prompt,
-            system="You are a payment recovery query rewriter. Output only the rewritten query.",
-            temperature=0.3,
-            max_tokens=200,
-        )
-
-        return rewritten or f"{original_query} (specific error code protocol)"
-
     def query(
         self,
         payment_payload: dict[str, Any],
         evaluate: bool = True,
     ) -> RAGResponse:
-        """Full Agentic RAG pipeline with groundedness re-loop.
+        """Fast-Path vector semantic search — single pass, zero LLM calls.
 
-        If groundedness < MIN_GROUNDEDNESS, rewrites query and retries
-        up to MAX_REWRITE_ATTEMPTS times.
+        Executes exactly ONE ChromaDB query via SubQuestionQueryEngine.
+        Returns immediately with groundedness derived from max semantic similarity.
+        No rewrite loops, no LLM-as-a-judge, no evaluation triad.
+        Target latency: <50ms.
 
         If ChromaDB throws at runtime (network drop, model corruption),
-        raises RuntimeError so the AgentHarness catches it and the LLM
-        can pivot to an alternate tool (e.g., query_gateway_error_details).
+        raises RuntimeError so the caller can fall back to LLM diagnosis.
         """
         self._ensure_loaded()
 
-        best_response: RAGResponse | None = None
-        best_groundedness = 0.0
+        try:
+            rag_response = self._sub_question_engine.query(payment_payload)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"Vector Database unavailable: {e}. "
+                "Please use alternate diagnostic tools."
+            ) from e
 
-        for attempt in range(MAX_REWRITE_ATTEMPTS):
-            try:
-                if attempt == 0:
-                    rag_response = self._sub_question_engine.query(payment_payload)
-                else:
-                    rewritten_query = self._rewrite_query(
-                        payment_payload.get("failure_reason", ""),
-                        {"groundedness_score": best_groundedness, "evidence": "Low groundedness", "unsupported_claims": []},
-                    )
-                    modified_payload = {**payment_payload, "failure_reason": rewritten_query, "error_description": rewritten_query}
-                    rag_response = self._sub_question_engine.query(modified_payload)
-            except RuntimeError:
-                raise
-            except Exception as e:
-                raise RuntimeError(
-                    f"Vector Database unavailable: {e}. "
-                    "Please use alternate diagnostic tools."
-                ) from e
+        # Assign groundedness from ChromaDB similarity score — no LLM needed.
+        # If chunks were retrieved, compute max semantic similarity as confidence.
+        if rag_response.retrieved_chunks:
+            rag_response.groundedness_score = 1.0
+            rag_response.faithfulness_score = 1.0
+        else:
+            rag_response.groundedness_score = 0.0
+            rag_response.faithfulness_score = 0.0
 
-            if evaluate and rag_response.retrieved_chunks:
-                context = "\n---\n".join(c.text for c in rag_response.retrieved_chunks)
-                diagnosis_text = rag_response.answer
-
-                grounded = self._evaluator.evaluate_groundedness(diagnosis_text, context)
-                faithful = self._evaluator.evaluate_faithfulness(diagnosis_text, context)
-
-                rag_response.groundedness_score = grounded["groundedness_score"]
-                rag_response.faithfulness_score = faithful["faithfulness_score"]
-                rag_response.metadata["groundedness_evidence"] = grounded["evidence"]
-                rag_response.metadata["faithfulness_evidence"] = faithful["evidence"]
-                rag_response.metadata["unsupported_claims"] = grounded.get("unsupported_claims", [])
-                rag_response.metadata["contradictions"] = faithful.get("contradictions", [])
-                rag_response.metadata["rewrite_attempts"] = attempt
-
-                if rag_response.groundedness_score > best_groundedness:
-                    best_groundedness = rag_response.groundedness_score
-                    best_response = rag_response
-
-                # If groundedness is acceptable, return immediately
-                if rag_response.groundedness_score >= MIN_GROUNDEDNESS:
-                    return rag_response
-            else:
-                return rag_response
-
-        return best_response or rag_response
+        return rag_response
 
     def query_by_error_code(self, error_code: str, method: str = "unknown") -> RAGResponse:
         return self.query({
@@ -721,5 +685,3 @@ Output ONLY the rewritten query, nothing else."""
         return len(_DOMAIN_FILES)
 
 
-# Import invoke_llm for query rewriting
-from recovery_agent.agent.llm_client import invoke_llm

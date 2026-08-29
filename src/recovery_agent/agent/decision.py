@@ -19,6 +19,8 @@ from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
 from recovery_agent.agent.llm_client import invoke_llm_json
 from recovery_agent.agent.memory import CustomerMemoryStore
 from recovery_agent.agent.payday_scheduler import PaydayScheduler
+from recovery_agent.agent.strategy_metrics import StrategyMetricsStore, ThompsonBandit
+from recovery_agent.agent.vector_memory import VectorMemoryStore
 from recovery_agent.models import (
     ActionType,
     Case,
@@ -40,6 +42,12 @@ _decline_router: DeclineCodeRouter | None = None
 
 # Shared PaydayScheduler instance (built once, reused)
 _payday_scheduler: PaydayScheduler | None = None
+
+# Shared StrategyMetricsStore instance (built once, reused)
+_strategy_metrics: StrategyMetricsStore | None = None
+
+# Shared ThompsonBandit instance (built once, reused)
+_thompson_bandit: ThompsonBandit | None = None
 
 
 def _get_kg_router() -> RazorpayKnowledgeGraph:
@@ -64,6 +72,22 @@ def _get_payday_scheduler() -> PaydayScheduler:
     if _payday_scheduler is None:
         _payday_scheduler = PaydayScheduler()
     return _payday_scheduler
+
+
+def _get_strategy_metrics() -> StrategyMetricsStore:
+    """Lazy-init the shared strategy metrics store."""
+    global _strategy_metrics
+    if _strategy_metrics is None:
+        _strategy_metrics = StrategyMetricsStore()
+    return _strategy_metrics
+
+
+def _get_thompson_bandit() -> ThompsonBandit:
+    """Lazy-init the shared Thompson Sampling bandit."""
+    global _thompson_bandit
+    if _thompson_bandit is None:
+        _thompson_bandit = ThompsonBandit(_get_strategy_metrics())
+    return _thompson_bandit
 
 
 INSTRUMENT_SWITCH_KEYWORDS = (
@@ -127,6 +151,10 @@ def _assign_tier(case: Case) -> RecoveryTier:
 
     # Card expired → ACTIVE (customer must update payment method)
     if cause == FailureType.CARD_EXPIRED:
+        return RecoveryTier.ACTIVE
+
+    # User dropoff → ACTIVE (customer must be re-engaged)
+    if cause == FailureType.USER_DROPOFF:
         return RecoveryTier.ACTIVE
 
     # Mandate revoked → ACTIVE (customer must re-authorize)
@@ -288,6 +316,13 @@ RISK_BLOCK: Fraud/risk system flagged the payment.
   → TIER: ACTIVE (needs human review)
   → escalate_to_human (requires human fraud review)
 
+USER_DROPOFF: Customer intentionally cancelled or abandoned the checkout flow. Nothing is technically wrong with the payment method.
+  → TIER: ACTIVE (customer must be re-engaged)
+  → First try: send_notification (send a friendly "We noticed you didn't complete your purchase" recovery message with a payment link)
+  → Then: update_payment_method (offer alternative checkout options)
+  → NEVER: retry_payment (customer chose to leave — silently retrying is hostile and may cause chargebacks)
+  → NEVER: wait_and_retry (waiting won't bring the customer back)
+
 You must output EXACTLY this JSON format:
 {
   "decided_action": "<one of the 6 action names>",
@@ -301,8 +336,10 @@ def _build_strategy_prompt(
     profile: CustomerProfile | None,
     available_rails: list[str],
     optimal_channel: str,
+    similar_context: str = "",
+    empirical_context: str = "",
 ) -> str:
-    """Build the strategy planning prompt."""
+    """Build the strategy planning prompt with similar case context and empirical data."""
     diagnosis = case.diagnosis
     payment = case.payment
 
@@ -367,6 +404,12 @@ DIAGNOSIS:
 
 CUSTOMER MEMORY:
 {memory_context}
+
+SIMILAR PAST CASES:
+{similar_context if similar_context else "No similar cases found in memory."}
+
+EMPIRICAL EVIDENCE:
+{empirical_context if empirical_context else "No historical data yet — building baseline."}
 
 RECOVERY RAILS:
 {rails_context}
@@ -468,6 +511,14 @@ def _heuristic_fallback(case: Case) -> ActionType:
         elif cause == FailureType.RISK_BLOCK:
             return ActionType.ESCALATE_TO_HUMAN
 
+        elif cause == FailureType.USER_DROPOFF:
+            if attempts == 0:
+                return ActionType.SEND_NOTIFICATION
+            elif attempts == 1:
+                return ActionType.UPDATE_PAYMENT_METHOD
+            else:
+                return ActionType.ESCALATE_TO_HUMAN
+
         elif cause == FailureType.INSUFFICIENT_FUNDS:
             if attempts == 0:
                 return ActionType.SEND_NOTIFICATION
@@ -504,14 +555,20 @@ def decide_intervention(
     profile: CustomerProfile | None = None,
     memory: CustomerMemoryStore | None = None,
     kg_router: RazorpayKnowledgeGraph | None = None,
+    vector_memory: VectorMemoryStore | None = None,
+    strategy_metrics: StrategyMetricsStore | None = None,
+    bandit: ThompsonBandit | None = None,
 ) -> ActionType:
     """Choose the appropriate intervention using LLM strategy planning.
 
     Two-tier decision logic:
     1. Check for hard decline → immediate escalation
     2. Assign tier (silent/active) based on failure type
-    3. LLM plans strategy within tier constraints
-    4. Enforce tier constraints on final action
+    3. Query bandit for empirical recommendation
+    4. LLM plans strategy within tier constraints + empirical context
+    5. Bandit override if high confidence
+    6. Enforce tier constraints on final action
+    7. Record outcome for future learning
 
     Falls back to heuristic rules if LLM is unavailable.
 
@@ -568,8 +625,23 @@ def decide_intervention(
         case.payment.metadata["discovered_rail_path"] = available_rails
         case.payment.metadata["recommended_api_rail"] = recommended_rail
 
+    # === STEP 3.5: Query bandit for empirical recommendation ===
+    metrics = strategy_metrics or _get_strategy_metrics()
+    bandit_inst = bandit or _get_thompson_bandit()
+    empirical_ctx = bandit_inst.get_empirical_context(cause)
+    bandit_action = bandit_inst.select_action(cause)
+    if bandit_action:
+        case.payment.metadata["bandit_recommendation"] = bandit_action.value
+        bandit_conf = bandit_inst.get_confidence(cause, bandit_action)
+        case.payment.metadata["bandit_confidence"] = bandit_conf
+
     # === STEP 4: LLM strategy planning ===
-    prompt = _build_strategy_prompt(case, profile, available_rails, preferred_channel)
+    # Query vector memory for similar past cases
+    similar_ctx = ""
+    if vector_memory and vector_memory.is_available:
+        similar_ctx = vector_memory.get_decision_context(case)
+
+    prompt = _build_strategy_prompt(case, profile, available_rails, preferred_channel, similar_ctx, empirical_ctx)
     result = invoke_llm_json(
         prompt=prompt,
         system=STRATEGY_SYSTEM_PROMPT,
@@ -601,6 +673,18 @@ def decide_intervention(
             if llm_tier != tier:
                 case.payment.metadata["tier_override_by_llm"] = True
 
+    # === STEP 4.5: Bandit override (if high confidence) ===
+    # If bandit has high confidence (>80%) and disagrees with LLM, override
+    if bandit_action and bandit_action != action:
+        bandit_conf = bandit_inst.get_confidence(cause, bandit_action)
+        if bandit_conf > 0.80:
+            # Bandit is very confident — override LLM
+            case.payment.metadata["bandit_override"] = True
+            case.payment.metadata["bandit_override_from"] = action.value
+            case.payment.metadata["bandit_override_to"] = bandit_action.value
+            case.payment.metadata["bandit_override_confidence"] = bandit_conf
+            action = bandit_action
+
     # === STEP 5: Enforce tier constraints ===
     if tier == RecoveryTier.SILENT:
         # Silent tier: block customer-facing actions
@@ -628,6 +712,9 @@ def run_decision(
     profile: CustomerProfile | None = None,
     memory: CustomerMemoryStore | None = None,
     kg_router: RazorpayKnowledgeGraph | None = None,
+    vector_memory: VectorMemoryStore | None = None,
+    strategy_metrics: StrategyMetricsStore | None = None,
+    bandit: ThompsonBandit | None = None,
 ) -> Case:
     """Run decision layer on a case and update its state.
 
@@ -639,7 +726,10 @@ def run_decision(
     """
     case.status = CaseStatus.DIAGNOSED
 
-    action = decide_intervention(case, profile=profile, memory=memory, kg_router=kg_router)
+    action = decide_intervention(
+        case, profile=profile, memory=memory, kg_router=kg_router,
+        vector_memory=vector_memory, strategy_metrics=strategy_metrics, bandit=bandit,
+    )
 
     case.payment.metadata["decided_action"] = action.value
 

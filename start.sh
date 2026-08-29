@@ -32,7 +32,15 @@ echo "Starting Revenue Recovery Agent services..."
 pkill -f "recovery_agent.dashboard" 2>/dev/null
 pkill -f "recovery_agent.webhook" 2>/dev/null
 pkill -f "recovery_agent.frontend" 2>/dev/null
+pkill -f "recovery_agent.daemon_worker" 2>/dev/null
+pkill -f "phoenix.server" 2>/dev/null
 sleep 1
+
+# Start Phoenix observability server
+export PHOENIX_PORT=6006
+setsid .venv/bin/phoenix serve > /tmp/phoenix.log 2>&1 &
+PHOENIX_PID=$!
+sleep 2
 
 # Start dashboard
 setsid .venv/bin/python3 -m recovery_agent.dashboard < /dev/null > /tmp/dashboard.log 2>&1 &
@@ -46,12 +54,18 @@ WEBHOOK_PID=$!
 setsid .venv/bin/python3 -m recovery_agent.frontend < /dev/null > /tmp/frontend.log 2>&1 &
 FRONTEND_PID=$!
 
+# Start daemon worker (executes scheduled retries)
+setsid .venv/bin/python3 -m recovery_agent.daemon_worker < /dev/null > /tmp/daemon_worker.log 2>&1 &
+DAEMON_PID=$!
+
 sleep 3
 
 # Verify services
+PHOENIX_OK=$(curl -s http://localhost:6006/ | grep -q "" && echo "YES" || echo "NO")
 DASHBOARD_OK=$(curl -s http://localhost:${DASHBOARD_PORT:-5001}/api/metrics | grep -q "total_cases" && echo "YES" || echo "NO")
 WEBHOOK_OK=$(curl -s http://localhost:${WEBHOOK_PORT:-5000}/health | grep -q "status" && echo "YES" || echo "NO")
 FRONTEND_OK=$(curl -s http://localhost:5002/health | grep -q "status" && echo "YES" || echo "NO")
+DAEMON_OK=$(pgrep -f "recovery_agent.daemon_worker" > /dev/null && echo "YES" || echo "NO")
 
 echo ""
 echo "========================================="
@@ -67,10 +81,15 @@ echo "  Recovery Dashboard: http://localhost:${DASHBOARD_PORT:-5001}"
 echo "  Agent Flow:         http://localhost:${DASHBOARD_PORT:-5001}/graph"
 echo "  Webhook Listener:   http://localhost:${WEBHOOK_PORT:-5000}/webhook"
 echo ""
+echo "  --- Observability ---"
+echo "  Phoenix Tracing:    http://localhost:6006"
+echo ""
 echo "  --- Status ---"
+echo "  Phoenix:    [$PHOENIX_OK]"
 echo "  Dashboard:  [$DASHBOARD_OK]"
 echo "  Webhook:    [$WEBHOOK_OK]"
 echo "  Frontend:   [$FRONTEND_OK]"
+echo "  Daemon:     [$DAEMON_OK]"
 echo ""
 echo "  To stop: pkill -f recovery_agent"
 echo "========================================="

@@ -105,9 +105,30 @@ def forward_to_frontend(event_type: str, payload: dict) -> dict[str, Any]:
         return {"status": "error", "message": str(e)}
 
 
+def _forward_to_frontend_async(event_type: str, payload: dict) -> None:
+    """Fire-and-forget background forwarding via thread pool.
+
+    Non-blocking: spawns a daemon thread for the HTTP POST so the
+    webhook handler returns 200 immediately. Under load, this prevents
+    Flask worker thread starvation from slow frontend responses.
+    """
+    def _do_forward():
+        try:
+            forward_to_frontend(event_type, payload)
+        except Exception as e:
+            print(f"[webhook] ERROR: Background forward failed: {e}", file=sys.stderr)
+
+    t = threading.Thread(target=_do_forward, daemon=True, name=f"fwd-{event_type[:32]}")
+    t.start()
+
+
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
-    """Receive Razorpay webhook, verify signature, deduplicate, forward to frontend."""
+    """Receive Razorpay webhook, verify signature, deduplicate, forward to frontend.
+
+    Returns 200 immediately after dedup check. Forwarding to frontend
+    happens in a background thread to avoid blocking the webhook worker.
+    """
     signature = request.headers.get("X-Razorpay-Signature", "")
     if not verify_signature(request.data, signature):
         return jsonify({"error": "Invalid signature"}), 401
@@ -116,10 +137,8 @@ def handle_webhook():
     event = payload.get("event", "")
 
     # Idempotency: extract event_id from Razorpay payload
-    # Razorpay includes event_id at payload.event or payload.payload.payment.entity.id
     event_id = payload.get("event_id", "")
     if not event_id:
-        # Fallback: construct from event type + payment entity ID
         payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
         entity_id = payment_entity.get("id", "")
         event_id = f"{event}:{entity_id}" if entity_id else ""
@@ -130,16 +149,14 @@ def handle_webhook():
 
     print(f"[webhook] Received event: {event}")
 
-    # Forward ALL events to frontend — let frontend decide what to process
-    result = forward_to_frontend(event, payload)
-
-    if result.get("status") == "error":
-        return jsonify(result), 502
+    # Offload forwarding to background thread — return 200 immediately
+    _forward_to_frontend_async(event, payload)
 
     return jsonify({
-        "status": "forwarded",
+        "status": "accepted",
         "event": event,
-        "frontend_response": result,
+        "event_id": event_id,
+        "forwarding": "async",
     }), 200
 
 

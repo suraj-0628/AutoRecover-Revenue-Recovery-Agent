@@ -5,13 +5,15 @@ If a policy is violated, the action is vetoed or modified to a compliant fallbac
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from recovery_agent.models import ActionType, Case, CustomerProfile, HARD_DECLINES
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 class GuardrailVerdict(str, Enum):
@@ -44,7 +46,7 @@ class QuietHourGuardrail:
         profile: CustomerProfile | None = None,
         now: datetime | None = None,
     ) -> GuardrailCheckResult:
-        current = now or datetime.now(timezone.utc)
+        current = now or datetime.now(IST)
         hour = current.hour
 
         is_quiet = hour >= self.quiet_start or hour < self.quiet_end
@@ -353,6 +355,7 @@ ACTION TO EVALUATE:
   Customer opted out: {opt_out}
   Communication count (24h): {comm_count_24h}
   Failure code: {failure_code}
+  Diagnosed Root Cause: {root_cause}
   Attempt count: {attempt_count}
   Amount: INR {amount}
 
@@ -363,6 +366,7 @@ POLICY RULES:
 4. Do NOT execute high-value retries (>INR 1,00,000) without human review
 5. Do NOT send notifications during quiet hours (9 PM - 8 AM IST)
 6. If the customer has complained or the case is disputed, escalate to human
+7. NEVER authorize a silent `retry_payment` or `wait_and_retry` if the Diagnosed Root Cause is `user_dropoff`. These are behavioral drop-offs where the customer intentionally cancelled or abandoned checkout. The correct action is `send_notification` or `update_payment_method` to re-engage the customer. Do NOT re-analyze the raw failure code — trust the Diagnosed Root Cause.
 
 Determine if this action is SAFE, UNSAFE, or REQUIRES_REVIEW.
 Output JSON:
@@ -410,6 +414,7 @@ Output JSON:
                 opt_out=profile.opt_out if profile else False,
                 comm_count_24h=comm_count,
                 failure_code=case.payment.failure_code if case else "unknown",
+                root_cause=case.diagnosis.root_cause.value if (case and case.diagnosis) else "unknown",
                 attempt_count=case.attempt_count if case else 0,
                 amount=case.payment.amount if case else 0,
             )
@@ -441,12 +446,16 @@ Output JSON:
                     modified_action=modified.value,
                 )
             elif verdict == "requires_review":
+                try:
+                    modified = ActionType(suggested) if suggested else ActionType.ESCALATE_TO_HUMAN
+                except ValueError:
+                    modified = ActionType.ESCALATE_TO_HUMAN
                 return GuardrailCheckResult(
                     guardrail="semantic",
                     verdict=GuardrailVerdict.MODIFIED,
                     reason=f"Semantic evaluation: {reason}",
                     original_action=action.value,
-                    modified_action=ActionType.ESCALATE_TO_HUMAN.value,
+                    modified_action=modified.value,
                 )
             else:
                 return GuardrailCheckResult(
@@ -466,6 +475,18 @@ Output JSON:
         case: Case | None,
     ) -> GuardrailCheckResult:
         """Deterministic fallback when LLM is unavailable."""
+        # Block retry for customer-initiated cancellations
+        if case and case.diagnosis:
+            if case.diagnosis.root_cause.value == "user_dropoff":
+                if action in (ActionType.RETRY_PAYMENT, ActionType.WAIT_AND_RETRY):
+                    return GuardrailCheckResult(
+                        guardrail="semantic",
+                        verdict=GuardrailVerdict.MODIFIED,
+                        reason="Customer intentionally cancelled. Silent retry is hostile. Switching to notification.",
+                        original_action=action.value,
+                        modified_action=ActionType.SEND_NOTIFICATION.value,
+                    )
+
         if profile and profile.opt_out:
             if action in (ActionType.SEND_NOTIFICATION, ActionType.UPDATE_PAYMENT_METHOD):
                 return GuardrailCheckResult(
@@ -557,18 +578,16 @@ class GuardrailEngine:
 
             # If guardrail blocks, use a safe compliant fallback instead of the blocked action
             if result.verdict == GuardrailVerdict.BLOCKED:
-                # Communication blocks → WAIT_AND_RETRY (defer to later)
-                # Payment blocks → ESCALATE_TO_HUMAN (let human handle)
-                # Other blocks → WAIT_AND_RETRY
                 if current_action in (ActionType.SEND_NOTIFICATION, ActionType.UPDATE_PAYMENT_METHOD):
                     fallback = ActionType.WAIT_AND_RETRY
                 elif current_action == ActionType.RETRY_PAYMENT:
+                    fallback = ActionType.ESCALATE_TO_HUMAN
+                elif current_action == ActionType.WAIT_AND_RETRY:
                     fallback = ActionType.ESCALATE_TO_HUMAN
                 else:
                     fallback = ActionType.WAIT_AND_RETRY
 
                 current_action = fallback
-                # Record the block
                 checks.append(GuardrailCheckResult(
                     guardrail="interceptor",
                     verdict=GuardrailVerdict.BLOCKED,

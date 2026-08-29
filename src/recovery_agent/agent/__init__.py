@@ -13,17 +13,20 @@ from langgraph.graph import END, StateGraph
 
 from recovery_agent.agent.decision import run_decision
 from recovery_agent.agent.diagnosis import run_diagnosis
-from recovery_agent.agent.execution import run_execution
+from recovery_agent.agent.execution import execute_action, run_execution
 from recovery_agent.agent.guardrails import GuardrailEngine
 from recovery_agent.agent.harness import AgentHarness, HarnessResult
 from recovery_agent.agent.memory import CustomerMemoryStore
+from recovery_agent.agent.semantic_cache import lookup_fast_path
 from recovery_agent.agent.squad import SquadOrchestrator
 from recovery_agent.agent.stopping import check_stopping_rules, run_stopping_check
+from recovery_agent.agent.vector_memory import VectorMemoryStore
 from recovery_agent.logging import AuditLogger
 from recovery_agent.models import (
     AgentState,
     AuditStep,
     Case,
+    CaseStatus,
     RecoveryTier,
 )
 
@@ -45,12 +48,14 @@ class RecoveryAgent:
         audit_logger: AuditLogger | None = None,
         memory_store: CustomerMemoryStore | None = None,
         guardrail_engine: GuardrailEngine | None = None,
+        vector_memory: VectorMemoryStore | None = None,
         use_squad: bool = False,
         use_harness: bool = False,
     ):
         self.logger = audit_logger or AuditLogger()
         self.memory = memory_store or CustomerMemoryStore()
         self.guardrails = guardrail_engine or GuardrailEngine()
+        self.vector_memory = vector_memory or VectorMemoryStore()
         self.use_squad = use_squad
         self.use_harness = use_harness
         if use_squad:
@@ -62,6 +67,7 @@ class RecoveryAgent:
             self.harness = AgentHarness(
                 memory_store=self.memory,
                 guardrail_engine=self.guardrails,
+                vector_memory=self.vector_memory,
             )
         self.graph = self._build_graph()
 
@@ -153,7 +159,7 @@ class RecoveryAgent:
         # Load customer profile from memory
         profile = self.memory.get_or_create_profile(case.payment.customer_id)
 
-        case = run_decision(case, profile=profile, memory=self.memory)
+        case = run_decision(case, profile=profile, memory=self.memory, vector_memory=self.vector_memory)
         action = case.payment.metadata.get("decided_action", "unknown")
         tier = case.recovery_tier.value
 
@@ -369,19 +375,198 @@ class RecoveryAgent:
         return "continue"
 
     def run(self, case: Case) -> Case:
-        """Run the full recovery loop on a case."""
+        """Run the full recovery loop on a case.
+
+        Intercepts deterministic failure codes via the Fast Path Cache
+        before entering the LangGraph state machine. Saves ~5-10s of
+        LLM latency for card_expired, insufficient_funds, hard declines, etc.
+        """
+        # === FAST PATH: deterministic failures bypass the ReAct loop ===
+        fast = lookup_fast_path(case.payment.failure_code)
+        if fast is not None:
+            return self._run_fast_path(case, fast)
+
         if self.use_harness:
             return self.run_harness(case)
         initial_state = AgentState(case=case)
         final_state = self.graph.invoke(initial_state)
         return final_state["case"]
 
+    async def run_async(self, case: Case) -> Case:
+        """Run the full recovery loop asynchronously (non-blocking).
+
+        All LLM calls and SDK operations are offloaded to a thread pool
+        via run_in_executor. Use this from async contexts (webhook handlers,
+        async servers) to avoid blocking the event loop.
+
+        Falls back to sync run() for fast-path and graph-mode cases.
+        """
+        fast = lookup_fast_path(case.payment.failure_code)
+        if fast is not None:
+            return self._run_fast_path(case, fast)
+
+        if self.use_harness:
+            return await self.run_harness_async(case)
+
+        # Graph mode is still synchronous — run in executor
+        import asyncio
+        from functools import partial
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(self.run, case))
+
+    def _run_fast_path(self, case: Case, fast) -> Case:
+        """Execute a deterministic fast-path intervention.
+
+        Bypasses diagnosis, LLM strategy planning, and RAG entirely.
+        Logs the same audit steps as the normal flow for consistency.
+        """
+        start = time.time()
+
+        # Step 1: Detect — log case opening (same as normal flow)
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.DETECT,
+            input_data={
+                "payment_id": case.payment.payment_id,
+                "amount": case.payment.amount,
+                "failure_reason": case.payment.failure_reason,
+            },
+            reasoning=f"Payment {case.payment.payment_id} failed: {case.payment.failure_reason}. "
+                      f"Amount: {case.payment.currency} {case.payment.amount}. "
+                      f"Opening recovery case.",
+            output_data={"case_id": case.id, "status": "open"},
+            duration_ms=0,
+        )
+
+        # Step 2: Diagnose — set pre-computed diagnosis (no LLM call)
+        from recovery_agent.models import Diagnosis
+        case.diagnosis = Diagnosis(
+            root_cause=fast.diagnosis_root_cause,
+            confidence=fast.diagnosis_confidence,
+            reasoning=fast.reasoning,
+            category="fast_path",
+        )
+        case.status = CaseStatus.DIAGNOSED
+
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.DIAGNOSE,
+            input_data={
+                "failure_reason": case.payment.failure_reason,
+                "failure_code": case.payment.failure_code,
+            },
+            reasoning=f"[FAST PATH] Diagnosis: {fast.diagnosis_root_cause.value} "
+                      f"(confidence: {fast.diagnosis_confidence:.0%}). "
+                      f"{fast.reasoning}",
+            output_data={
+                "root_cause": fast.diagnosis_root_cause.value,
+                "confidence": fast.diagnosis_confidence,
+                "fast_path": True,
+            },
+            duration_ms=0,
+        )
+
+        # Step 3: Decide — set pre-computed action (no LLM call)
+        case.recovery_tier = fast.tier
+        case.payment.metadata["decided_action"] = fast.action.value
+        case.payment.metadata["recovery_tier"] = fast.tier.value
+        case.payment.metadata["strategy_reasoning"] = fast.reasoning
+        case.payment.metadata["fast_path"] = True
+
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.DECIDE,
+            input_data={
+                "root_cause": fast.diagnosis_root_cause.value,
+                "attempt_count": case.attempt_count,
+                "recovery_tier": fast.tier.value,
+                "fast_path": True,
+            },
+            reasoning=f"[FAST PATH] Deterministic intervention: {fast.action.value}. "
+                      f"Cause: {fast.diagnosis_root_cause.value}. "
+                      f"Tier: {fast.tier.value.upper()}. "
+                      f"{fast.reasoning}",
+            output_data={
+                "action": fast.action.value,
+                "recovery_tier": fast.tier.value,
+                "fast_path": True,
+            },
+            duration_ms=0,
+        )
+
+        # Step 4: Act — execute the intervention (real Razorpay SDK call)
+        profile = self.memory.get_or_create_profile(case.payment.customer_id)
+        case = run_execution(case, guardrail_engine=self.guardrails, profile=profile)
+        last_attempt = case.attempts[-1] if case.attempts else None
+
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.ACT,
+            input_data={
+                "action": last_attempt.action_type.value if last_attempt else "none",
+                "attempt_number": case.attempt_count,
+                "recovery_tier": fast.tier.value,
+                "fast_path": True,
+            },
+            reasoning=f"[FAST PATH] Executed: {last_attempt.action_type.value}. "
+                      f"Result: {last_attempt.result}. "
+                      f"Tier: {fast.tier.value.upper()}.",
+            output_data={
+                "action": last_attempt.action_type.value if last_attempt else "none",
+                "result": last_attempt.result if last_attempt else "none",
+                "fast_path": True,
+            },
+            duration_ms=int((time.time() - start) * 1000),
+        )
+
+        # Step 5: Stop — log final status
+        case = run_stopping_check(case)
+
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.STOP,
+            input_data={
+                "status": case.status.value,
+                "fast_path": True,
+            },
+            reasoning=f"[FAST PATH] Agent stopped. "
+                      f"Total attempts: {case.attempt_count}. "
+                      f"Recovered: {case.recovered}. "
+                      f"Recovered amount: {case.recovered_amount}. "
+                      f"Penalties prevented: {case.penalties_prevented}. "
+                      f"Final tier: {case.recovery_tier.value.upper()}",
+            output_data={
+                "final_status": case.status.value,
+                "total_attempts": case.attempt_count,
+                "recovered": case.recovered,
+                "recovered_amount": case.recovered_amount,
+                "penalties_prevented": case.penalties_prevented,
+                "fast_path": True,
+            },
+            duration_ms=0,
+        )
+
+        # Ingest fast-path outcome into vector memory for future similarity
+        try:
+            self.vector_memory.ingest_outcome(case)
+        except Exception:
+            pass
+
+        return case
+
     def run_harness(self, case: Case) -> Case:
         """Run the TrueForge-style AgentHarness on a case.
 
         Executes multi-turn reasoning with tool-calling, error reflection,
         and context compaction. Returns the case with enriched metadata.
+
+        Intercepts deterministic failure codes via Fast Path Cache before
+        spinning up the expensive harness loop.
         """
+        # === FAST PATH: deterministic failures bypass the harness ===
+        fast = lookup_fast_path(case.payment.failure_code)
+        if fast is not None:
+            return self._run_fast_path(case, fast)
         start = time.time()
 
         # Step 1: Detect — log case opening
@@ -422,6 +607,61 @@ class RecoveryAgent:
 
         # Step 3: Run the multi-turn harness loop
         harness_result = self.harness.run_recovery_case(case)
+
+        # Step 4: Log harness results
+        self._log_harness_result(case, harness_result, start)
+
+        return case
+
+    async def run_harness_async(self, case: Case) -> Case:
+        """Run the AgentHarness asynchronously (non-blocking).
+
+        All LLM calls and tool executions inside the harness are offloaded
+        to a thread pool via run_in_executor. Use this from async contexts.
+        """
+        fast = lookup_fast_path(case.payment.failure_code)
+        if fast is not None:
+            return self._run_fast_path(case, fast)
+        start = time.time()
+
+        # Step 1: Detect
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.DETECT,
+            input_data={
+                "payment_id": case.payment.payment_id,
+                "amount": case.payment.amount,
+                "failure_reason": case.payment.failure_reason,
+            },
+            reasoning=f"Payment {case.payment.payment_id} failed: {case.payment.failure_reason}. "
+                      f"Amount: {case.payment.currency} {case.payment.amount}. "
+                      f"Opening recovery case via AgentHarness (async).",
+            output_data={"case_id": case.id, "status": "open", "mode": "harness_async"},
+            duration_ms=0,
+        )
+
+        # Step 2: Diagnose
+        case = run_diagnosis(case)
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.DIAGNOSE,
+            input_data={
+                "failure_reason": case.payment.failure_reason,
+                "failure_code": case.payment.failure_code,
+            },
+            reasoning=f"Diagnosis: {case.diagnosis.root_cause.value} "
+                      f"(confidence: {case.diagnosis.confidence:.0%}). "
+                      f"{case.diagnosis.reasoning}",
+            output_data={
+                "root_cause": case.diagnosis.root_cause.value,
+                "confidence": case.diagnosis.confidence,
+                "mode": "harness_async",
+            },
+            duration_ms=0,
+        )
+
+        # Step 3: Run the multi-turn harness loop (async — non-blocking)
+        harness_result = await self.harness.run_recovery_case_async(case)
 
         # Step 4: Log harness results
         self._log_harness_result(case, harness_result, start)

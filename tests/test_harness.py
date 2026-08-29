@@ -32,6 +32,7 @@ from recovery_agent.agent.harness import (
     _compact_context,
     _format_observation,
     _reflect_on_error,
+    _reflect_on_error_async,
     _build_harness_prompt,
     MAX_HARNESS_ITERATIONS,
     CONTEXT_COMPACT_THRESHOLD,
@@ -67,16 +68,16 @@ def make_payment_event(
 
 
 def make_case(
-    failure_code: str = "card_expired",
-    failure_reason: str = "Card has expired",
+    failure_code: str = "unknown_retryable_error",
+    failure_reason: str = "Payment processing issue",
     amount: float = 5000.0,
 ) -> Case:
     event = make_payment_event(failure_code, failure_reason, amount)
     case = Case(payment=event, max_attempts=5)
     case.diagnosis = Diagnosis(
-        root_cause=FailureType.CARD_EXPIRED,
+        root_cause=FailureType.UNKNOWN,
         confidence=0.9,
-        reasoning="Card expired — customer needs to update payment method.",
+        reasoning="Unknown error — requires LLM reasoning to determine intervention.",
     )
     return case
 
@@ -332,12 +333,12 @@ class TestPromptBuilder:
         prompt = _build_harness_prompt(case, [], [])
         assert "pay_test_harness" in prompt
         assert "5,000.00" in prompt
-        assert "card_expired" in prompt
+        assert "unknown_retryable_error" in prompt
 
     def test_prompt_includes_diagnosis(self):
         case = make_case()
         prompt = _build_harness_prompt(case, [], [])
-        assert "card_expired" in prompt
+        assert "unknown_retryable_error" in prompt
         assert "90%" in prompt
 
     def test_prompt_includes_history_block(self):
@@ -376,16 +377,16 @@ class TestAgentHarness:
                 {"tool": "generate_smart_recovery_link", "arguments": {"payment_id": "pay_test_harness"}}
             ],
             "is_final": True,
-            "status": "recovered",
+            "status": "action_dispatched",
         }
         harness = AgentHarness()
         case = make_case()
         result = harness.run_recovery_case(case)
 
-        assert result.final_status == "recovered"
+        assert result.final_status == "action_dispatched"
         assert result.total_turns == 1
         assert len(result.tools_called) == 1
-        assert case.recovered is True
+        assert case.recovered is False
 
     @patch("recovery_agent.agent.harness.invoke_llm_json")
     def test_harness_escalation_path(self, mock_llm):
@@ -447,7 +448,7 @@ class TestAgentHarness:
                 "reasoning": "Bank is healthy. Generate recovery link.",
                 "tool_calls": [{"tool": "generate_smart_recovery_link", "arguments": {"payment_id": "pay_test_harness"}}],
                 "is_final": True,
-                "status": "recovered",
+                "status": "action_dispatched",
             },
         ]
         mock_llm.side_effect = responses
@@ -457,7 +458,7 @@ class TestAgentHarness:
         result = harness.run_recovery_case(case)
 
         assert result.total_turns == 2
-        assert result.final_status == "recovered"
+        assert result.final_status == "action_dispatched"
         assert len(result.tools_called) == 2
 
     @patch("recovery_agent.agent.harness.invoke_llm_json")
@@ -480,7 +481,7 @@ class TestAgentHarness:
                 "reasoning": "Try different approach.",
                 "tool_calls": [],
                 "is_final": True,
-                "status": "recovered",
+                "status": "action_dispatched",
             },
         ]
         mock_llm.side_effect = responses
@@ -507,7 +508,7 @@ class TestAgentHarness:
                 "reasoning": "Link generated successfully.",
                 "tool_calls": [{"tool": "generate_smart_recovery_link", "arguments": {"payment_id": "pay_test_harness"}}],
                 "is_final": True,
-                "status": "recovered",
+                "status": "action_dispatched",
             },
         ]
         mock_llm.side_effect = responses
@@ -536,7 +537,7 @@ class TestAgentHarness:
                 "reasoning": "Calculate payday window.",
                 "tool_calls": [{"tool": "calculate_payday_window", "arguments": {"customer_id": "cust_harness_test"}}],
                 "is_final": True,
-                "status": "recovered",
+                "status": "action_dispatched",
             },
         ]
         mock_llm.side_effect = responses
@@ -564,7 +565,7 @@ class TestHarnessAgentIntegration:
             "reasoning": "Recovery complete.",
             "tool_calls": [],
             "is_final": True,
-            "status": "recovered",
+            "status": "action_dispatched",
         }
 
         from recovery_agent.agent import RecoveryAgent
@@ -572,7 +573,7 @@ class TestHarnessAgentIntegration:
         case = make_case()
         final_case = agent.run(case)
 
-        assert final_case.recovered is True
+        assert final_case.recovered is False
         assert final_case.audit_log  # Should have audit entries
 
     @patch("recovery_agent.agent.harness.invoke_llm_json")
@@ -582,7 +583,7 @@ class TestHarnessAgentIntegration:
             "reasoning": "Done.",
             "tool_calls": [],
             "is_final": True,
-            "status": "recovered",
+            "status": "action_dispatched",
         }
 
         from recovery_agent.agent import RecoveryAgent
@@ -598,5 +599,237 @@ class TestHarnessAgentIntegration:
         final_lg = agent_langgraph.run(case_lg)
 
         # Both should complete without errors
-        assert final_h.status in (CaseStatus.RECOVERED, CaseStatus.ESCALATED, CaseStatus.STOPPED)
-        assert final_lg.status in (CaseStatus.RECOVERED, CaseStatus.ESCALATED, CaseStatus.STOPPED)
+        assert final_h.status in (CaseStatus.AWAITING_CUSTOMER, CaseStatus.ESCALATED, CaseStatus.STOPPED)
+        assert final_lg.status in (CaseStatus.AWAITING_CUSTOMER, CaseStatus.ESCALATED, CaseStatus.STOPPED)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ASYNC HARNESS TESTS
+# ═══════════════════════════════════════════════════════════════
+
+import asyncio
+
+
+class TestAsyncHarness:
+    """Test AgentHarness async execution — non-blocking event loop behavior."""
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    def test_async_harness_recovery_path(self, mock_llm_async):
+        """Async harness completes recovery without blocking."""
+        mock_llm_async.return_value = {
+            "reasoning": "Recovery complete.",
+            "tool_calls": [],
+            "is_final": True,
+            "status": "action_dispatched",
+        }
+        harness = AgentHarness()
+        case = make_case()
+        result = asyncio.run(harness.run_recovery_case_async(case))
+
+        assert result.final_status == "action_dispatched"
+        assert case.recovered is False
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    def test_async_harness_llm_unavailable(self, mock_llm_async):
+        """Async harness returns failed when LLM is unavailable."""
+        mock_llm_async.return_value = None
+        harness = AgentHarness()
+        case = make_case()
+        result = asyncio.run(harness.run_recovery_case_async(case))
+
+        assert result.final_status == "failed"
+        assert result.total_turns == 0
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    def test_async_harness_multiple_turns(self, mock_llm_async):
+        """Async harness flows through multiple turns."""
+        responses = [
+            {
+                "reasoning": "Check bank health.",
+                "tool_calls": [{"tool": "check_bank_health", "arguments": {"bank_code": "HDFC"}}],
+                "is_final": False,
+                "status": "in_progress",
+            },
+            {
+                "reasoning": "Bank healthy. Generate link.",
+                "tool_calls": [{"tool": "generate_smart_recovery_link", "arguments": {"payment_id": "pay_test_harness"}}],
+                "is_final": True,
+                "status": "action_dispatched",
+            },
+        ]
+        mock_llm_async.side_effect = responses
+
+        harness = AgentHarness()
+        case = make_case()
+        result = asyncio.run(harness.run_recovery_case_async(case))
+
+        assert result.total_turns == 2
+        assert result.final_status == "action_dispatched"
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    def test_async_harness_max_iterations(self, mock_llm_async):
+        """Async harness stops after max iterations."""
+        mock_llm_async.return_value = {
+            "reasoning": "Trying...",
+            "tool_calls": [{"tool": "check_bank_health", "arguments": {"bank_code": "HDFC"}}],
+            "is_final": False,
+            "status": "in_progress",
+        }
+        harness = AgentHarness()
+        case = make_case()
+        result = asyncio.run(harness.run_recovery_case_async(case))
+
+        assert result.final_status == "max_iterations"
+        assert result.total_turns == MAX_HARNESS_ITERATIONS
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    def test_async_harness_error_reflection(self, mock_llm_async):
+        """Async harness calls async reflection when tool returns error."""
+        responses = [
+            {
+                "reasoning": "Query gateway.",
+                "tool_calls": [{"tool": "query_gateway_error_details", "arguments": {"payment_id": "pay_test_harness"}}],
+                "is_final": False,
+                "status": "in_progress",
+            },
+            {
+                "reasoning": "Link generated.",
+                "tool_calls": [{"tool": "generate_smart_recovery_link", "arguments": {"payment_id": "pay_test_harness"}}],
+                "is_final": True,
+                "status": "action_dispatched",
+            },
+        ]
+        mock_llm_async.side_effect = responses
+
+        harness = AgentHarness()
+        case = make_case()
+        with patch("recovery_agent.agent.harness.execute_tool_async") as mock_exec:
+            mock_exec.return_value = {"status": "error", "message": "Gateway timeout"}
+            with patch("recovery_agent.agent.harness._reflect_on_error_async") as mock_reflect:
+                mock_reflect.return_value = "Tool failed. Switching strategy."
+                result = asyncio.run(harness.run_recovery_case_async(case))
+
+        assert result.error_count >= 1
+        mock_reflect.assert_called()
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    def test_async_harness_repetition_prohibition(self, mock_llm_async):
+        """Async harness blocks identical repeated tool calls."""
+        responses = [
+            {
+                "reasoning": "Check bank.",
+                "tool_calls": [{"tool": "check_bank_health", "arguments": {"bank_code": "HDFC"}}],
+                "is_final": False,
+                "status": "in_progress",
+            },
+            {
+                "reasoning": "Check bank again.",
+                "tool_calls": [{"tool": "check_bank_health", "arguments": {"bank_code": "HDFC"}}],
+                "is_final": False,
+                "status": "in_progress",
+            },
+            {
+                "reasoning": "Done.",
+                "tool_calls": [],
+                "is_final": True,
+                "status": "action_dispatched",
+            },
+        ]
+        mock_llm_async.side_effect = responses
+
+        harness = AgentHarness()
+        case = make_case()
+        result = asyncio.run(harness.run_recovery_case_async(case))
+
+        assert result.error_count >= 1
+        assert len(result.tools_called) == 1
+
+
+class TestSyncAsyncEquivalence:
+    """Verify sync wrapper produces identical results to direct async call."""
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    @patch("recovery_agent.agent.harness.invoke_llm_json")
+    def test_sync_wrapper_matches_async(self, mock_sync, mock_async):
+        """Sync run_recovery_case() produces same result as run_recovery_case_async()."""
+        expected = {
+            "reasoning": "Recovered.",
+            "tool_calls": [],
+            "is_final": True,
+            "status": "action_dispatched",
+        }
+        mock_sync.return_value = expected
+        mock_async.return_value = expected
+
+        harness = AgentHarness()
+
+        # Sync path (uses _run_recovery_case_sync directly)
+        case_sync = make_case()
+        result_sync = harness.run_recovery_case(case_sync)
+
+        # Async path
+        case_async = make_case()
+        result_async = asyncio.run(harness.run_recovery_case_async(case_async))
+
+        assert result_sync.final_status == result_async.final_status
+        assert result_sync.total_turns == result_async.total_turns
+        assert case_sync.recovered == case_async.recovered
+
+
+class TestAsyncReflectOnError:
+    """Test async error reflection function."""
+
+    @patch("recovery_agent.agent.harness.invoke_llm_async")
+    def test_async_reflect_returns_string(self, mock_invoke_async):
+        mock_invoke_async.return_value = "Network timeout. Try different rail."
+        case = make_case()
+        result = asyncio.run(_reflect_on_error_async(case, "check_bank_health", "Connection timeout", []))
+        assert isinstance(result, str)
+        assert "network timeout" in result.lower()
+
+    @patch("recovery_agent.agent.harness.invoke_llm_async")
+    def test_async_reflect_fallback(self, mock_invoke_async):
+        mock_invoke_async.return_value = None
+        case = make_case()
+        result = asyncio.run(_reflect_on_error_async(case, "check_bank_health", "Connection timeout", []))
+        assert "check_bank_health" in result
+        assert "Connection timeout" in result
+
+
+class TestAsyncAgentIntegration:
+    """Test RecoveryAgent async entry points."""
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    def test_agent_run_async_harness_mode(self, mock_llm_async):
+        """RecoveryAgent.run_async() works in harness mode."""
+        mock_llm_async.return_value = {
+            "reasoning": "Done.",
+            "tool_calls": [],
+            "is_final": True,
+            "status": "action_dispatched",
+        }
+
+        from recovery_agent.agent import RecoveryAgent
+        agent = RecoveryAgent(use_harness=True)
+        case = make_case()
+        final_case = asyncio.run(agent.run_async(case))
+
+        assert final_case.recovered is False
+        assert final_case.audit_log
+
+    @patch("recovery_agent.agent.harness.invoke_llm_json_async")
+    def test_agent_run_harness_async(self, mock_llm_async):
+        """RecoveryAgent.run_harness_async() directly."""
+        mock_llm_async.return_value = {
+            "reasoning": "Recovered.",
+            "tool_calls": [],
+            "is_final": True,
+            "status": "action_dispatched",
+        }
+
+        from recovery_agent.agent import RecoveryAgent
+        agent = RecoveryAgent(use_harness=True)
+        case = make_case()
+        final_case = asyncio.run(agent.run_harness_async(case))
+
+        assert final_case.recovered is False

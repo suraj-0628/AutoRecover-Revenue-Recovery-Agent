@@ -18,6 +18,7 @@ class CaseStatus(str, Enum):
     DIAGNOSING = "diagnosing"
     DIAGNOSED = "diagnosed"
     ACTING = "acting"
+    AWAITING_CUSTOMER = "awaiting_customer"
     RECOVERED = "recovered"
     STOPPED = "stopped"
     ESCALATED = "escalated"
@@ -30,6 +31,7 @@ class FailureType(str, Enum):
     NETWORK_TIMEOUT = "network_timeout"
     RISK_BLOCK = "risk_block"
     MANDATE_REVOKED = "mandate_revoked"
+    USER_DROPOFF = "user_dropoff"
     UNKNOWN = "unknown"
 
 

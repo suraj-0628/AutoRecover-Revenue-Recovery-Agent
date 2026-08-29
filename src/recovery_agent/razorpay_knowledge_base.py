@@ -105,7 +105,7 @@ RAZORPAY_ERROR_CATALOG: dict[str, dict[str, Any]] = {
         "error_source": "customer",
         "error_step": "payment_initiation",
         "error_description": "Customer exited the payment window prior to completing authentication.",
-        "failure_type": FailureType.UNKNOWN,
+        "failure_type": FailureType.USER_DROPOFF,
         "recommended_rail": "whatsapp_recovery",
     },
     # 7. Risk / Fraud Block

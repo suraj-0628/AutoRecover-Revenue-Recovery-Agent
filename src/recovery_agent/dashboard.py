@@ -76,6 +76,8 @@ def _parse_audit_log(log_file: Path) -> dict | None:
             "step": step,
             "reasoning": reasoning,
             "duration_ms": duration,
+            "input_data": entry.get("input_data", {}),
+            "output_data": entry.get("output_data", {}),
         })
 
         if step == "detect":
@@ -159,6 +161,26 @@ def api_metrics():
     rate = (recovered / total * 100) if total > 0 else 0.0
     total_recovered = sum(c.get("recovered_amount", 0.0) for c in cases)
 
+    # Dynamic policy violation count: guardrail intercepted = blocked or modified action
+    policy_violations = 0
+    for c in cases:
+        for step in c.get("steps", []):
+            if step.get("step") != "act":
+                continue
+            # Check input_data for guardrail interception signals
+            input_data = step.get("input_data", {})
+            if isinstance(input_data, str):
+                continue
+            guardrail_final = input_data.get("guardrail_final_action", "")
+            guardrail_checks = input_data.get("guardrail_checks", 0)
+            # Violation: guardrail modified/blocked the action (final differs from intended)
+            if guardrail_final and guardrail_final in ("wait_and_retry", "escalate_to_human"):
+                if guardrail_checks and guardrail_checks > 0:
+                    policy_violations += 1
+                    break  # count once per case
+
+    policy_compliance_rate = 1.0 - (policy_violations / total) if total > 0 else 1.0
+
     # Live Memory Store Stats
     from recovery_agent.agent.memory import CustomerMemoryStore
     mem_store = CustomerMemoryStore()
@@ -176,9 +198,8 @@ def api_metrics():
         "memory_customers_tracked": mem_stats.get("total_customers", 0),
         "kg_rails_count": len(kg.graph.nodes()),
         "kg_available_rails": len(kg.graph.edges()),
-        "policy_violations": 0,
-        "policy_compliance_rate": 1.0,
-        "passing_unit_tests": 209,
+        "policy_violations": policy_violations,
+        "policy_compliance_rate": round(policy_compliance_rate, 4),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 

@@ -5,11 +5,21 @@ Source: Evaluation framework from Evaluating AI Agents (Arize AI)
 """
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from recovery_agent.agent import RecoveryAgent
-from recovery_agent.agent.test_generator import generate_batch, get_known_outcomes
-from recovery_agent.models import Case, CaseStatus
+from recovery_agent.models import Case, CaseStatus, PaymentEvent
+
+BATCH_CSV_PATH = Path(__file__).resolve().parent.parent.parent.parent / "data" / "batch_transactions.csv"
+
+# failure_code -> recoverable mapping
+_RECOVERABLE_MAP: dict[str, bool] = {
+    "insufficient_funds": True,
+    "card_expired": True,
+    "risk_block": False,
+}
 
 
 @dataclass
@@ -58,24 +68,49 @@ class BatchResult:
         return "\n".join(lines)
 
 
+def _load_batch_from_csv(csv_path: Path | None = None) -> list[PaymentEvent]:
+    """Load payment events from a static CSV file."""
+    path = csv_path or BATCH_CSV_PATH
+    events: list[PaymentEvent] = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            events.append(PaymentEvent(
+                payment_id=row["payment_id"],
+                customer_id=row["customer_id"],
+                amount=float(row["amount"]),
+                currency=row["currency"],
+                failure_code=row["failure_code"],
+                failure_reason=row["failure_reason"],
+            ))
+    return events
+
+
+def _get_known_outcomes(events: list[PaymentEvent]) -> dict[str, dict]:
+    """Derive known properties for each event from failure_code."""
+    outcomes: dict[str, dict] = {}
+    for event in events:
+        outcomes[event.payment_id] = {
+            "failure_type": event.failure_code,
+            "recoverable": _RECOVERABLE_MAP.get(event.failure_code, False),
+            "amount": event.amount,
+        }
+    return outcomes
+
+
 def run_batch_evaluation(
     num_cases: int = 30,
     seed: int | None = None,
+    csv_path: Path | None = None,
 ) -> BatchResult:
     """Run a batch of cases through the recovery agent and measure results.
 
-    Source: Evaluation framework — structured experiments
-    https://www.deeplearning.ai/courses/evaluating-ai-agents
+    Reads from data/batch_transactions.csv by default. The seed parameter is
+    kept for backward compatibility but is no longer used (static dataset).
     """
-    if seed is not None:
-        import random
-        random.seed(seed)
+    events = _load_batch_from_csv(csv_path)
+    known_outcomes = _get_known_outcomes(events)
 
-    # Generate test batch
-    events = generate_batch(num_cases)
-    known_outcomes = get_known_outcomes(events)
-
-    # Run each case through the agent
     agent = RecoveryAgent()
     result = BatchResult()
 
@@ -83,7 +118,6 @@ def run_batch_evaluation(
         case = Case(payment=event)
         final_case = agent.run(case)
 
-        # Record result
         case_outcome = {
             "case_id": final_case.id,
             "payment_id": final_case.payment.payment_id,
@@ -97,7 +131,6 @@ def run_batch_evaluation(
         }
         result.cases.append(case_outcome)
 
-        # Aggregate
         result.total_cases += 1
         result.total_amount += final_case.payment.amount
         result.total_attempts += final_case.attempt_count
@@ -110,7 +143,6 @@ def run_batch_evaluation(
         elif final_case.status == CaseStatus.ESCALATED:
             result.escalated += 1
 
-        # By failure type
         ftype = known_outcomes[event.payment_id]["failure_type"]
         if ftype not in result.by_failure_type:
             result.by_failure_type[ftype] = {"total": 0, "recovered": 0, "rate": 0.0}
@@ -118,7 +150,6 @@ def run_batch_evaluation(
         if final_case.recovered:
             result.by_failure_type[ftype]["recovered"] += 1
 
-    # Calculate rates
     result.avg_attempts = result.total_attempts / result.total_cases if result.total_cases > 0 else 0
     for stats in result.by_failure_type.values():
         stats["rate"] = stats["recovered"] / stats["total"] if stats["total"] > 0 else 0.0

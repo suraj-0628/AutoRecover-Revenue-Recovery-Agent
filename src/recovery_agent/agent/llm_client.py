@@ -12,19 +12,49 @@ from __future__ import annotations
 import json
 import os
 import socket
+import threading
 from typing import Any
 from urllib.parse import urlparse
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+# --- Arize Phoenix Observability (LangChain) ---
+_phoenix_initialized = False
+
+def _ensure_phoenix():
+    """Lazy-init Phoenix OTel on first LLM call (avoids blocking at import time)."""
+    global _phoenix_initialized
+    if _phoenix_initialized:
+        return
+    _phoenix_initialized = True
+    try:
+        from phoenix.otel import register
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+        register(endpoint="http://localhost:6006/v1/traces")
+        LangChainInstrumentor().instrument()
+    except Exception as e:
+        print(f"Observability disabled: {e}")
+
 # Timeout for LLM calls — allow time for complete dynamic reasoning completions
 # Override via LLM_TIMEOUT env var for production use (e.g., LLM_TIMEOUT=30)
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "25"))
 
 _llm_available: bool | None = None
-_llm_consecutive_failures: int = 0
 _LLM_FAIL_THRESHOLD = 2  # After N failures, stop trying for this session
+
+# Thread-local storage for per-thread consecutive failure tracking
+_thread_local = threading.local()
+
+
+def _get_consecutive_failures() -> int:
+    """Get consecutive failure count for current thread."""
+    return getattr(_thread_local, "consecutive_failures", 0)
+
+
+def _set_consecutive_failures(count: int) -> None:
+    """Set consecutive failure count for current thread."""
+    _thread_local.consecutive_failures = count
 
 
 def _check_llm_reachable() -> bool:
@@ -77,6 +107,7 @@ def invoke_llm(
 
     Returns the raw string response, or None on failure.
     """
+    _ensure_phoenix()
     if not _check_llm_reachable():
         return None
 
@@ -100,6 +131,38 @@ def invoke_llm(
     return None
 
 
+async def invoke_llm_async(
+    prompt: str,
+    system: str = "",
+    temperature: float = 0,
+    max_tokens: int = 512,
+) -> str | None:
+    """Non-blocking LLM invocation via thread pool executor."""
+    import asyncio
+    from functools import partial
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, partial(invoke_llm, prompt=prompt, system=system,
+                      temperature=temperature, max_tokens=max_tokens)
+    )
+
+
+async def invoke_llm_json_async(
+    prompt: str,
+    system: str = "",
+    temperature: float = 0,
+    max_tokens: int = 512,
+) -> dict[str, Any] | None:
+    """Non-blocking LLM JSON invocation via thread pool executor."""
+    import asyncio
+    from functools import partial
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, partial(invoke_llm_json, prompt=prompt, system=system,
+                      temperature=temperature, max_tokens=max_tokens)
+    )
+
+
 def invoke_llm_json(
     prompt: str,
     system: str = "",
@@ -109,11 +172,10 @@ def invoke_llm_json(
     """Invoke the LLM and parse the response as JSON.
 
     Tracks consecutive JSON parse failures — after 2 unparseable responses,
-    stops trying for this session (the LLM may be reachable but not
-    producing structured output).
+    stops trying for this thread (the LLM may be reachable but not
+    producing structured output). Thread-safe via thread-local storage.
     """
-    global _llm_consecutive_failures
-    if _llm_consecutive_failures >= _LLM_FAIL_THRESHOLD:
+    if _get_consecutive_failures() >= _LLM_FAIL_THRESHOLD:
         return None
 
     json_system = (system + "\n\nCRITICAL: Respond ONLY with a valid JSON object. Do NOT include any intro text, preamble, or markdown code blocks.").strip()
@@ -134,7 +196,7 @@ def invoke_llm_json(
 
     try:
         result = json.loads(cleaned)
-        _llm_consecutive_failures = 0  # Reset on success
+        _set_consecutive_failures(0)  # Reset on success
         return result
     except json.JSONDecodeError:
         start = cleaned.find("{")
@@ -142,9 +204,9 @@ def invoke_llm_json(
         if start >= 0 and end > start:
             try:
                 result = json.loads(cleaned[start:end])
-                _llm_consecutive_failures = 0
+                _set_consecutive_failures(0)
                 return result
             except json.JSONDecodeError:
                 pass
-        _llm_consecutive_failures += 1
+        _set_consecutive_failures(_get_consecutive_failures() + 1)
         return None

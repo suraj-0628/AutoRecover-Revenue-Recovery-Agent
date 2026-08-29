@@ -24,13 +24,16 @@ from datetime import datetime, timezone
 from typing import Any
 
 from recovery_agent.agent.guardrails import GuardrailEngine
-from recovery_agent.agent.llm_client import invoke_llm_json, invoke_llm
+from recovery_agent.agent.llm_client import invoke_llm, invoke_llm_json, invoke_llm_json_async, invoke_llm_async
 from recovery_agent.agent.memory import CustomerMemoryStore
+from recovery_agent.agent.strategy_metrics import StrategyMetricsStore
 from recovery_agent.agent.tools import (
     TOOL_SCAPES,
     execute_tool,
+    execute_tool_async,
     get_tool_schemas_for_llm,
 )
+from recovery_agent.agent.vector_memory import VectorMemoryStore
 from recovery_agent.models import (
     ActionType,
     AuditStep,
@@ -41,6 +44,15 @@ from recovery_agent.models import (
 
 
 # --- Constants ---
+
+# Map harness tool names to ActionTypes for guardrail interception.
+# Only ACTION tools (tools that trigger customer-facing or state-changing behavior)
+# are intercepted. Diagnostic tools (query_*, check_*) pass through unchecked.
+_TOOL_ACTION_MAP: dict[str, ActionType] = {
+    "generate_smart_recovery_link": ActionType.UPDATE_PAYMENT_METHOD,
+    "schedule_payday_retry": ActionType.WAIT_AND_RETRY,
+    "escalate_to_human_agent": ActionType.ESCALATE_TO_HUMAN,
+}
 
 MAX_HARNESS_ITERATIONS = 8
 CONTEXT_COMPACT_THRESHOLD = 6  # Summarize older entries after this many turns
@@ -89,6 +101,8 @@ Retrying the same method WILL fail again. You MUST:
 - generate_smart_recovery_link: When customer needs a fresh payment link to retry.
 - schedule_payday_retry: When timing the retry to payday would help (insufficient_funds).
 - escalate_to_human_agent: When automated recovery has failed or case is complex.
+
+CRITICAL INSTRUCTION: If the STRATEGY PLANNER DECISION is 'send_notification' or 'update_payment_method', the system will automatically handle the dispatch after you finish. You DO NOT need to call a tool for these. Simply emit is_final=true and status=action_dispatched on Turn 1 to hand control back to the system execution layer. NEVER emit status=recovered — recovery is only confirmed by a real Razorpay webhook or customer response, never by the agent.
 
 ═══ OUTPUT FORMAT ═══
 
@@ -202,8 +216,8 @@ def _format_observation(obs: Observation) -> str:
     )
 
 
-def _build_harness_prompt(case: Case, observations: list[Observation], history: list[str]) -> str:
-    """Build the multi-turn reasoning prompt with compacted context."""
+def _build_harness_prompt(case: Case, observations: list[Observation], history: list[str], similar_context: str = "") -> str:
+    """Build the multi-turn reasoning prompt with compacted context and similar cases."""
     # Build failure context
     failure_ctx = (
         f"PAYMENT FAILURE CONTEXT:\n"
@@ -234,6 +248,16 @@ def _build_harness_prompt(case: Case, observations: list[Observation], history: 
         f"PENALTIES PREVENTED: {case.penalties_prevented}\n"
     )
 
+    # Add strategy planner decision
+    decided_action = case.payment.metadata.get("decided_action")
+    if decided_action:
+        failure_ctx += (
+            f"\nSTRATEGY PLANNER DECISION:\n"
+            f"  The guardrail-approved strategy is: {decided_action}\n"
+            f"  Your goal is to use your tools to support this strategy.\n"
+            f"  If no further tools are needed to execute this strategy, output is_final=true and status=recovered immediately.\n"
+        )
+
     # Add previously blocked tools (to prevent repetition)
     if history:
         failure_ctx += f"\nPREVIOUSLY ATTEMPTED (DO NOT REPEAT IDENTICAL CALLS):\n"
@@ -245,11 +269,14 @@ def _build_harness_prompt(case: Case, observations: list[Observation], history: 
 
     return f"""{failure_ctx}
 
+═══ SIMILAR PAST CASES ═══
+{similar_context if similar_context else "No similar cases found in memory."}
+
 ═══ OBSERVATION HISTORY ═══
 {obs_text}
 
 ═══ YOUR TASK ═══
-Choose the next tool call(s) based on the failure context and observation history.
+Choose the next tool call(s) based on the failure context, observation history, and similar past cases.
 If a previous tool call returned an error, REFLECT on why and try a DIFFERENT approach.
 Do NOT repeat the same tool call with identical parameters.
 
@@ -288,6 +315,33 @@ def _reflect_on_error(
     return reflection or f"Tool {failed_tool} returned error: {error_message}. Switching strategy."
 
 
+async def _reflect_on_error_async(
+    case: Case,
+    failed_tool: str,
+    error_message: str,
+    observations: list[Observation],
+) -> str:
+    """Non-blocking LLM reflection on tool failure via thread pool."""
+    prompt = (
+        f"A tool call just failed during recovery of payment {case.payment.payment_id}.\n\n"
+        f"Failed tool: {failed_tool}\n"
+        f"Error message: {error_message}\n"
+        f"Payment failure code: {case.payment.failure_code}\n"
+        f"Diagnosis: {case.diagnosis.root_cause.value if case.diagnosis else 'unknown'}\n\n"
+        f"Why might this tool have failed? What should we try instead?\n"
+        f"Respond with a brief reflection (1-2 sentences)."
+    )
+
+    reflection = await invoke_llm_async(
+        prompt=prompt,
+        system="You are a payment recovery strategist. Reflect briefly on tool failures.",
+        temperature=0.3,
+        max_tokens=200,
+    )
+
+    return reflection or f"Tool {failed_tool} returned error: {error_message}. Switching strategy."
+
+
 # --- Main Harness Loop ---
 
 class AgentHarness:
@@ -304,24 +358,114 @@ class AgentHarness:
         self,
         memory_store: CustomerMemoryStore | None = None,
         guardrail_engine: GuardrailEngine | None = None,
+        vector_memory: VectorMemoryStore | None = None,
+        strategy_metrics: StrategyMetricsStore | None = None,
     ):
         self.memory = memory_store or CustomerMemoryStore()
         self.guardrails = guardrail_engine or GuardrailEngine()
+        self.vector_memory = vector_memory or VectorMemoryStore()
+        self.strategy_metrics = strategy_metrics or StrategyMetricsStore()
+
+    def _guardrail_intercept(
+        self, case: Case, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Check if a tool call is blocked or modified by the guardrail engine.
+
+        Returns exec_result dict if the guardrail BLOCKS the action (caller should
+        skip normal execution and use this result directly).
+        Returns None if the action is APPROVED (caller should proceed with execute_tool).
+
+        Maps tool names to ActionTypes:
+          generate_smart_recovery_link → UPDATE_PAYMENT_METHOD
+          schedule_payday_retry        → WAIT_AND_RETRY
+          escalate_to_human_agent      → ESCALATE_TO_HUMAN
+        """
+        mapped_action = _TOOL_ACTION_MAP.get(tool_name)
+        if mapped_action is None:
+            return None  # Not an action tool — no interception
+
+        profile = self.memory.get_or_create_profile(case.payment.customer_id)
+        approved_action, checks = self.guardrails.validate_action(case, mapped_action, profile)
+
+        if approved_action == mapped_action:
+            return None  # Approved — proceed with normal execution
+
+        # Blocked or modified — build error message from check results
+        blocked_reasons = []
+        for check in checks:
+            if check.verdict.value in ("blocked", "modified"):
+                blocked_reasons.append(f"{check.guardrail}: {check.reason}")
+
+        if not blocked_reasons:
+            blocked_reasons.append(
+                f"Guardrail redirected {mapped_action.value} to {approved_action.value}"
+            )
+
+        error_message = (
+            f"Guardrail blocked action {mapped_action.value}. "
+            f"Reasons: {'; '.join(blocked_reasons)}. "
+            f"Please pivot strategy to {approved_action.value}."
+        )
+
+        return {"status": "blocked", "message": error_message}
 
     def run_recovery_case(self, case: Case) -> HarnessResult:
-        """Run the full multi-turn harness loop on a case.
+        """Run the full multi-turn harness loop on a case (sync, backward-compatible).
 
-        Returns a HarnessResult with observations, final status, and metrics.
+        When called from an async context (event loop already running),
+        delegates to run_recovery_case_async via a thread pool to avoid
+        blocking the event loop. When called synchronously, runs the
+        original blocking loop directly.
         """
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, self.run_recovery_case_async(case))
+                return future.result()
+        else:
+            return self._run_recovery_case_sync(case)
+
+    def _run_recovery_case_sync(self, case: Case) -> HarnessResult:
+        """Original synchronous harness loop — kept for backward compatibility.
+
+        Direct callers (tests, CLI) use this path. Async callers use
+        run_recovery_case_async which offloads LLM/SDK to thread pool.
+        """
+        from recovery_agent.agent.stopping import check_stopping_rules, transition_to_active_tier
+
         observations: list[Observation] = []
-        tools_called_history: list[str] = []  # For repetition prohibition
+        tools_called_history: list[str] = []
         error_count = 0
 
         for turn in range(MAX_HARNESS_ITERATIONS):
-            # 1. Context Engineering — build compacted prompt
-            prompt = _build_harness_prompt(case, observations, tools_called_history)
+            # Check stopping rules before each turn
+            should_stop, stop_reason = check_stopping_rules(case)
+            if should_stop:
+                case.status = CaseStatus.STOPPED
+                self._ingest_outcome(case)
+                return HarnessResult(
+                    case=case, observations=observations,
+                    final_status="stopped", total_turns=turn,
+                    tools_called=tools_called_history, error_count=error_count,
+                )
+            if stop_reason in ("SILENT_RETRY_FAILED", "SILENT_TIER_EXHAUSTED"):
+                case = transition_to_active_tier(case, stop_reason)
+                # Emit tier transition observation
+                observations.append(Observation(
+                    turn=turn + 1,
+                    reasoning=f"Tier transition: {stop_reason}",
+                    tool_calls=[], raw_response={"tier_transition": stop_reason},
+                ))
 
-            # 2. LLM Tool Plan — ask LLM to choose next tool(s)
+            similar_ctx = self.vector_memory.get_decision_context(case)
+            prompt = _build_harness_prompt(case, observations, tools_called_history, similar_ctx)
+
             result = invoke_llm_json(
                 prompt=prompt,
                 system=HARNESS_SYSTEM_PROMPT,
@@ -330,7 +474,200 @@ class AgentHarness:
             )
 
             if result is None:
+                self._ingest_outcome(case)
+                return HarnessResult(
+                    case=case,
+                    observations=observations,
+                    final_status="failed",
+                    total_turns=turn,
+                    tools_called=tools_called_history,
+                    error_count=error_count,
+                )
+
+            reasoning = result.get("reasoning", "")
+            tool_calls_raw = result.get("tool_calls", [])
+            is_final = result.get("is_final", False)
+            final_status = result.get("status", "in_progress")
+
+            tool_calls: list[ToolCall] = []
+
+            for tc in tool_calls_raw:
+                tool_name = tc.get("tool", "")
+                arguments = tc.get("arguments", {})
+
+                call_signature = f"{tool_name}({json.dumps(arguments, sort_keys=True)})"
+                if call_signature in tools_called_history:
+                    tool_calls.append(ToolCall(
+                        tool=tool_name,
+                        arguments=arguments,
+                        result={"status": "blocked", "message": "Duplicate call prohibited — already attempted"},
+                        is_error=True,
+                    ))
+                    error_count += 1
+                    continue
+
+                cached_metadata = {
+                    "method": case.payment.metadata.get("method", ""),
+                    "provider": case.payment.metadata.get("provider", ""),
+                    "error_code": case.payment.metadata.get("error_code", case.payment.failure_code),
+                    "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
+                    "error_source": case.payment.metadata.get("error_source", ""),
+                    "error_step": case.payment.metadata.get("error_step", ""),
+                    "failure_reason": case.payment.failure_reason,
+                    "amount": case.payment.amount,
+                    "bank": case.payment.metadata.get("bank", ""),
+                    "card_network": case.payment.metadata.get("card_network", ""),
+                }
+                if cached_metadata["method"] or cached_metadata["error_code"]:
+                    arguments["cached_metadata"] = cached_metadata
+
+                # Block escalate_to_human_agent unless strategy planner decided it
+                decided_action = case.payment.metadata.get("decided_action", "")
+                if tool_name == "escalate_to_human_agent" and decided_action != "escalate_to_human":
+                    exec_result = {"status": "blocked", "message": f"Escalation blocked: strategy planner decided '{decided_action}', not escalate_to_human"}
+                    is_error = True
+                # Guardrail interception — block/modify action tools before execution
+                elif guardrail_result := self._guardrail_intercept(case, tool_name, arguments):
+                    exec_result = guardrail_result
+                    is_error = True
+                else:
+                    exec_result = execute_tool(tool_name, arguments)
+                    is_error = exec_result.get("status") in ("error", "unavailable")
+
+                tc_record = ToolCall(
+                    tool=tool_name,
+                    arguments=arguments,
+                    result=exec_result,
+                    is_error=is_error,
+                )
+                tool_calls.append(tc_record)
+                tools_called_history.append(call_signature)
+
+                if is_error:
+                    error_count += 1
+                    error_msg = exec_result.get("message", "unknown error")
+                    reflection = _reflect_on_error(case, tool_name, error_msg, observations)
+                    reasoning += f" [Reflection: {reflection}]"
+
+                self._apply_tool_result(case, tool_name, exec_result)
+
+            obs = Observation(
+                turn=turn + 1,
+                reasoning=reasoning,
+                tool_calls=tool_calls,
+                raw_response=result,
+            )
+            observations.append(obs)
+
+            if is_final:
+                # The harness NEVER confirms recovery — only webhooks and customer
+                # responses can do that. The harness dispatches actions and hands
+                # control back to the system execution layer.
+                status_map = {
+                    "action_dispatched": "action_dispatched",
+                    "recovered": "action_dispatched",  # LLM cannot claim recovery
+                    "escalated": "escalated",
+                    "failed": "failed",
+                    "max_iterations": "max_iterations",
+                }
+                final = status_map.get(final_status, "failed")
+                if final == "escalated":
+                    case.status = CaseStatus.ESCALATED
+                elif final == "action_dispatched":
+                    case.status = CaseStatus.AWAITING_CUSTOMER
+                else:
+                    case.status = CaseStatus.STOPPED
+
+                self._ingest_outcome(case)
+                return HarnessResult(
+                    case=case,
+                    observations=observations,
+                    final_status=final,
+                    total_turns=turn + 1,
+                    tools_called=tools_called_history,
+                    error_count=error_count,
+                )
+
+            if turn + 1 >= MAX_HARNESS_ITERATIONS:
+                case.status = CaseStatus.STOPPED
+                self._ingest_outcome(case)
+                return HarnessResult(
+                    case=case,
+                    observations=observations,
+                    final_status="max_iterations",
+                    total_turns=turn + 1,
+                    tools_called=tools_called_history,
+                    error_count=error_count,
+                )
+
+            if case.attempt_count >= case.max_attempts:
+                case.status = CaseStatus.STOPPED
+                self._ingest_outcome(case)
+                return HarnessResult(
+                    case=case,
+                    observations=observations,
+                    final_status="max_iterations",
+                    total_turns=turn + 1,
+                    tools_called=tools_called_history,
+                    error_count=error_count,
+                )
+
+        case.status = CaseStatus.STOPPED
+        return HarnessResult(
+            case=case,
+            observations=observations,
+            final_status="max_iterations",
+            total_turns=MAX_HARNESS_ITERATIONS,
+            tools_called=tools_called_history,
+            error_count=error_count,
+        )
+
+    async def run_recovery_case_async(self, case: Case) -> HarnessResult:
+        """Run the full multi-turn harness loop on a case (async, non-blocking).
+
+        All LLM calls and tool executions are offloaded to a thread pool
+        via run_in_executor, so the event loop is never blocked.
+        """
+        from recovery_agent.agent.stopping import check_stopping_rules, transition_to_active_tier
+
+        observations: list[Observation] = []
+        tools_called_history: list[str] = []  # For repetition prohibition
+        error_count = 0
+
+        for turn in range(MAX_HARNESS_ITERATIONS):
+            # Check stopping rules before each turn
+            should_stop, stop_reason = check_stopping_rules(case)
+            if should_stop:
+                case.status = CaseStatus.STOPPED
+                self._ingest_outcome(case)
+                return HarnessResult(
+                    case=case, observations=observations,
+                    final_status="stopped", total_turns=turn,
+                    tools_called=tools_called_history, error_count=error_count,
+                )
+            if stop_reason in ("SILENT_RETRY_FAILED", "SILENT_TIER_EXHAUSTED"):
+                case = transition_to_active_tier(case, stop_reason)
+                observations.append(Observation(
+                    turn=turn + 1,
+                    reasoning=f"Tier transition: {stop_reason}",
+                    tool_calls=[], raw_response={"tier_transition": stop_reason},
+                ))
+
+            # 1. Context Engineering — build compacted prompt with similar cases
+            similar_ctx = self.vector_memory.get_decision_context(case)
+            prompt = _build_harness_prompt(case, observations, tools_called_history, similar_ctx)
+
+            # 2. LLM Tool Plan — ask LLM to choose next tool(s) (non-blocking)
+            result = await invoke_llm_json_async(
+                prompt=prompt,
+                system=HARNESS_SYSTEM_PROMPT,
+                temperature=0,
+                max_tokens=1024,
+            )
+
+            if result is None:
                 # LLM unavailable — fall back to heuristic
+                self._ingest_outcome(case)
                 return HarnessResult(
                     case=case,
                     observations=observations,
@@ -380,8 +717,15 @@ class AgentHarness:
                 }
                 if cached_metadata["method"] or cached_metadata["error_code"]:
                     arguments["cached_metadata"] = cached_metadata
-                exec_result = execute_tool(tool_name, arguments)
-                is_error = exec_result.get("status") in ("error", "unavailable")
+
+                # Guardrail interception — block/modify action tools before execution
+                guardrail_result = self._guardrail_intercept(case, tool_name, arguments)
+                if guardrail_result is not None:
+                    exec_result = guardrail_result
+                    is_error = True
+                else:
+                    exec_result = await execute_tool_async(tool_name, arguments)
+                    is_error = exec_result.get("status") in ("error", "unavailable")
 
                 tc_record = ToolCall(
                     tool=tool_name,
@@ -396,7 +740,7 @@ class AgentHarness:
                 if is_error:
                     error_count += 1
                     error_msg = exec_result.get("message", "unknown error")
-                    reflection = _reflect_on_error(case, tool_name, error_msg, observations)
+                    reflection = await _reflect_on_error_async(case, tool_name, error_msg, observations)
                     reasoning += f" [Reflection: {reflection}]"
 
                 # 5. Observation Feed — update case based on tool results
@@ -413,22 +757,24 @@ class AgentHarness:
 
             # Check stopping conditions
             if is_final:
+                # The harness NEVER confirms recovery — only webhooks and customer
+                # responses can do that.
                 status_map = {
-                    "recovered": "recovered",
+                    "action_dispatched": "action_dispatched",
+                    "recovered": "action_dispatched",  # LLM cannot claim recovery
                     "escalated": "escalated",
                     "failed": "failed",
                     "max_iterations": "max_iterations",
                 }
                 final = status_map.get(final_status, "failed")
-                if final == "recovered":
-                    case.recovered = True
-                    case.recovered_amount = case.payment.amount
-                    case.status = CaseStatus.RECOVERED
-                elif final == "escalated":
+                if final == "escalated":
                     case.status = CaseStatus.ESCALATED
+                elif final == "action_dispatched":
+                    case.status = CaseStatus.AWAITING_CUSTOMER
                 else:
                     case.status = CaseStatus.STOPPED
 
+                self._ingest_outcome(case)
                 return HarnessResult(
                     case=case,
                     observations=observations,
@@ -441,6 +787,7 @@ class AgentHarness:
             # Check max iterations
             if turn + 1 >= MAX_HARNESS_ITERATIONS:
                 case.status = CaseStatus.STOPPED
+                self._ingest_outcome(case)
                 return HarnessResult(
                     case=case,
                     observations=observations,
@@ -453,6 +800,7 @@ class AgentHarness:
             # Check attempt-based stopping
             if case.attempt_count >= case.max_attempts:
                 case.status = CaseStatus.STOPPED
+                self._ingest_outcome(case)
                 return HarnessResult(
                     case=case,
                     observations=observations,
@@ -464,6 +812,7 @@ class AgentHarness:
 
         # Exhausted all iterations
         case.status = CaseStatus.STOPPED
+        self._ingest_outcome(case)
         return HarnessResult(
             case=case,
             observations=observations,
@@ -472,6 +821,24 @@ class AgentHarness:
             tools_called=tools_called_history,
             error_count=error_count,
         )
+
+    def _ingest_outcome(self, case: Case) -> None:
+        """Ingest completed case outcome into vector memory and strategy metrics."""
+        try:
+            self.vector_memory.ingest_outcome(case)
+        except Exception:
+            pass  # Never block on vector memory ingestion
+        # Record strategy outcome for empirical learning
+        try:
+            if case.diagnosis and case.attempts:
+                last_action = case.attempts[-1].action_type
+                self.strategy_metrics.record_outcome(
+                    failure_type=case.diagnosis.root_cause,
+                    action=last_action,
+                    recovered=case.recovered,
+                )
+        except Exception:
+            pass  # Never block on metrics recording
 
     def _apply_tool_result(self, case: Case, tool_name: str, result: dict[str, Any]):
         """Apply a tool result to the case state.

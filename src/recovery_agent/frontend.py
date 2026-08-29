@@ -21,18 +21,17 @@ from flask import Flask, render_template, render_template_string, request, jsoni
 from flask_socketio import SocketIO
 
 from recovery_agent.razorpay_client import RazorpayClient
+from recovery_agent.state_store import StateStore
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.urandom(24).hex()
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 razorpay_client = RazorpayClient()
+store = StateStore()
 
-# In-memory stores
-payments: dict[str, dict] = {}
-agent_trails: dict[str, list[dict]] = {}
-pending_actions: dict[str, dict] = {}  # payment_id → action waiting for customer response
-active_agent_payments: set[str] = set()  # tracks which payment_ids have active agent threads
+# Transient — only tracks in-flight agent threads, not persisted
+active_agent_payments: set[str] = set()
 
 
 def push_event(payment_id: str, event_type: str, data: dict):
@@ -151,15 +150,16 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
             })
         except Exception:
             pass
-        if payment_id in payments:
-            payments[payment_id]["status"] = "failed"
-            payments[payment_id]["trail"] = payments[payment_id].get("trail", [])
-            payments[payment_id]["trail"].append({
+        if store.has_payment(payment_id):
+            p = store.get_payment(payment_id)
+            p["status"] = "failed"
+            p.setdefault("trail", []).append({
                 "step": "error",
                 "msg": f"Agent Execution Error: {str(e)}",
                 "detail": traceback.format_exc(),
                 "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             })
+            store.flush()
     finally:
         active_agent_payments.discard(payment_id)
 
@@ -201,9 +201,9 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
         }
         trail.append(entry)
-        agent_trails[payment_id] = trail
-        if payment_id in payments:
-            payments[payment_id]["trail"] = list(trail)
+        store.set_trail(payment_id, trail)
+        if store.has_payment(payment_id):
+            store.get_payment(payment_id)["trail"] = list(trail)
         push_event(payment_id, step, entry)
 
     from recovery_agent.razorpay_knowledge_base import normalize_razorpay_failure
@@ -289,6 +289,11 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
     )
 
     # ── 3. DECIDE (real LLM strategy planner + guardrails) ──
+    emit_thought(
+        step="deciding",
+        thought="Initiating LLM Strategy Planner...",
+        detail="Querying strategy metrics and planning optimal recovery intervention...",
+    )
     case.attempt_count = 0
     case = run_decision(case)
     action_val = case.payment.metadata.get("decided_action", "send_notification")
@@ -389,21 +394,30 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             tool_call=tool_call_data,
         )
 
-    # ── 5. WIRE REAL RAZORPAY SDK based on harness-decided action ──
+    # ── 5. WIRE REAL RAZORPAY SDK based on harness-executed tools ──
+    # The harness is the SINGLE execution path. It dispatches tools based on
+    # the strategy planner's decision. The frontend does NOT re-execute.
     action_val = case.payment.metadata.get("decided_action", action_val)
     sdk_res = {}
     tool_name_str = ""
 
-    if action_val in ("retry_payment", "update_payment_method"):
-        sdk_res = razorpay_client.create_order(
-            amount=amount,
-            receipt=payment_id,
-            notes={"target_rail": recommended_rails[0] if recommended_rails else "upi_autopay", "customer": customer_email, "harness_turns": str(harness_result.total_turns)},
-        )
-        tool_name_str = "RazorpaySDK.Order.create"
-    elif action_val == "wait_and_retry":
-        # Wire real retry scheduler
+    # Check what the harness actually executed
+    if harness_result.tools_called:
+        last_tool = harness_result.tools_called[-1]
+        tool_name_str = f"Tool.{last_tool}"
+        # Extract sdk_res from harness observations if available
+        for obs in reversed(harness_result.observations):
+            for tc in obs.tool_calls:
+                if tc.tool == last_tool and not tc.is_error:
+                    sdk_res = tc.result
+                    break
+            if sdk_res:
+                break
+
+    if action_val == "wait_and_retry":
+        # Wire real retry scheduler via daemon worker
         from recovery_agent.models import FailureType
+        from recovery_agent.daemon_worker import register_retry_job
         try:
             ft = FailureType(cause)
         except ValueError:
@@ -412,52 +426,55 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         next_time = get_next_retry_time(ft, case.attempt_count)
         best_window = windows[0] if windows else None
 
-        scheduled_job = {
-            "job_id": f"job_{uuid.uuid4().hex[:8]}",
-            "payment_id": payment_id,
-            "target_timestamp": (next_time or datetime.now(timezone.utc)).isoformat(),
-            "confidence": best_window.confidence if best_window else 0.5,
-            "reason": best_window.reason if best_window else "Scheduled retry",
-            "window_start": best_window.start_time.isoformat() if best_window else "",
-            "window_end": best_window.end_time.isoformat() if best_window else "",
-        }
-        sdk_res = scheduled_job
-        tool_name_str = "RetryScheduler.schedule"
+        target_ts = (next_time or datetime.now(timezone.utc)).isoformat()
+
+        # Register real background retry job with daemon worker
+        registered_job = register_retry_job(
+            payment_id=payment_id,
+            amount=amount,
+            target_timestamp=target_ts,
+            action="retry_payment",
+            method=case.payment.metadata.get("method", "card"),
+            customer={"name": customer.get("name", ""), "email": customer_email},
+            reason=best_window.reason if best_window else "Scheduled retry",
+            confidence=best_window.confidence if best_window else 0.5,
+        )
+
+        sdk_res = registered_job
+        tool_name_str = "DaemonWorker.register_retry_job"
 
         # Store scheduled job
-        if payment_id not in payments:
-            payments[payment_id] = {"payment_id": payment_id, "amount": amount, "status": "scheduled", "trail": [], "attempts": 0}
-        payments[payment_id]["scheduled_job"] = scheduled_job
-        payments[payment_id]["status"] = "scheduled"
+        if not store.has_payment(payment_id):
+            store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "scheduled", "trail": [], "attempts": 0})
+        p = store.get_payment(payment_id)
+        p["scheduled_job"] = registered_job
+        p["status"] = "scheduled"
 
         # Emit scheduled job event
         socketio.emit("scheduled_job", {
             "payment_id": payment_id,
-            **scheduled_job,
+            **registered_job,
             "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
         })
-    elif action_val == "send_notification":
-        sdk_res = razorpay_client.create_payment_link(
-            amount=amount,
-            customer={"name": customer.get("name", ""), "email": customer_email, "contact": ""},
-            notes={"recovery_agent": "AutoRecover_v2", "harness_turns": str(harness_result.total_turns)},
-        )
-        tool_name_str = "RazorpaySDK.PaymentLink.create"
-    elif action_val == "escalate_to_human":
-        sdk_res = {
-            "ticket_id": f"ESC-{payment_id[-8:]}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}",
-            "payment_id": payment_id,
-            "reason": f"Harness escalated after {harness_result.total_turns} turns",
-            "harness_errors": harness_result.error_count,
+    elif not sdk_res and action_val != "wait_and_retry":
+        # Harness didn't execute a tool — fallback to direct execution
+        # This is a safety net; ideally the harness always executes the right tool
+        fallback_dispatch = {
+            "retry_payment": ("generate_smart_recovery_link", {"payment_id": payment_id, "allowed_rails": recommended_rails or ["upi", "card", "netbanking"]}),
+            "update_payment_method": ("generate_smart_recovery_link", {"payment_id": payment_id, "allowed_rails": ["card", "upi"]}),
+            "send_notification": ("generate_smart_recovery_link", {"payment_id": payment_id, "allowed_rails": ["upi", "card", "netbanking"]}),
+            "escalate_to_human": ("escalate_to_human_agent", {"payment_id": payment_id, "reason": f"Harness did not execute tool after {harness_result.total_turns} turns"}),
         }
-        tool_name_str = "Escalation.create_ticket"
-    else:
-        sdk_res = razorpay_client.create_payment_link(
-            amount=amount,
-            customer={"name": customer.get("name", ""), "email": customer_email, "contact": ""},
-            notes={"recovery_agent": "AutoRecover_v2"},
-        )
-        tool_name_str = "RazorpaySDK.PaymentLink.create"
+        if action_val in fallback_dispatch:
+            tool_name, tool_args = fallback_dispatch[action_val]
+            sdk_res = execute_tool(tool_name, tool_args)
+            tool_name_str = f"Tool.{tool_name} (fallback)"
+
+    emit_thought(
+        step="acting",
+        thought="Generating Dynamic Customer UI Spec...",
+        detail="Morphing the frontend checkout experience based on the harness decision...",
+    )
 
     # Generate UI spec
     ui_spec_dict = _generate_ui_spec(
@@ -494,17 +511,36 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         },
     )
 
-    execution = execute_action(action, cause, amount)
+    # Push UI spec as visible overlay — appears ABOVE Razorpay iframe
+    socketio.emit("ui_spec_overlay", {
+        "payment_id": payment_id,
+        **ui_spec_dict.model_dump(),
+        "recovery_tier": recovery_tier,
+        "decline_strategy": decline_strategy,
+    })
 
-    if payment_id not in payments:
-        payments[payment_id] = {"payment_id": payment_id, "amount": amount, "status": "recovering", "trail": [], "attempts": 0}
-    payments[payment_id]["attempts"] = payments[payment_id].get("attempts", 0) + 1
-    payments[payment_id]["last_action"] = action_val
-    payments[payment_id]["last_detail"] = execution["detail"]
-    payments[payment_id]["trail"] = trail
-    payments[payment_id]["ui_spec"] = ui_spec_dict.model_dump()
-    payments[payment_id]["order_id"] = sdk_res.get("id", "")
-    payments[payment_id]["harness_turns"] = harness_result.total_turns
+    execution = execute_action(
+        action=action_val,
+        cause_value=cause,
+        amount=amount,
+        payment_id=payment_id,
+        customer_email=customer_email,
+        customer_phone=customer.get("contact", ""),
+        recovery_link=sdk_res.get("short_url") or sdk_res.get("link_url"),
+        failure_reason=failure_reason,
+        attempt_count=case.attempt_count,
+    )
+
+    if not store.has_payment(payment_id):
+        store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "trail": [], "attempts": 0})
+    p = store.get_payment(payment_id)
+    p["attempts"] = p.get("attempts", 0) + 1
+    p["last_action"] = action_val
+    p["last_detail"] = execution["detail"]
+    p["trail"] = trail
+    p["ui_spec"] = ui_spec_dict.model_dump()
+    p["order_id"] = sdk_res.get("id", "")
+    p["harness_turns"] = harness_result.total_turns
 
     # ── 6. OBSERVE & RECOVER ──
     # Recovery ONLY happens via real webhook (payment.captured / order.paid)
@@ -519,50 +555,40 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             ui_morph="SCHEDULED_RETRY",
         )
     else:
-        pending_actions[payment_id] = {
+        store.save_pending(payment_id, {
             "action": action_val,
             "execution": execution,
-            "case": case,
             "attempt": 0,
             "trail": trail,
             "amount": amount,
-        }
+        })
         push_event(payment_id, "waiting_for_customer", {"action": action_val, "detail": execution["detail"], "ui_morph": ui_spec_dict.ui_type})
 
-        customer_responded = False
-        for _ in range(30):
-            time.sleep(1)
-            if payment_id not in pending_actions:
-                customer_responded = True
-                break
+        # No blocking poll — recovery is confirmed asynchronously via:
+        #   1. POST /api/customer-responded (customer completes checkout)
+        #   2. POST /api/webhook-forward (Razorpay capture webhook)
+        # The agent thread returns immediately; pending_actions is cleaned up
+        # when either endpoint fires.
 
-        # Recovery is ONLY confirmed by real webhook or customer action
-        if customer_responded and payment_id not in pending_actions:
-            # Customer completed checkout — real recovery
-            case.recovered = True
-            case.recovered_amount = amount
-            emit_thought(
-                step="stopping",
-                thought=f"SUCCESS: Customer completed payment! Total INR {amount:,.2f}",
-                detail="Verified via customer-responded callback. Awaiting Razorpay capture webhook.",
-                ui_morph="RECOVERY_SUCCESS",
-            )
-        else:
-            # No payment completed — escalate, never fake success
-            emit_thought(
-                step="stopping",
-                thought="Case Escalated / Awaiting Customer Action",
-                detail=f"No payment received. Action dispatched: {action_val}. Customer must complete checkout or respond to notification.",
-                ui_morph="RECOVERY_FAILED",
-            )
+    # Determine final status — NEVER claim failed when waiting for customer
+    if case.recovered:
+        final_status = "recovered"
+    elif action_val in ("send_notification", "update_payment_method"):
+        final_status = "awaiting_customer"
+    elif action_val == "wait_and_retry":
+        final_status = "scheduled"
+    elif action_val == "escalate_to_human":
+        final_status = "escalated"
+    else:
+        final_status = "failed"
 
-    final_status = "recovered" if case.recovered else "failed"
-    if payment_id in payments:
-        payments[payment_id]["status"] = final_status
-        payments[payment_id]["trail"] = trail
-        payments[payment_id]["recovery_tier"] = recovery_tier
-        payments[payment_id]["decline_strategy"] = decline_strategy
-        payments[payment_id]["penalties_prevented"] = case.penalties_prevented
+    if store.has_payment(payment_id):
+        p = store.get_payment(payment_id)
+        p["status"] = final_status
+        p["trail"] = trail
+        p["recovery_tier"] = recovery_tier
+        p["decline_strategy"] = decline_strategy
+        p["penalties_prevented"] = case.penalties_prevented
 
     push_tier_event(
         payment_id,
@@ -574,7 +600,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
 
     push_event(payment_id, "complete", {
         "status": final_status,
-        "attempts": payments[payment_id].get("attempts", 1),
+        "attempts": store.get_payment(payment_id).get("attempts", 1) if store.has_payment(payment_id) else 1,
         "trail": trail,
         "amount": amount,
         "recovery_tier": recovery_tier,
@@ -585,6 +611,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         "order_id": sdk_res.get("id", ""),
         "scheduled_job": sdk_res if action_val == "wait_and_retry" else None,
     })
+    store.flush()
 
 
 def _generate_ui_spec(
@@ -673,64 +700,89 @@ PAY_PAGE = """<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f4f8;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.checkout{background:#fff;border-radius:16px;padding:40px;max-width:520px;width:100%;box-shadow:0 4px 24px rgba(0,0,0,.08)}
-.logo{font-size:24px;font-weight:700;color:#2563eb;margin-bottom:4px}
-.subtitle{color:#64748b;font-size:14px;margin-bottom:28px}
-.product{display:flex;gap:16px;align-items:center;padding:16px;background:#f8fafc;border-radius:12px;margin-bottom:24px}
-.product-img{width:56px;height:56px;background:#e2e8f0;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:24px}
-.product-info h3{font-size:15px;color:#1e293b}.product-info p{color:#64748b;font-size:13px}
-.price{font-size:28px;font-weight:700;color:#1e293b;margin-bottom:24px}
-.price span{font-size:14px;color:#64748b;font-weight:400}
-.btn{width:100%;padding:14px;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s}
-.btn-primary{background:#2563eb;color:#fff}.btn-primary:hover{background:#1d4ed8}
-.btn-primary:disabled{background:#94a3b8;cursor:not-allowed}
-.btn-respond{background:#f59e0b;color:#fff;margin-top:8px}.btn-respond:hover{background:#d97706}
-.btn-success{background:#10b981;color:#fff}
-.status-bar{margin-top:16px;padding:14px;border-radius:10px;display:none;font-size:13px}
-.status-bar.active{display:block}
-.s-processing{background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe}
-.s-waiting{background:#fef3c7;color:#92400e;border:1px solid #fde68a}
-.s-success{background:#dcfce7;color:#166534;border:1px solid #bbf7d0}
-.s-failed{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}
-.spinner{display:inline-block;width:16px;height:16px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;vertical-align:middle}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(135deg,#f8fafc 0%,#e2e8f0 50%,#cbd5e1 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;letter-spacing:-0.011em}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+@keyframes pulseGlow{0%,100%{box-shadow:0 0 0 0 rgba(37,99,235,0)}50%{box-shadow:0 0 20px 4px rgba(37,99,235,0.15)}}
 @keyframes spin{to{transform:rotate(360deg)}}
-.trail{margin-top:16px;display:none;max-height:400px;overflow-y:auto}
-.trail.visible{display:block}
-.trail h4{font-size:13px;color:#64748b;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
-.step{display:flex;gap:12px;padding:10px;border-left:3px solid #e2e8f0;margin-bottom:6px;font-size:13px;animation:fadeIn .3s}
-.step.active{border-left-color:#2563eb;background:#f8fafc;border-radius:0 8px 8px 0}
-.step.done{border-left-color:#10b981}.step.failed-step{border-left-color:#ef4444}.step.waiting{border-left-color:#f59e0b;background:#fffbeb;border-radius:0 8px 8px 0}
-.step-num{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;flex-shrink:0}
-.step-num.n-detect{background:#3b82f6}.step-num.n-diagnose{background:#8b5cf6}.step-num.n-decide{background:#f59e0b}.step-num.n-act{background:#10b981}.step-num.n-stop{background:#ef4444}.step-num.n-wait{background:#f59e0b}
-.step-content{flex:1}.step-title{font-weight:600;color:#1e293b;margin-bottom:2px}.step-detail{color:#64748b;font-size:12px;line-height:1.5}
-.action-box{background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:16px;margin-top:12px;display:none}
-.action-box.visible{display:block}
-.action-box h4{color:#2563eb;font-size:14px;margin-bottom:6px}
-.action-box p{color:#64748b;font-size:13px;margin-bottom:12px}
+.checkout{background:rgba(255,255,255,0.9);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.6);border-radius:20px;padding:44px 40px;max-width:520px;width:100%;box-shadow:0 20px 40px -15px rgba(0,0,0,0.08),0 0 0 1px rgba(0,0,0,0.02);animation:fadeIn .4s ease-out}
+.logo{font-size:22px;font-weight:700;color:#1e293b;margin-bottom:2px;letter-spacing:-0.02em}
+.subtitle{color:#64748b;font-size:14px;margin-bottom:28px;font-weight:400}
+.product{display:flex;gap:16px;align-items:center;padding:16px;background:linear-gradient(135deg,#f8fafc,#f1f5f9);border:1px solid #e2e8f0;border-radius:14px;margin-bottom:24px;transition:border-color .2s}
+.product:hover{border-color:#cbd5e1}
+.product-img{width:56px;height:56px;background:linear-gradient(135deg,#3b82f6,#2563eb);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 12px rgba(37,99,235,0.2)}
+.product-info h3{font-size:15px;font-weight:600;color:#1e293b;letter-spacing:-0.01em}.product-info p{color:#64748b;font-size:13px;margin-top:2px}
+.price{font-size:32px;font-weight:700;color:#1e293b;margin-bottom:28px;letter-spacing:-0.02em}
+.price span{font-size:14px;color:#94a3b8;font-weight:400;letter-spacing:0}
+.btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s cubic-bezier(.4,0,.2,1);letter-spacing:-0.01em}
+.btn-primary{background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff;box-shadow:0 4px 14px rgba(37,99,235,0.25)}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(37,99,235,0.35)}
+.btn-primary:active{transform:translateY(0);box-shadow:0 2px 8px rgba(37,99,235,0.2)}
+.btn-primary:disabled{background:linear-gradient(135deg,#94a3b8,#64748b);cursor:not-allowed;transform:none;box-shadow:none}
+.btn-respond{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;margin-top:8px;box-shadow:0 4px 14px rgba(245,158,11,0.25)}
+.btn-respond:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(245,158,11,0.35)}
+.btn-success{background:linear-gradient(135deg,#10b981,#059669);color:#fff;box-shadow:0 4px 14px rgba(16,185,129,0.25)}
+.status-bar{margin-top:16px;padding:14px 16px;border-radius:12px;display:none;font-size:13px;font-weight:500;animation:fadeIn .3s}
+.status-bar.active{display:flex;align-items:center;gap:8px}
+.s-processing{background:rgba(59,130,246,0.08);color:#2563eb;border:1px solid rgba(59,130,246,0.15)}
+.s-waiting{background:rgba(245,158,11,0.08);color:#92400e;border:1px solid rgba(245,158,11,0.15)}
+.s-success{background:rgba(16,185,129,0.08);color:#059669;border:1px solid rgba(16,185,129,0.15)}
+.s-failed{background:rgba(239,68,68,0.08);color:#dc2626;border:1px solid rgba(239,68,68,0.15)}
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+.trail{margin-top:20px;display:none;max-height:400px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#e2e8f0 transparent}
+.trail.visible{display:block;animation:slideUp .3s ease-out}
+.trail h4{font-size:11px;color:#94a3b8;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600}
+.step{display:flex;gap:12px;padding:12px;border-left:3px solid #e2e8f0;margin-bottom:4px;font-size:13px;animation:fadeIn .3s;border-radius:0 10px 10px 0;transition:background .15s}
+.step:hover{background:rgba(0,0,0,0.01)}
+.step.active{border-left-color:#3b82f6;background:rgba(59,130,246,0.04)}
+.step.done{border-left-color:#10b981}.step.failed-step{border-left-color:#ef4444}.step.waiting{border-left-color:#f59e0b;background:rgba(245,158,11,0.04)}
+.step-num{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,0.1)}
+.step-num.n-detect{background:linear-gradient(135deg,#3b82f6,#2563eb)}.step-num.n-diagnose{background:linear-gradient(135deg,#8b5cf6,#7c3aed)}.step-num.n-decide{background:linear-gradient(135deg,#f59e0b,#d97706)}.step-num.n-act{background:linear-gradient(135deg,#10b981,#059669)}.step-num.n-stop{background:linear-gradient(135deg,#ef4444,#dc2626)}.step-num.n-wait{background:linear-gradient(135deg,#f59e0b,#d97706)}
+.step-content{flex:1;min-width:0}.step-title{font-weight:600;color:#1e293b;margin-bottom:2px;font-size:13px}.step-detail{color:#64748b;font-size:12px;line-height:1.5}
+.action-box{background:linear-gradient(135deg,rgba(59,130,246,0.06),rgba(59,130,246,0.02));border:1px solid rgba(59,130,246,0.12);border-radius:14px;padding:20px;margin-top:16px;display:none}
+.action-box.visible{display:block;animation:slideUp .3s ease-out}
+.action-box h4{color:#2563eb;font-size:14px;margin-bottom:6px;font-weight:600}
+.action-box p{color:#64748b;font-size:13px;margin-bottom:14px;line-height:1.5}
 
-/* Churnkey Payment Wall — clean, non-alarmist decline messaging */
-.decline-wall{background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:20px;margin-top:16px;display:none}
-.decline-wall.visible{display:block}
-.decline-wall h3{color:#92400e;font-size:16px;margin-bottom:6px;font-weight:600}
-.decline-wall p{color:#78716c;font-size:13px;margin-bottom:12px;line-height:1.5}
-.decline-wall .reason{background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:10px;font-size:12px;color:#92400e;margin-bottom:12px}
+.decline-wall{background:linear-gradient(135deg,rgba(245,158,11,0.06),rgba(245,158,11,0.02));border:1px solid rgba(245,158,11,0.15);border-radius:16px;padding:24px;margin-top:18px;display:none;backdrop-filter:blur(10px)}
+.decline-wall.visible{display:block;animation:slideUp .35s ease-out}
+.decline-wall h3{color:#92400e;font-size:16px;margin-bottom:8px;font-weight:600;letter-spacing:-0.01em}
+.decline-wall p{color:#78716c;font-size:13px;margin-bottom:12px;line-height:1.6}
+.decline-wall .reason{background:rgba(245,158,11,0.06);border:1px solid rgba(245,158,11,0.12);border-radius:10px;padding:12px;font-size:12px;color:#92400e;margin-bottom:14px;line-height:1.5}
 
-/* Alternative Payment Rails — 1-click switching (Stripe hosted page style) */
-.alt-rails{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
-.alt-rail-btn{background:#f8fafc;border:2px solid #e2e8f0;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:500;color:#475569;cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:6px}
-.alt-rail-btn:hover{border-color:#2563eb;color:#2563eb;background:#eff6ff}
-.alt-rail-btn.active{border-color:#2563eb;color:#2563eb;background:#eff6ff}
+.alt-rails{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+.alt-rail-btn{background:rgba(255,255,255,0.8);backdrop-filter:blur(8px);border:1.5px solid #e2e8f0;border-radius:10px;padding:10px 16px;font-size:13px;font-weight:500;color:#475569;cursor:pointer;transition:all .2s cubic-bezier(.4,0,.2,1);display:flex;align-items:center;gap:6px}
+.alt-rail-btn:hover{border-color:#3b82f6;color:#2563eb;background:rgba(59,130,246,0.06);transform:translateY(-1px);box-shadow:0 4px 12px rgba(59,130,246,0.1)}
+.alt-rail-btn.active{border-color:#3b82f6;color:#2563eb;background:rgba(59,130,246,0.08);box-shadow:0 0 0 3px rgba(59,130,246,0.08)}
 .alt-rail-icon{font-size:16px}
 
-/* Discount Banner */
-.discount-banner{background:#dcfce7;border:1px solid #bbf7d0;border-radius:8px;padding:10px;margin-bottom:16px;font-size:13px;color:#166534;font-weight:500;text-align:center;display:none}
+.discount-banner{background:linear-gradient(135deg,rgba(16,185,129,0.08),rgba(16,185,129,0.04));border:1px solid rgba(16,185,129,0.15);border-radius:10px;padding:12px;margin-bottom:16px;font-size:13px;color:#059669;font-weight:600;text-align:center;display:none;animation:fadeIn .3s}
 .discount-banner.visible{display:block}
 
-@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+/* Agent UI Spec Overlay — appears ABOVE Razorpay iframe */
+.ui-overlay{position:fixed;top:20px;right:20px;max-width:380px;background:rgba(255,255,255,0.95);backdrop-filter:blur(20px);border:1px solid rgba(0,0,0,0.08);border-radius:16px;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,0.15);z-index:2147483647;display:none;animation:slideUp .4s ease-out;font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif}
+.ui-overlay.visible{display:block}
+.ui-overlay-headline{font-size:18px;font-weight:700;color:#1e293b;margin-bottom:8px;letter-spacing:-0.02em}
+.ui-overlay-subtext{font-size:13px;color:#64748b;line-height:1.6;margin-bottom:16px}
+.ui-overlay-cta{display:inline-block;background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff;padding:10px 20px;border-radius:10px;font-size:14px;font-weight:600;text-decoration:none;transition:all .2s}
+.ui-overlay-cta:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(37,99,235,0.3)}
+.ui-overlay-discount{background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.15);border-radius:8px;padding:8px 12px;margin-top:12px;font-size:12px;color:#059669;font-weight:600}
+.ui-overlay-tier{display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:600;margin-top:8px}
+.ui-overlay-tier.silent{background:rgba(59,130,246,0.1);color:#2563eb}
+.ui-overlay-tier.active{background:rgba(245,158,11,0.1);color:#d97706}
+@keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
 </style>
 </head>
 <body>
+<!-- Agent UI Spec Overlay — renders ABOVE Razorpay iframe -->
+<div class="ui-overlay" id="ui-overlay">
+  <div class="ui-overlay-headline" id="overlay-headline"></div>
+  <div class="ui-overlay-subtext" id="overlay-subtext"></div>
+  <div id="overlay-cta-wrap"><a class="ui-overlay-cta" id="overlay-cta" href="#">Complete Payment</a></div>
+  <div class="ui-overlay-discount" id="overlay-discount" style="display:none"></div>
+  <div class="ui-overlay-tier" id="overlay-tier" style="display:none"></div>
+</div>
 <div class="checkout">
 <div class="logo">ShopFast</div>
 <div class="subtitle">Secure Checkout</div>
@@ -857,6 +909,34 @@ socket.on("agent_event",function(data){
     }
 });
 
+// Agent UI Spec Overlay — appears ABOVE Razorpay iframe
+socket.on("ui_spec_overlay",function(data){
+    if(data.payment_id!==paymentId)return;
+    const overlay=document.getElementById("ui-overlay");
+    if(!overlay)return;
+    if(data.headline)document.getElementById("overlay-headline").textContent=data.headline;
+    if(data.subtext)document.getElementById("overlay-subtext").textContent=data.subtext;
+    if(data.primary_cta_text){
+        const cta=document.getElementById("overlay-cta");
+        cta.textContent=data.primary_cta_text;
+        cta.onclick=function(e){e.preventDefault();overlay.classList.remove("visible");startPayment()};
+    }
+    if(data.discount_incentive){
+        const disc=document.getElementById("overlay-discount");
+        disc.textContent=data.discount_incentive;
+        disc.style.display="block";
+    }
+    if(data.recovery_tier){
+        const tier=document.getElementById("overlay-tier");
+        tier.textContent=data.recovery_tier.toUpperCase();
+        tier.className="ui-overlay-tier "+data.recovery_tier;
+        tier.style.display="inline-block";
+    }
+    overlay.classList.add("visible");
+    // Auto-hide after 8 seconds
+    setTimeout(function(){overlay.classList.remove("visible")},8000);
+});
+
 function applyGenerativeUISpec(spec){
     if(!spec)return;
     const subtitle=document.querySelector(".subtitle");
@@ -883,114 +963,331 @@ function applyGenerativeUISpec(spec){
 
 # ─── Merchant Dashboard ───────────────────────────────────────
 MERCHANT_PAGE = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Merchant Dashboard</title>
+<title>Revenue Recovery — Agent Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
 <style>
+:root{
+  --bg-canvas:#FFFFFF;--bg-surface:#F7F8FA;--bg-card:#FFFFFF;
+  --border-subtle:#E5E7EB;--border-hover:#D1D5DB;
+  --text-primary:#1A1A2E;--text-secondary:#6B7280;--text-muted:#9CA3AF;
+  --brand-blue:#2563EB;--brand-blue-light:#EFF6FF;
+  --success:#16A34A;--success-light:#F0FDF4;--success-border:#BBF7D0;
+  --error:#DC2626;--error-light:#FEF2F2;--error-border:#FECACA;
+  --warning:#F59E0B;--warning-light:#FFFBEB;--warning-border:#FDE68A;
+  --accent-teal:#0EA5E9;
+  --sidebar-bg:#F7F8FA;--sidebar-active:#EFF6FF;--sidebar-active-text:#2563EB;
+  --card-shadow:0 1px 3px rgba(0,0,0,0.04),0 1px 2px rgba(0,0,0,0.02);
+  --card-shadow-hover:0 4px 12px rgba(0,0,0,0.06);
+}
+[data-theme="dark"]{
+  --bg-canvas:#020617;--bg-surface:#0F172A;--bg-card:rgba(15,23,42,0.7);
+  --border-subtle:rgba(255,255,255,0.06);--border-hover:rgba(255,255,255,0.1);
+  --text-primary:#F8FAFC;--text-secondary:#94A3B8;--text-muted:#475569;
+  --brand-blue:#3B82F6;--brand-blue-light:rgba(59,130,246,0.1);
+  --success:#10B981;--success-light:rgba(16,185,129,0.1);--success-border:rgba(16,185,129,0.2);
+  --error:#EF4444;--error-light:rgba(239,68,68,0.1);--error-border:rgba(239,68,68,0.2);
+  --warning:#F59E0B;--warning-light:rgba(245,158,11,0.1);--warning-border:rgba(245,158,11,0.2);
+  --sidebar-bg:#0F172A;--sidebar-active:rgba(59,130,246,0.1);--sidebar-active-text:#60A5FA;
+  --card-shadow:0 1px 3px rgba(0,0,0,0.2);--card-shadow-hover:0 4px 12px rgba(0,0,0,0.3);
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0}
-.topbar{background:#1e293b;padding:12px 24px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #334155}
-.topbar .logo{font-weight:700;font-size:16px;color:#3b82f6}
-.topbar .links{display:flex;gap:12px}
-.topbar a{color:#94a3b8;text-decoration:none;font-size:13px;padding:5px 10px;border-radius:6px}.topbar a:hover,.topbar a.active{background:#334155;color:#e2e8f0}
-.container{max-width:1400px;margin:0 auto;padding:20px}
-.metrics{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:20px}
-.metric{background:#1e293b;border-radius:10px;padding:16px;border:1px solid #334155}
-.metric-value{font-size:1.8em;font-weight:700;color:#3b82f6}.sv{color:#10b981}.wv{color:#f59e0b}.rv{color:#ef4444}
-.metric-label{color:#64748b;font-size:11px;margin-top:2px}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg-canvas);color:var(--text-primary);letter-spacing:-0.011em;min-height:100vh;display:flex;transition:background .3s,color .3s}
+
+/* Sidebar */
+.sidebar{width:220px;background:var(--sidebar-bg);border-right:1px solid var(--border-subtle);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:50;transition:background .3s}
+.sidebar-logo{padding:20px 20px 16px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:10px}
+.sidebar-logo-icon{width:32px;height:32px;background:var(--brand-blue);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:16px}
+.sidebar-logo-text{font-weight:700;font-size:14px;color:var(--text-primary)}
+.sidebar-nav{flex:1;padding:12px 8px;overflow-y:auto}
+.nav-section{font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;padding:8px 12px 4px;margin-top:8px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;font-size:13px;font-weight:500;color:var(--text-secondary);text-decoration:none;transition:all .15s;cursor:pointer}
+.nav-item:hover{background:var(--brand-blue-light);color:var(--text-primary)}
+.nav-item.active{background:var(--sidebar-active);color:var(--sidebar-active-text);font-weight:600}
+.nav-item .nav-icon{width:18px;text-align:center;font-size:14px;flex-shrink:0}
+.nav-badge{font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600;background:var(--brand-blue);color:#fff;margin-left:auto}
+.sidebar-footer{padding:12px 16px;border-top:1px solid var(--border-subtle);font-size:11px;color:var(--text-muted)}
+
+/* Main Area */
+.main{margin-left:220px;flex:1;display:flex;flex-direction:column;min-height:100vh}
+.topbar{height:56px;background:var(--bg-canvas);border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center;padding:0 28px;position:sticky;top:0;z-index:40;transition:background .3s}
+.topbar-left{display:flex;align-items:center;gap:16px}
+.breadcrumb{font-size:13px;color:var(--text-secondary)}
+.breadcrumb span{color:var(--text-primary);font-weight:600}
+.topbar-right{display:flex;align-items:center;gap:12px}
+.topbar-search{background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:8px;padding:7px 14px 7px 32px;font-size:13px;color:var(--text-primary);width:220px;outline:none;transition:border-color .15s}
+.topbar-search:focus{border-color:var(--brand-blue)}
+.search-wrap{position:relative}.search-wrap::before{content:"\\1F50D";position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:12px}
+.theme-toggle{width:36px;height:36px;border-radius:8px;border:1px solid var(--border-subtle);background:var(--bg-surface);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .15s}
+.theme-toggle:hover{border-color:var(--brand-blue);background:var(--brand-blue-light)}
+
+/* Content */
+.content{padding:24px 28px;flex:1}
+.agent-hero{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:14px;padding:24px;margin-bottom:24px;box-shadow:var(--card-shadow);display:flex;justify-content:space-between;align-items:center;transition:all .2s}
+.agent-hero:hover{box-shadow:var(--card-shadow-hover)}
+.agent-identity{display:flex;align-items:center;gap:14px}
+.agent-icon{width:44px;height:44px;background:var(--brand-blue);border-radius:12px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px}
+.agent-name{font-size:18px;font-weight:700;color:var(--text-primary)}
+.agent-subtitle{font-size:13px;color:var(--text-secondary);margin-top:2px}
+.health-badge{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--success);padding:6px 14px;border-radius:20px;background:var(--success-light);border:1px solid var(--success-border)}
+.health-dot{width:7px;height:7px;background:var(--success);border-radius:50%;animation:blink 1.5s infinite}
+
+/* Tabs */
+.tabs{display:flex;gap:0;border-bottom:2px solid var(--border-subtle);margin-bottom:24px}
+.tab{padding:10px 20px;font-size:13px;font-weight:500;color:var(--text-secondary);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s}
+.tab:hover{color:var(--text-primary)}
+.tab.active{color:var(--brand-blue);border-bottom-color:var(--brand-blue);font-weight:600}
+
+/* Metrics Row */
+.metrics{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:24px}
+.metric{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:12px;padding:16px;box-shadow:var(--card-shadow);transition:all .2s}
+.metric:hover{box-shadow:var(--card-shadow-hover);border-color:var(--border-hover)}
+.metric-value{font-size:1.6em;font-weight:700;color:var(--brand-blue);letter-spacing:-0.02em}
+.metric-value.sv{color:var(--success)}.metric-value.wv{color:var(--warning)}.metric-value.rv{color:var(--error)}
+.metric-label{color:var(--text-muted);font-size:11px;margin-top:4px;font-weight:500;text-transform:uppercase;letter-spacing:0.04em}
+
+/* Grid layouts */
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
-.card{background:#1e293b;border-radius:10px;padding:16px;border:1px solid #334155;margin-bottom:16px}
-.card h2{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #334155;font-size:12px}th{color:#64748b;font-size:10px;text-transform:uppercase}
-.badge{display:inline-block;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:600}
-.bs{background:#065f46;color:#10b981}.bf{background:#7f1d1d;color:#ef4444}.bp{background:#1e3a5f;color:#3b82f6}.bw{background:#4a3000;color:#f59e0b}
-.bh{background:#7f1d1d;color:#ef4444;border:1px solid #ef4444}
-.btier-silent{background:rgba(59,130,246,0.15);color:#3b82f6;border:1px solid #3b82f6}
-.btier-active{background:rgba(245,158,11,0.15);color:#f59e0b;border:1px solid #f59e0b}
-.btier-hard{background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid #ef4444}
-.trail{max-height:500px;overflow-y:auto}
-.trail-item{padding:10px;border-left:3px solid #334155;margin-bottom:4px;border-radius:0 6px 6px 0;background:#0f172a;font-size:12px}
-.trail-item.t-detecting{border-left-color:#3b82f6}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8b5cf6}.trail-item.t-deciding{border-left-color:#f59e0b}.trail-item.t-acting,.trail-item.t-acted{border-left-color:#10b981}.trail-item.t-waiting{border-left-color:#f59e0b;background:#1c1917}.trail-item.t-observed{border-left-color:#6366f1}.trail-item.t-stopping{border-left-color:#ef4444}
-.trail-time{color:#475569;font-size:10px}.trail-msg{color:#e2e8f0;margin-top:2px;font-weight:500}.trail-detail{color:#94a3b8;margin-top:2px;font-size:11px}
-.toast{position:fixed;top:16px;right:16px;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 16px;font-size:12px;z-index:1000;transform:translateX(120%);transition:transform .3s}
-.toast.show{transform:translateX(0)}.toast.success{border-left:3px solid #10b981}.toast.info{border-left:3px solid #3b82f6}
-.live{display:flex;align-items:center;gap:6px;font-size:11px;color:#10b981}
-.live-dot{width:6px;height:6px;background:#10b981;border-radius:50%;animation:blink 1s infinite}
+
+/* Card */
+.card{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:14px;padding:20px;box-shadow:var(--card-shadow);transition:all .2s}
+.card:hover{box-shadow:var(--card-shadow-hover)}
+.card h2{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:14px;font-weight:600}
+
+/* Activity Feed */
+.activity-feed{max-height:600px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border-subtle) transparent}
+.activity-item{display:flex;gap:12px;padding:14px 0;border-bottom:1px solid var(--border-subtle);font-size:13px;transition:background .15s;cursor:pointer;border-radius:8px;padding-left:8px;padding-right:8px}
+.activity-item:hover{background:var(--bg-surface)}
+.activity-icon{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+.activity-icon.recovering{background:var(--warning-light);color:var(--warning)}
+.activity-icon.recovered{background:var(--success-light);color:var(--success)}
+.activity-icon.failed{background:var(--error-light);color:var(--error)}
+.activity-icon.escalated{background:var(--brand-blue-light);color:var(--brand-blue)}
+.activity-icon.scheduled{background:var(--brand-blue-light);color:var(--brand-blue)}
+.activity-body{flex:1;min-width:0}
+.activity-title{font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px}
+.activity-title .live{color:var(--success);font-size:10px;font-weight:600}
+.activity-meta{color:var(--text-secondary);font-size:12px;margin-top:3px;display:flex;gap:12px;align-items:center}
+.activity-amount{font-weight:600;color:var(--text-primary)}
+
+/* Table */
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border-subtle);font-size:12px}
+th{color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600}
+tr{transition:background .15s}
+tr:hover{background:var(--bg-surface)}
+
+/* Badges */
+.badge{display:inline-block;padding:3px 10px;border-radius:8px;font-size:10px;font-weight:600;letter-spacing:0.02em}
+.bs{background:var(--success-light);color:var(--success);border:1px solid var(--success-border)}
+.bf{background:var(--error-light);color:var(--error);border:1px solid var(--error-border)}
+.bp{background:var(--brand-blue-light);color:var(--brand-blue);border:1px solid rgba(59,130,246,0.2)}
+.bw{background:var(--warning-light);color:var(--warning);border:1px solid var(--warning-border)}
+.btier-silent{background:var(--brand-blue-light);color:var(--brand-blue);border:1px solid rgba(59,130,246,0.2)}
+.btier-active{background:var(--warning-light);color:var(--warning);border:1px solid var(--warning-border)}
+.btier-hard{background:var(--error-light);color:var(--error);border:1px solid var(--error-border)}
+
+/* Strategy items */
+.strategy-item{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border-subtle);font-size:12px}
+.strategy-code{color:var(--brand-blue);font-weight:600;min-width:60px;font-family:'SF Mono',SFMono-Regular,monospace;font-size:11px}
+.strategy-name{color:var(--text-primary);flex:1}
+.strategy-tier{font-size:10px;padding:3px 8px;border-radius:6px;font-weight:600}
+
+/* Penalty counter */
+.penalty-counter{text-align:center;padding:20px}
+.penalty-big{font-size:2.2em;font-weight:700;color:var(--success);letter-spacing:-0.02em}
+.penalty-sub{color:var(--text-muted);font-size:12px;margin-top:6px;font-weight:500}
+.penalty-usd{color:var(--brand-blue);font-size:14px;margin-top:10px;font-weight:600}
+
+/* Trail */
+.trail{max-height:500px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border-subtle) transparent}
+.trail-item{padding:12px;border-left:3px solid var(--border-subtle);margin-bottom:4px;border-radius:0 10px 10px 0;background:var(--bg-surface);font-size:12px;transition:background .15s}
+.trail-item:hover{background:var(--brand-blue-light)}
+.trail-item.t-detecting{border-left-color:var(--brand-blue)}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8B5CF6}.trail-item.t-deciding{border-left-color:var(--warning)}.trail-item.t-acting,.trail-item.t-acted{border-left-color:var(--success)}.trail-item.t-waiting{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-observed{border-left-color:#6366F1}.trail-item.t-stopping{border-left-color:var(--error)}
+.trail-time{color:var(--text-muted);font-size:10px;font-weight:500}.trail-msg{color:var(--text-primary);margin-top:3px;font-weight:500}.trail-detail{color:var(--text-secondary);margin-top:3px;font-size:11px;line-height:1.5}
+
+/* Toast */
+.toast{position:fixed;top:20px;right:20px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:12px;padding:12px 18px;font-size:12px;z-index:1000;transform:translateX(120%);transition:transform .3s cubic-bezier(.4,0,.2,1);font-weight:500;box-shadow:var(--card-shadow-hover)}
+.toast.show{transform:translateX(0)}.toast.success{border-left:3px solid var(--success)}.toast.info{border-left:3px solid var(--brand-blue)}
+
+/* Empty state */
+.empty{text-align:center;padding:40px;color:var(--text-muted);font-size:13px}
+
+/* Case detail drawer */
+.drawer-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:200;opacity:0;pointer-events:none;transition:opacity .25s}
+.drawer-overlay.open{opacity:1;pointer-events:all}
+.drawer{position:fixed;top:0;right:0;width:520px;height:100vh;background:var(--bg-canvas);border-left:1px solid var(--border-subtle);z-index:201;transform:translateX(100%);transition:transform .3s cubic-bezier(.4,0,.2,1);overflow-y:auto;display:flex;flex-direction:column}
+.drawer.open{transform:translateX(0)}
+.drawer-header{padding:20px 24px;border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center}
+.drawer-title{font-size:16px;font-weight:700;color:var(--text-primary)}
+.drawer-close{width:32px;height:32px;border-radius:8px;border:1px solid var(--border-subtle);background:var(--bg-surface);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .15s}
+.drawer-close:hover{background:var(--error-light);border-color:var(--error);color:var(--error)}
+.drawer-body{padding:20px 24px;flex:1}
+.drawer-section{margin-bottom:20px}
+.drawer-section h3{font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:10px}
+.drawer-trail{max-height:400px;overflow-y:auto}
+.drawer-trail .trail-item{margin-bottom:6px}
+
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-.empty{text-align:center;padding:40px;color:#475569;font-size:13px}
-.strategy-item{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid #334155;font-size:12px}
-.strategy-code{color:#3b82f6;font-weight:600;min-width:60px}
-.strategy-name{color:#e2e8f0;flex:1}
-.strategy-tier{font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600}
-.penalty-counter{text-align:center;padding:16px}
-.penalty-big{font-size:2.2em;font-weight:700;color:#10b981}
-.penalty-sub{color:#64748b;font-size:12px;margin-top:4px}
-.penalty-usd{color:#3b82f6;font-size:14px;margin-top:8px}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 </style>
 </head>
 <body>
-<div class="topbar">
-<span class="logo">Revenue Recovery — Live</span>
-<div class="links">
-<a href="/pay" target="_blank">Open Store</a>
-<a href="/merchant" class="active">Dashboard</a>
-<a href="/graph" target="_blank">Agent Flow</a>
+
+<!-- Sidebar Navigation -->
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <div class="sidebar-logo-icon">⚡</div>
+    <div class="sidebar-logo-text">Revenue Recovery</div>
+  </div>
+  <nav class="sidebar-nav">
+    <div class="nav-section">Payment Products</div>
+    <a class="nav-item" href="/merchant"><span class="nav-icon">📊</span> Dashboard<span class="nav-badge">Live</span></a>
+    <a class="nav-item" href="/pay" target="_blank"><span class="nav-icon">🛒</span> Store</a>
+    <a class="nav-item" href="/graph" target="_blank"><span class="nav-icon">🔀</span> Agent Flow</a>
+    <div class="nav-section">Agent Studio</div>
+    <a class="nav-item active" href="/merchant"><span class="nav-icon">🤖</span> Recovery Agent<span class="nav-badge" style="background:var(--success)">Active</span></a>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">📋</span> Transactions</a>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">🏦</span> Settlements</a>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">💳</span> Payment Links</a>
+    <div class="nav-section">Settings</div>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">⚙️</span> Configuration</a>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">🔑</span> API Keys</a>
+  </nav>
+  <div class="sidebar-footer">Recovery Agent v2.0 — Buildathon</div>
+</aside>
+
+<!-- Main Content -->
+<div class="main">
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="breadcrumb">Agent Studio / <span>Recovery Agent</span></div>
+    </div>
+    <div class="topbar-right">
+      <div class="search-wrap"><input class="topbar-search" placeholder="Search payments..." /></div>
+      <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">🌓</button>
+      <a href="/pay" target="_blank" style="text-decoration:none"><button style="padding:7px 16px;border-radius:8px;border:1px solid var(--brand-blue);background:var(--brand-blue);color:#fff;font-size:12px;font-weight:600;cursor:pointer">Open Store</button></a>
+    </div>
+  </header>
+
+  <div class="content">
+    <!-- Agent Hero Card -->
+    <div class="agent-hero">
+      <div class="agent-identity">
+        <div class="agent-icon">🤖</div>
+        <div>
+          <div class="agent-name">Payment Recovery Agent</div>
+          <div class="agent-subtitle">Recovering failed payments with AI-powered multi-turn reasoning</div>
+        </div>
+      </div>
+      <div class="health-badge"><span class="health-dot"></span> Healthy &amp; Active</div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <div class="tab active" onclick="showTab('activity')">Activity</div>
+      <div class="tab" onclick="showTab('settings')">Settings</div>
+    </div>
+
+    <!-- Tab: Activity -->
+    <div id="tab-activity">
+      <!-- Metrics -->
+      <div class="metrics">
+        <div class="metric"><div class="metric-value" id="m-total">0</div><div class="metric-label">Total Payments</div></div>
+        <div class="metric"><div class="metric-value sv" id="m-recovered">0</div><div class="metric-label">Recovered</div></div>
+        <div class="metric"><div class="metric-value wv" id="m-waiting">0</div><div class="metric-label">Awaiting Customer</div></div>
+        <div class="metric"><div class="metric-value rv" id="m-failed">0</div><div class="metric-label">Failed</div></div>
+        <div class="metric"><div class="metric-value" id="m-rate">0%</div><div class="metric-label">Recovery Rate</div></div>
+        <div class="metric"><div class="metric-value sv" id="m-penalties">0</div><div class="metric-label">Penalties Prevented</div></div>
+        <div class="metric"><div class="metric-value sv" id="m-saved">$0.00</div><div class="metric-label">Fines Saved</div></div>
+      </div>
+
+      <!-- Activity + Sidebar Cards -->
+      <div class="grid">
+        <!-- Activity Feed (left) -->
+        <div class="card">
+          <h2>Activity Feed <span class="live"><span class="health-dot"></span> Live</span></h2>
+          <div class="activity-feed" id="payments">
+            <div class="empty" id="empty-msg">No payments yet. Open the <a href="/pay" target="_blank" style="color:var(--brand-blue)">store</a> to start recovery.</div>
+          </div>
+        </div>
+
+        <!-- Right column: Agent Trail + Info -->
+        <div style="display:flex;flex-direction:column;gap:16px">
+          <div class="card">
+            <h2>Agent Trail</h2>
+            <div class="trail" id="trail"><div class="empty">Waiting for agent activity...</div></div>
+          </div>
+          <div class="grid-3" style="margin-bottom:0">
+            <div class="card">
+              <h2>Recovery Tiers</h2>
+              <div id="tier-badges" style="display:flex;gap:8px;flex-wrap:wrap">
+                <span class="badge btier-silent" id="tier-silent-count">SILENT: 0</span>
+                <span class="badge btier-active" id="tier-active-count">ACTIVE: 0</span>
+                <span class="badge btier-hard" id="tier-hard-count">HARD BLOCKED: 0</span>
+              </div>
+            </div>
+            <div class="card">
+              <h2>Decline Strategy</h2>
+              <div id="decline-strategies"><div class="empty" style="padding:8px">Waiting...</div></div>
+            </div>
+            <div class="card">
+              <h2>Penalties</h2>
+              <div class="penalty-counter">
+                <div class="penalty-big" id="penalty-count">0</div>
+                <div class="penalty-sub">blocked</div>
+                <div class="penalty-usd" id="penalty-value">$0.00 saved</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Full-width trail for mobile -->
+      <div class="card" style="margin-top:16px">
+        <h2>Full Agent Trail</h2>
+        <div class="trail" id="trail-full"><div class="empty">Waiting for agent activity...</div></div>
+      </div>
+
+      <div style="text-align:center;padding:20px;color:var(--text-muted);font-size:11px;margin-top:16px">
+        AI agents can make mistakes. Verify important decisions independently.
+      </div>
+    </div>
+
+    <!-- Tab: Settings (placeholder) -->
+    <div id="tab-settings" style="display:none">
+      <div class="card">
+        <h2>Agent Configuration</h2>
+        <div style="padding:20px;color:var(--text-secondary);font-size:13px">
+          <p>Configure recovery agent parameters, guardrail policies, and notification templates.</p>
+          <p style="margin-top:12px;color:var(--text-muted);font-size:12px">Settings panel coming soon. Currently managed via configuration files.</p>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
+
+<!-- Case Detail Drawer -->
+<div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-header">
+    <div class="drawer-title" id="drawer-title">Payment Details</div>
+    <button class="drawer-close" onclick="closeDrawer()">✕</button>
+  </div>
+  <div class="drawer-body" id="drawer-body">
+    <div class="empty">Select a payment to view details</div>
+  </div>
 </div>
-<div class="container">
-<div class="metrics">
-<div class="metric"><div class="metric-value" id="m-total">0</div><div class="metric-label">Total Payments</div></div>
-<div class="metric"><div class="metric-value sv" id="m-recovered">0</div><div class="metric-label">Recovered</div></div>
-<div class="metric"><div class="metric-value wv" id="m-waiting">0</div><div class="metric-label">Waiting for Customer</div></div>
-<div class="metric"><div class="metric-value rv" id="m-failed">0</div><div class="metric-label">Failed</div></div>
-<div class="metric"><div class="metric-value" id="m-rate">0%</div><div class="metric-label">Recovery Rate</div></div>
-<div class="metric"><div class="metric-value sv" id="m-penalties">0</div><div class="metric-label">Penalties Prevented</div></div>
-<div class="metric"><div class="metric-value" id="m-saved" style="color:#10b981">$0.00</div><div class="metric-label">Network Fines Saved</div></div>
-</div>
-<div class="grid-3">
-<div class="card">
-<h2>Recovery Tier Distribution</h2>
-<div style="display:flex;gap:10px;flex-wrap:wrap;" id="tier-badges">
-<span class="badge btier-silent" id="tier-silent-count">SILENT: 0</span>
-<span class="badge btier-active" id="tier-active-count">ACTIVE: 0</span>
-<span class="badge btier-hard" id="tier-hard-count">HARD BLOCKED: 0</span>
-</div>
-</div>
-<div class="card">
-<h2>Decline Code Strategy</h2>
-<div id="decline-strategies">
-<div class="empty" style="padding:12px">Waiting for failure events...</div>
-</div>
-</div>
-<div class="card">
-<h2>Penalties Prevented</h2>
-<div class="penalty-counter">
-<div class="penalty-big" id="penalty-count">0</div>
-<div class="penalty-sub">hard decline retries blocked</div>
-<div class="penalty-usd" id="penalty-value">$0.00 saved (Visa/MC fines)</div>
-</div>
-</div>
-</div>
-<div class="grid">
-<div class="card">
-<h2>Payments <span class="live"><span class="live-dot"></span> Live</span></h2>
-<table>
-<tr><th>ID</th><th>Amount</th><th>Tier</th><th>Status</th><th>Strategy</th><th>Attempts</th></tr>
-<tbody id="payments"></tbody>
-</table>
-<div class="empty" id="empty-msg">No payments yet. Open the <a href="/pay" target="_blank" style="color:#3b82f6">store</a> to start.</div>
-</div>
-<div class="card">
-<h2>Agent Trail</h2>
-<div class="trail" id="trail"><div class="empty">Waiting for agent activity...</div></div>
-</div>
-</div>
-</div>
+
+<!-- Toast -->
 <div class="toast" id="toast"></div>
+
 <script>
 const socket=io();
 let paymentsData=[];
@@ -998,63 +1295,114 @@ let tierStats={silent:0,active:0,hard_decline_blocked:0};
 let totalPenalties=0;
 let declineStrategies={};
 
+// Theme toggle
+function toggleTheme(){
+  const html=document.documentElement;
+  const current=html.getAttribute("data-theme");
+  html.setAttribute("data-theme",current==="light"?"dark":"light");
+  localStorage.setItem("theme",html.getAttribute("data-theme"));
+}
+(function(){const saved=localStorage.getItem("theme");if(saved)document.documentElement.setAttribute("data-theme",saved)})();
+
+// Tab switching
+function showTab(name){
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  document.querySelectorAll("[id^=tab-]").forEach(p=>p.style.display="none");
+  event.target.classList.add("active");
+  document.getElementById("tab-"+name).style.display="block";
+}
+
+// Drawer
+function openDrawer(paymentId){
+  const p=paymentsData.find(x=>x.payment_id===paymentId);
+  if(!p)return;
+  document.getElementById("drawer-title").textContent=p.payment_id;
+  const body=document.getElementById("drawer-body");
+  let html=`<div class="drawer-section"><h3>Payment Info</h3><div style="font-size:13px;color:var(--text-secondary)"><b>Amount:</b> INR ${p.amount.toLocaleString()}<br><b>Status:</b> ${p.status}<br><b>Tier:</b> ${(p.recovery_tier||"active").toUpperCase()}<br><b>Strategy:</b> ${p.decline_strategy||"—"}<br><b>Attempts:</b> ${p.attempts||0}</div></div>`;
+  if(p.trail&&p.trail.length){
+    html+=`<div class="drawer-section"><h3>Agent Reasoning (${p.trail.length} steps)</h3><div class="drawer-trail">`;
+    p.trail.forEach(e=>{
+      html+=`<div class="trail-item t-${e.step}"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail">'+e.detail+'</div>':''}</div>`;
+    });
+    html+=`</div></div>`;
+  }
+  body.innerHTML=html;
+  document.getElementById("drawer-overlay").classList.add("open");
+  document.getElementById("drawer").classList.add("open");
+}
+function closeDrawer(){
+  document.getElementById("drawer-overlay").classList.remove("open");
+  document.getElementById("drawer").classList.remove("open");
+}
+
 function updateMetrics(){
-    const t=paymentsData.length,r=paymentsData.filter(p=>p.status==="recovered").length,w=paymentsData.filter(p=>p.status==="recovering").length,f=paymentsData.filter(p=>p.status==="failed").length;
-    document.getElementById("m-total").textContent=t;document.getElementById("m-recovered").textContent=r;
-    document.getElementById("m-waiting").textContent=w;document.getElementById("m-failed").textContent=f;
-    document.getElementById("m-rate").textContent=t>0?Math.round(r/t*100)+"%":"0%";
-    document.getElementById("m-penalties").textContent=totalPenalties;
-    document.getElementById("m-saved").textContent="$"+(totalPenalties*0.10).toFixed(2);
-    document.getElementById("penalty-count").textContent=totalPenalties;
-    document.getElementById("penalty-value").textContent="$"+(totalPenalties*0.10).toFixed(2)+" saved (Visa/MC fines)";
-    document.getElementById("tier-silent-count").textContent="SILENT: "+tierStats.silent;
-    document.getElementById("tier-active-count").textContent="ACTIVE: "+tierStats.active;
-    document.getElementById("tier-hard-count").textContent="HARD BLOCKED: "+tierStats.hard_decline_blocked;
+  const t=paymentsData.length,r=paymentsData.filter(p=>p.status==="recovered").length,w=paymentsData.filter(p=>p.status==="recovering"||p.status==="awaiting_customer").length,f=paymentsData.filter(p=>p.status==="failed").length;
+  document.getElementById("m-total").textContent=t;document.getElementById("m-recovered").textContent=r;
+  document.getElementById("m-waiting").textContent=w;document.getElementById("m-failed").textContent=f;
+  document.getElementById("m-rate").textContent=t>0?Math.round(r/t*100)+"%":"0%";
+  document.getElementById("m-penalties").textContent=totalPenalties;
+  document.getElementById("m-saved").textContent="$"+(totalPenalties*0.10).toFixed(2);
+  document.getElementById("penalty-count").textContent=totalPenalties;
+  document.getElementById("penalty-value").textContent="$"+(totalPenalties*0.10).toFixed(2)+" saved";
+  document.getElementById("tier-silent-count").textContent="SILENT: "+tierStats.silent;
+  document.getElementById("tier-active-count").textContent="ACTIVE: "+tierStats.active;
+  document.getElementById("tier-hard-count").textContent="HARD BLOCKED: "+tierStats.hard_decline_blocked;
 }
 
 function renderDeclineStrategies(){
-    const el=document.getElementById("decline-strategies");
-    const keys=Object.keys(declineStrategies);
-    if(keys.length===0){el.innerHTML='<div class="empty" style="padding:12px">Waiting for failure events...</div>';return}
-    el.innerHTML=keys.map(code=>{
-        const s=declineStrategies[code];
-        const tierCls=s.tier==="silent"?"btier-silent":s.tier==="hard_decline_blocked"?"btier-hard":"btier-active";
-        const tierLabel=s.tier==="silent"?"SILENT":s.tier==="hard_decline_blocked"?"BLOCKED":"ACTIVE";
-        return `<div class="strategy-item"><span class="strategy-code">Code ${code}</span><span class="strategy-name">${s.strategy}</span><span class="strategy-tier ${tierCls}">${tierLabel}</span></div>`;
-    }).join("");
+  const el=document.getElementById("decline-strategies");
+  const keys=Object.keys(declineStrategies);
+  if(keys.length===0){el.innerHTML='<div class="empty" style="padding:8px">Waiting...</div>';return}
+  el.innerHTML=keys.map(code=>{
+    const s=declineStrategies[code];
+    const tierCls=s.tier==="silent"?"btier-silent":s.tier==="hard_decline_blocked"?"btier-hard":"btier-active";
+    const tierLabel=s.tier==="silent"?"SILENT":s.tier==="hard_decline_blocked"?"BLOCKED":"ACTIVE";
+    return `<div class="strategy-item"><span class="strategy-code">${code}</span><span class="strategy-name">${s.strategy}</span><span class="strategy-tier ${tierCls}">${tierLabel}</span></div>`;
+  }).join("");
 }
 
 function renderPayments(){
-    const el=document.getElementById("payments"),empty=document.getElementById("empty-msg");
-    if(paymentsData.length===0){empty.style.display="block";el.innerHTML="";return}
-    empty.style.display="none";
-    el.innerHTML=paymentsData.map(p=>{
-        const sc=p.status==="recovered"?"bs":p.status==="recovering"?"bw":p.status==="failed"?"bf":"bp";
-        const tierCls=p.recovery_tier==="silent"?"btier-silent":p.recovery_tier==="hard_decline_blocked"?"btier-hard":"btier-active";
-        const tierLabel=p.recovery_tier==="silent"?"SILENT":p.recovery_tier==="hard_decline_blocked"?"BLOCKED":"ACTIVE";
-        return `<tr><td style="color:#94a3b8">${p.payment_id.slice(0,14)}</td><td>INR ${p.amount.toLocaleString()}</td><td><span class="badge ${tierCls}">${tierLabel}</span></td><td><span class="badge ${sc}">${p.status}</span></td><td style="font-size:11px;color:#94a3b8">${p.decline_strategy||"—"}</td><td>${p.attempts||0}</td></tr>`;
-    }).join("");
+  const el=document.getElementById("payments"),empty=document.getElementById("empty-msg");
+  if(paymentsData.length===0){empty.style.display="block";el.innerHTML="";el.appendChild(empty);return}
+  empty.style.display="none";
+  el.innerHTML=paymentsData.map(p=>{
+    const iconCls=p.status==="recovered"?"recovered":p.status==="recovering"||p.status==="awaiting_customer"?"recovering":p.status==="failed"?"failed":p.status==="escalated"?"escalated":"scheduled";
+    const icon=p.status==="recovered"?"✓":p.status==="failed"?"✕":p.status==="escalated"?"↗":p.status==="scheduled"?"⏱":"●";
+    const live=p.status==="recovering"||p.status==="awaiting_customer"?'<span class="live"><span class="health-dot"></span> Live</span>':'';
+    const tierCls=p.recovery_tier==="silent"?"btier-silent":p.recovery_tier==="hard_decline_blocked"?"btier-hard":"btier-active";
+    const tierLabel=(p.recovery_tier||"active").toUpperCase();
+    const action=p.status==="recovered"?"recovered":p.status==="escalated"?"escalated to human":p.status==="scheduled"?"retry scheduled":p.status==="awaiting_customer"?"awaiting response":"recovering";
+    return `<div class="activity-item" onclick="openDrawer('${p.payment_id}')">
+      <div class="activity-icon ${iconCls}">${icon}</div>
+      <div class="activity-body">
+        <div class="activity-title">${p.payment_id.slice(0,16)} ${live}</div>
+        <div class="activity-meta">
+          <span class="activity-amount">INR ${p.amount.toLocaleString()}</span>
+          <span class="badge ${tierCls}">${tierLabel}</span>
+          <span>${action}</span>
+          <span>${p.attempts||0} attempts</span>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
 }
 
 function renderTrail(trail){
-    const el=document.getElementById("trail");
+  ["trail","trail-full"].forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el)return;
     if(!trail||trail.length===0){el.innerHTML='<div class="empty">Waiting for agent activity...</div>';return}
     el.innerHTML=trail.map(e=>{
-        let specHtml='';
-        if(e.ui_spec){
-            specHtml=`<div class="trail-detail" style="margin-top:6px;padding:8px;background:#1e293b;border-radius:6px;border-left:3px solid #8b5cf6">
-                <strong style="color:#8b5cf6">Generative UI Spec:</strong><br>
-                <span style="color:#e2e8f0">${e.ui_spec.headline||''}</span><br>
-                <span style="color:#94a3b8;font-size:11px">${e.ui_spec.subtext||''}</span><br>
-                <span style="color:#10b981;font-size:11px">CTA: ${e.ui_spec.primary_cta_text||''} | Rail: ${e.ui_spec.target_rail||''}</span>
-                ${e.ui_spec.recovery_tier?`<br><span style="color:#3b82f6;font-size:11px">Tier: ${e.ui_spec.recovery_tier.toUpperCase()}</span>`:''}
-                ${e.ui_spec.decline_strategy?`<br><span style="color:#f59e0b;font-size:11px">Strategy: ${e.ui_spec.decline_strategy}</span>`:''}
-                ${e.ui_spec.discount_incentive?`<br><span style="color:#f59e0b;font-size:11px">${e.ui_spec.discount_incentive}</span>`:''}
-            </div>`;
-        }
-        return `<div class="trail-item t-${e.step}"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail">'+e.detail+'</div>':''}${specHtml}</div>`;
+      let specHtml='';
+      if(e.ui_spec){
+        specHtml=`<div class="trail-detail" style="margin-top:6px;padding:8px;border-radius:6px;border-left:3px solid #8B5CF6;background:var(--bg-surface)">
+          <strong style="color:#8B5CF6">UI Spec:</strong> ${e.ui_spec.headline||''} — ${e.ui_spec.primary_cta_text||''}
+        </div>`;
+      }
+      return `<div class="trail-item t-${e.step}"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail">'+e.detail+'</div>':''}${specHtml}</div>`;
     }).join("");
     el.scrollTop=el.scrollHeight;
+  });
 }
 
 function showToast(msg,type){const t=document.getElementById("toast");t.textContent=msg;t.className="toast "+type+" show";setTimeout(()=>t.className="toast",3000)}
@@ -1062,36 +1410,38 @@ function showToast(msg,type){const t=document.getElementById("toast");t.textCont
 socket.on("connect",()=>showToast("Connected to live feed","info"));
 
 socket.on("tier_update",function(data){
-    const tier=data.tier||"active";
-    if(tierStats[tier]!==undefined)tierStats[tier]++;
-    if(data.penalties_prevented)totalPenalties+=data.penalties_prevented;
-    updateMetrics();
-    showToast("Tier: "+(data.tier_badge||tier.toUpperCase())+(data.penalties_prevented?" | Penalties blocked: "+data.penalties_prevented:""),"info");
+  const tier=data.tier||"active";
+  if(tierStats[tier]!==undefined)tierStats[tier]++;
+  if(data.penalties_prevented)totalPenalties+=data.penalties_prevented;
+  updateMetrics();
 });
 
 socket.on("decline_strategy",function(data){
-    if(data.failure_code){
-        declineStrategies[data.failure_code]={strategy:data.strategy,tier:data.tier};
-        renderDeclineStrategies();
-    }
+  if(data.failure_code){
+    declineStrategies[data.failure_code]={strategy:data.strategy,tier:data.tier};
+    renderDeclineStrategies();
+  }
 });
 
 socket.on("agent_event",function(data){
-    const idx=paymentsData.findIndex(p=>p.payment_id===data.payment_id);
-    if(data.event==="progress"||data.event==="complete"){
-        const p={payment_id:data.payment_id,amount:data.amount||0,status:data.status||"recovering",last_action:data.last_action,last_detail:data.last_detail,attempts:data.attempts||0,trail:data.trail||[],recovery_tier:data.recovery_tier||"active",decline_strategy:data.decline_strategy||"",penalties_prevented:data.penalties_prevented||0};
-        if(idx>=0)paymentsData[idx]={...paymentsData[idx],...p};else paymentsData.unshift(p);
-        renderPayments();updateMetrics();
-    }
-    if(idx>=0&&paymentsData[idx].trail)renderTrail(paymentsData[idx].trail);
-    else if(data.msg){
-        const existing=document.getElementById("trail");
-        if(existing.querySelector(".empty"))existing.innerHTML="";
-        existing.innerHTML+=`<div class="trail-item t-${data.event}"><div class="trail-time">${data.ts}</div><div class="trail-msg">${data.msg}</div>${data.detail?'<div class="trail-detail">'+data.detail+'</div>':''}</div>`;
-        existing.scrollTop=existing.scrollHeight;
-    }
-    if(data.event==="waiting_for_customer")showToast(`[${data.payment_id.slice(0,10)}] Waiting for customer response`,"info");
-    if(data.event==="complete")showToast(`[${data.payment_id.slice(0,10)}] ${data.status}`,data.status==="recovered"?"success":"info");
+  const idx=paymentsData.findIndex(p=>p.payment_id===data.payment_id);
+  if(data.event==="progress"||data.event==="complete"){
+    const p={payment_id:data.payment_id,amount:data.amount||0,status:data.status||"recovering",last_action:data.last_action,last_detail:data.last_detail,attempts:data.attempts||0,trail:data.trail||[],recovery_tier:data.recovery_tier||"active",decline_strategy:data.decline_strategy||"",penalties_prevented:data.penalties_prevented||0};
+    if(idx>=0)paymentsData[idx]={...paymentsData[idx],...p};else paymentsData.unshift(p);
+    renderPayments();updateMetrics();
+  }
+  if(idx>=0&&paymentsData[idx].trail)renderTrail(paymentsData[idx].trail);
+  else if(data.msg){
+    ["trail","trail-full"].forEach(id=>{
+      const existing=document.getElementById(id);
+      if(!existing)return;
+      if(existing.querySelector(".empty"))existing.innerHTML="";
+      existing.innerHTML+=`<div class="trail-item t-${data.event}"><div class="trail-time">${data.ts}</div><div class="trail-msg">${data.msg}</div>${data.detail?'<div class="trail-detail">'+data.detail+'</div>':''}</div>`;
+      existing.scrollTop=existing.scrollHeight;
+    });
+  }
+  if(data.event==="waiting_for_customer")showToast(`[${data.payment_id.slice(0,10)}] Waiting for customer response`,"info");
+  if(data.event==="complete")showToast(`[${data.payment_id.slice(0,10)}] ${data.status}`,data.status==="recovered"?"success":"info");
 });
 </script></body></html>"""
 
@@ -1115,7 +1465,7 @@ def graph_page():
 def simulate_scenario(scenario: str):
     import random
     payment_id = f"pay_sim_{random.randint(1000, 9999)}"
-    customer = {}
+    customer = {"email": "customer@example.com", "contact": "+919876543210", "name": "Simulated User"}
 
     scenarios = {
         "degradation": (4999.0, "Gateway timeout during payment processing", "degradation", "gateway_timeout", "gateway", "payment_authorization"),
@@ -1140,7 +1490,7 @@ def simulate_scenario(scenario: str):
         })
 
     amount, reason, stype, fail_code, err_source, err_step = scenarios[scenario]
-    payments[payment_id] = {
+    store.save_payment(payment_id, {
         "payment_id": payment_id,
         "amount": amount,
         "status": "recovering",
@@ -1151,7 +1501,7 @@ def simulate_scenario(scenario: str):
         "recovery_tier": "silent",
         "decline_strategy": "",
         "penalties_prevented": 0,
-    }
+    })
 
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, reason, customer, stype, fail_code, err_source, err_step)
     return jsonify({"status": "simulating", "scenario": scenario, "payment_id": payment_id, "amount": amount, "reason": reason})
@@ -1164,10 +1514,10 @@ def create_order():
     if razorpay_client.is_configured:
         order = razorpay_client.create_order(amount=amount, notes={"payment_id": payment_id})
         if "error" not in order:
-            payments[payment_id] = {"payment_id": payment_id, "amount": amount, "status": "pending", "order_id": order["id"], "attempts": 0, "last_action": "", "last_detail": "", "trail": []}
+            store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "pending", "order_id": order["id"], "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
             return jsonify({"order_id": order["id"], "amount": order["amount"], "currency": order["currency"], "key_id": razorpay_client.key_id})
     order_id = f"order_sim_{payment_id}"
-    payments[payment_id] = {"payment_id": payment_id, "amount": amount, "status": "pending", "order_id": order_id, "attempts": 0, "last_action": "", "last_detail": "", "trail": []}
+    store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "pending", "order_id": order_id, "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
     return jsonify({"order_id": order_id, "amount": int(amount * 100), "currency": "INR", "key_id": razorpay_client.key_id or "rzp_test_demo"})
 
 @app.route("/api/payment-failed", methods=["POST"])
@@ -1180,9 +1530,13 @@ def payment_failed():
     error_source = data.get("error_source", "")
     error_step = data.get("error_step", "")
     customer = data.get("customer", {})
-    if payment_id not in payments:
-        payments[payment_id] = {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": []}
-    payments[payment_id]["status"] = "recovering"
+    # --- Idempotency: skip if already recovering ---
+    if store.has_payment(payment_id):
+        if store.get_payment(payment_id).get("status") == "recovering":
+            return jsonify({"status": "already_recovering", "payment_id": payment_id})
+    if not store.has_payment(payment_id):
+        store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
+    store.update_payment(payment_id, status="recovering")
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)
     return jsonify({"status": "recovery_started"})
 
@@ -1192,23 +1546,61 @@ def customer_responded():
     payment_id = data.get("payment_id", "")
     updated_expiry = data.get("updated_expiry", "08/29")
 
-    if payment_id in pending_actions:
-        del pending_actions[payment_id]
+    if store.has_pending(payment_id):
+        store.remove_pending(payment_id)
 
-    if payment_id in payments:
-        payments[payment_id]["status"] = "recovered"
-        amount = payments[payment_id].get("amount", 0)
-        trail_entry = {
-            "step": "stopping",
-            "msg": f"Card Expiry Updated ({updated_expiry}) & Payment Recovered!",
-            "detail": f"Updated expiry: {updated_expiry}. Charge verified via Razorpay API Capture.",
-            "ui_morph": "RECOVERY_SUCCESS",
-            "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-        }
-        payments[payment_id].setdefault("trail", []).append(trail_entry)
-        push_event(payment_id, "stopping", trail_entry)
-        push_event(payment_id, "complete", {"status": "recovered", "attempts": 1, "amount": amount})
-        return jsonify({"status": "recovered", "payment_id": payment_id, "amount": amount})
+    if store.has_payment(payment_id):
+        p = store.get_payment(payment_id)
+        amount = p.get("amount", 0)
+        order_id = p.get("order_id", "")
+
+        # Verify real Razorpay orders before marking recovered
+        is_simulated = order_id.startswith("order_rzp_") or order_id.startswith("order_sim_")
+        order_paid = False
+
+        if order_id and not is_simulated and razorpay_client.is_configured:
+            order_data = razorpay_client.fetch_order(order_id)
+            order_status = order_data.get("status", "")
+            order_paid = order_status == "paid"
+        elif is_simulated or not razorpay_client.is_configured:
+            # Simulated or unconfigured — accept customer click as recovery
+            order_paid = True
+
+        if order_paid:
+            p["status"] = "recovered"
+            # Call observe_outcome to record the real recovery
+            pending = store.get_pending(payment_id) if store.has_pending(payment_id) else {}
+            if pending:
+                from recovery_agent.models import ActionType as AT
+                try:
+                    action_type = AT(pending.get("action", "unknown"))
+                    observe_outcome(action_type, pending.get("execution", {}), customer_responded=True)
+                except (ValueError, KeyError):
+                    pass
+            trail_entry = {
+                "step": "stopping",
+                "msg": f"Card Expiry Updated ({updated_expiry}) & Payment Recovered!",
+                "detail": f"Updated expiry: {updated_expiry}. Charge verified via Razorpay API Capture.",
+                "ui_morph": "RECOVERY_SUCCESS",
+                "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            }
+            p.setdefault("trail", []).append(trail_entry)
+            push_event(payment_id, "stopping", trail_entry)
+            push_event(payment_id, "complete", {"status": "recovered", "attempts": 1, "amount": amount})
+            store.flush()
+            return jsonify({"status": "recovered", "payment_id": payment_id, "amount": amount})
+        else:
+            trail_entry = {
+                "step": "stopping",
+                "msg": "Customer clicked complete, but Razorpay capture not found",
+                "detail": f"Order {order_id} status: {order_data.get('status', 'unknown')}. Awaiting Razorpay capture webhook.",
+                "ui_morph": "AWAITING_CAPTURE",
+                "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            }
+            p.setdefault("trail", []).append(trail_entry)
+            push_event(payment_id, "stopping", trail_entry)
+            store.flush()
+            return jsonify({"status": "recovering", "payment_id": payment_id, "detail": "Order not yet paid"})
 
     return jsonify({"status": "no_pending_action"})
 
@@ -1238,8 +1630,13 @@ def webhook_forward():
         notes = payment_entity.get("notes", {})
         customer_id = notes.get("customer_id", payment_entity.get("customer_id", f"cust_{payment_id}"))
 
-        if payment_id not in payments:
-            payments[payment_id] = {
+        # --- Idempotency: skip if already recovering ---
+        if store.has_payment(payment_id):
+            if store.get_payment(payment_id).get("status") == "recovering":
+                return jsonify({"status": "already_recovering", "payment_id": payment_id})
+
+        if not store.has_payment(payment_id):
+            store.save_payment(payment_id, {
                 "payment_id": payment_id,
                 "amount": amount,
                 "status": "recovering",
@@ -1247,8 +1644,8 @@ def webhook_forward():
                 "last_action": "",
                 "last_detail": "",
                 "trail": [],
-            }
-        payments[payment_id]["status"] = "recovering"
+            })
+        store.update_payment(payment_id, status="recovering")
 
         socketio.start_background_task(
             run_agent_for_payment,
@@ -1261,6 +1658,7 @@ def webhook_forward():
             payment_entity.get("error_source", ""),
             error_step,
         )
+        store.flush()
 
         return jsonify({"status": "recovery_started", "payment_id": payment_id})
 
@@ -1269,18 +1667,18 @@ def webhook_forward():
         payment_id = payment_entity.get("id", "")
         amount = payment_entity.get("amount", 0) / 100
 
-        if payment_id in pending_actions:
-            del pending_actions[payment_id]
+        if store.has_pending(payment_id):
+            store.remove_pending(payment_id)
 
-        if payment_id in payments:
-            payments[payment_id]["status"] = "recovered"
-            payments[payment_id]["recovered_amount"] = amount
+        if store.has_payment(payment_id):
+            store.update_payment(payment_id, status="recovered", recovered_amount=amount)
 
         push_event(payment_id, "webhook_captured", {
             "status": "recovered",
             "amount": amount,
             "payment_id": payment_id,
         })
+        store.flush()
 
         return jsonify({"status": "captured", "payment_id": payment_id})
 
@@ -1305,17 +1703,18 @@ def daemon_retry_complete():
     print(f"[frontend] Daemon retry complete: job={job_id} payment={payment_id} status={result.get('status')}")
 
     # Update payment state
-    if payment_id in payments:
-        payments[payment_id]["last_action"] = action
-        payments[payment_id]["last_detail"] = result.get("message", "")
+    if store.has_payment(payment_id):
+        p = store.get_payment(payment_id)
+        p["last_action"] = action
+        p["last_detail"] = result.get("message", "")
 
         # If retry created an order, store it
         if result.get("order_id"):
-            payments[payment_id]["order_id"] = result["order_id"]
+            p["order_id"] = result["order_id"]
 
         # If link created, store it
         if result.get("link_url"):
-            payments[payment_id]["payment_link"] = result["link_url"]
+            p["payment_link"] = result["link_url"]
 
     # Broadcast to WebSocket
     push_event(payment_id, "daemon_retry_executed", {
@@ -1327,13 +1726,14 @@ def daemon_retry_complete():
         "link_url": result.get("link_url", ""),
         "source": source,
     })
+    store.flush()
 
     return jsonify({"status": "received", "payment_id": payment_id})
 
 
 @app.route("/api/payments")
 def api_payments():
-    p_list = list(payments.values())
+    p_list = store.payment_values()
     total_at_risk = sum(p.get("amount", 0) for p in p_list)
     total_recovered = sum(p.get("amount", 0) for p in p_list if p.get("status") == "recovered")
     rec_count = sum(1 for p in p_list if p.get("status") == "recovered")
@@ -1362,7 +1762,7 @@ def run_benchmark():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "payments": len(payments)})
+    return jsonify({"status": "ok", "payments": len(store.all_payments())})
 
 def main():
     port = int(os.getenv("FRONTEND_PORT", "5002"))

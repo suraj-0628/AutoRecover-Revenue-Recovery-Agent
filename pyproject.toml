@@ -12,6 +12,9 @@ dependencies = [
     "razorpay>=2.0",
     "flask>=3.0",
     "networkx>=3.0",
+    "arize-phoenix>=4.0",
+    "openinference-instrumentation-langchain>=0.1.0",
+    "openinference-instrumentation-llama-index>=0.1.0",
 ]
 
 [project.optional-dependencies]
