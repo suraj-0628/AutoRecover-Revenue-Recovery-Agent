@@ -963,315 +963,339 @@ function applyGenerativeUISpec(spec){
 
 # ─── Merchant Dashboard ───────────────────────────────────────
 MERCHANT_PAGE = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Razorpay AutoRecover — Agent Studio</title>
+<title>Revenue Recovery — Agent Studio</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
 <style>
+:root{
+  --bg-canvas:#FFFFFF;--bg-surface:#F7F8FA;--bg-card:#FFFFFF;
+  --border-subtle:#E5E7EB;--border-hover:#D1D5DB;
+  --text-primary:#1A1A2E;--text-secondary:#6B7280;--text-muted:#9CA3AF;
+  --brand-blue:#2563EB;--brand-blue-light:#EFF6FF;
+  --success:#16A34A;--success-light:#F0FDF4;--success-border:#BBF7D0;
+  --error:#DC2626;--error-light:#FEF2F2;--error-border:#FECACA;
+  --warning:#F59E0B;--warning-light:#FFFBEB;--warning-border:#FDE68A;
+  --accent-teal:#0EA5E9;
+  --sidebar-bg:#F7F8FA;--sidebar-active:#EFF6FF;--sidebar-active-text:#2563EB;
+  --card-shadow:0 1px 3px rgba(0,0,0,0.04),0 1px 2px rgba(0,0,0,0.02);
+  --card-shadow-hover:0 4px 12px rgba(0,0,0,0.06);
+}
+[data-theme="dark"]{
+  --bg-canvas:#020617;--bg-surface:#0F172A;--bg-card:rgba(15,23,42,0.7);
+  --border-subtle:rgba(255,255,255,0.06);--border-hover:rgba(255,255,255,0.1);
+  --text-primary:#F8FAFC;--text-secondary:#94A3B8;--text-muted:#475569;
+  --brand-blue:#3B82F6;--brand-blue-light:rgba(59,130,246,0.1);
+  --success:#10B981;--success-light:rgba(16,185,129,0.1);--success-border:rgba(16,185,129,0.2);
+  --error:#EF4444;--error-light:rgba(239,68,68,0.1);--error-border:rgba(239,68,68,0.2);
+  --warning:#F59E0B;--warning-light:rgba(245,158,11,0.1);--warning-border:rgba(245,158,11,0.2);
+  --sidebar-bg:#0F172A;--sidebar-active:rgba(59,130,246,0.1);--sidebar-active-text:#60A5FA;
+  --card-shadow:0 1px 3px rgba(0,0,0,0.2);--card-shadow-hover:0 4px 12px rgba(0,0,0,0.3);
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fff;color:#1a1a2e;display:flex;min-height:100vh;-webkit-font-smoothing:antialiased}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg-canvas);color:var(--text-primary);letter-spacing:-0.011em;min-height:100vh;display:flex;transition:background .3s,color .3s}
 
-/* ── Top Navigation Bar (Razorpay style) ── */
-.topnav{position:fixed;top:0;left:0;right:0;height:56px;background:#1b2135;display:flex;align-items:center;padding:0 24px;z-index:100;gap:28px}
-.topnav-logo{display:flex;align-items:center;gap:8px;color:#fff;font-weight:700;font-size:15px;letter-spacing:-0.01em;text-decoration:none}
-.topnav-logo svg{width:24px;height:24px}
-.topnav-links{display:flex;gap:4px;margin-left:12px}
-.topnav-link{color:#8b93a7;font-size:13px;font-weight:500;padding:6px 14px;border-radius:6px;text-decoration:none;transition:all .15s}
-.topnav-link:hover{color:#fff;background:rgba(255,255,255,0.08)}
-.topnav-link.active{color:#fff;background:rgba(59,130,246,0.2);font-weight:600}
-.topnav-right{margin-left:auto;display:flex;align-items:center;gap:12px}
-.topnav-search{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:7px 14px 7px 34px;font-size:13px;color:#fff;width:240px;outline:none;transition:border-color .15s}
-.topnav-search::placeholder{color:#8b93a7}
-.topnav-search:focus{border-color:rgba(59,130,246,0.5)}
+/* Sidebar */
+.sidebar{width:220px;background:var(--sidebar-bg);border-right:1px solid var(--border-subtle);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:50;transition:background .3s}
+.sidebar-logo{padding:20px 20px 16px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:10px}
+.sidebar-logo-icon{width:32px;height:32px;background:var(--brand-blue);border-radius:6px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px;font-weight:700}
+.sidebar-logo-text{font-size:14px;color:var(--text-primary)}
+.sidebar-logo-sub{font-size:10px;color:var(--text-muted);font-weight:400;margin-top:1px}
+.sidebar-nav{flex:1;padding:12px 8px;overflow-y:auto}
+.nav-section{font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;padding:8px 12px 4px;margin-top:8px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;font-size:13px;font-weight:500;color:var(--text-secondary);text-decoration:none;transition:all .15s;cursor:pointer;border-bottom:2px solid transparent}
+.nav-item:hover{background:var(--brand-blue-light);color:var(--text-primary);border-bottom-color:var(--brand-blue)}
+.nav-item.active{background:var(--sidebar-active);color:var(--sidebar-active-text);font-weight:600}
+.nav-item .nav-icon{width:18px;text-align:center;font-size:14px;flex-shrink:0}
+.nav-badge{font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600;background:var(--brand-blue);color:#fff;margin-left:auto}
+.sidebar-footer{padding:12px 16px;border-top:1px solid var(--border-subtle);font-size:11px;color:var(--text-muted)}
+
+/* Main Area */
+.main{margin-left:220px;flex:1;display:flex;flex-direction:column;min-height:100vh;position:relative}
+.main::before{content:'';position:fixed;top:0;left:220px;right:0;bottom:0;background:radial-gradient(circle at 20% 50%,rgba(59,130,246,0.03) 0%,transparent 50%),radial-gradient(circle at 80% 20%,rgba(16,185,129,0.03) 0%,transparent 50%);pointer-events:none;z-index:0}
+.topbar{height:56px;background:var(--bg-canvas);border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center;padding:0 28px;position:sticky;top:0;z-index:40;transition:background .3s}
+.topbar-left{display:flex;align-items:center;gap:16px}
+.breadcrumb{font-size:13px;color:var(--text-secondary)}
+.breadcrumb span{color:var(--text-primary);font-weight:600}
+.topbar-right{display:flex;align-items:center;gap:12px}
+.topbar-search{background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:8px;padding:7px 14px 7px 32px;font-size:13px;color:var(--text-primary);width:220px;outline:none;transition:border-color .15s}
+.topbar-search:focus{border-color:var(--brand-blue)}
 .search-wrap{position:relative}
-.search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#8b93a7;font-size:14px}
-.topnav-avatar{width:32px;height:32px;border-radius:50%;background:#3b82f6;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;font-weight:600}
+.search-wrap::before{content:"\\1F50D";position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:12px;z-index:1}
+.theme-toggle{width:36px;height:36px;border-radius:8px;border:1px solid var(--border-subtle);background:var(--bg-surface);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .15s}
+.theme-toggle:hover{border-color:var(--brand-blue);background:var(--brand-blue-light)}
 
-/* ── Left Sidebar ── */
-.sidebar{position:fixed;top:56px;left:0;bottom:0;width:240px;background:#f7f8fa;border-right:1px solid #e5e7eb;overflow-y:auto;z-index:50}
-.sidebar-section{padding:20px 16px 6px;font-size:10px;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:0.08em}
-.sidebar-item{display:flex;align-items:center;gap:10px;padding:8px 16px;margin:1px 8px;border-radius:6px;font-size:13px;font-weight:500;color:#4b5563;cursor:pointer;text-decoration:none;transition:all .12s}
-.sidebar-item:hover{background:#eef2ff;color:#1a1a2e}
-.sidebar-item.active{background:#eef2ff;color:#2563eb;font-weight:600}
-.sidebar-item .icon{width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0}
-.sidebar-badge{margin-left:auto;font-size:9px;padding:2px 7px;border-radius:10px;font-weight:600}
-.sidebar-badge.beta{background:#dbeafe;color:#2563eb}
-.sidebar-badge.live{background:#dcfce7;color:#16a34a}
-.sidebar-more{padding:8px 16px;margin:1px 8px;font-size:12px;color:#9ca3af;cursor:pointer}
-.sidebar-more:hover{color:#4b5563}
-
-/* ── Main Content Area ── */
-.main{margin-left:240px;margin-top:56px;flex:1;min-height:calc(100vh - 56px)}
-.content{max-width:960px;padding:32px 40px}
-
-/* ── Breadcrumb ── */
-.breadcrumb{font-size:13px;color:#9ca3af;margin-bottom:24px}
-.breadcrumb a{color:#9ca3af;text-decoration:none}
-.breadcrumb a:hover{color:#4b5563}
-.breadcrumb span{color:#1a1a2e;font-weight:500}
-
-/* ── Agent Hero Card ── */
-.agent-hero{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}
+/* Content */
+.content{padding:24px 28px;flex:1}
+.agent-hero{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:14px;padding:24px;margin-bottom:24px;box-shadow:var(--card-shadow);display:flex;justify-content:space-between;align-items:center;transition:all .2s}
+.agent-hero:hover{box-shadow:var(--card-shadow-hover)}
 .agent-identity{display:flex;align-items:center;gap:14px}
-.agent-avatar{width:48px;height:48px;background:linear-gradient(135deg,#6366f1,#4f46e5);border-radius:12px;display:flex;align-items:center;justify-content:center;position:relative}
-.agent-avatar img,.agent-avatar svg{width:28px;height:28px}
-.agent-avatar .edit-dot{position:absolute;bottom:-2px;right:-2px;width:16px;height:16px;background:#2563eb;border:2px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:8px;color:#fff}
-.agent-name{font-size:20px;font-weight:700;color:#1a1a2e;letter-spacing:-0.02em}
-.agent-health{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:500;color:#16a34a;margin-top:4px}
-.agent-health .dot{width:6px;height:6px;background:#16a34a;border-radius:50%;animation:pulse 2s infinite}
-.agent-actions{display:flex;gap:8px}
-.btn-disable{padding:8px 18px;border:1px solid #e5e7eb;border-radius:8px;background:#fff;font-size:13px;font-weight:500;color:#4b5563;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .15s}
-.btn-disable:hover{border-color:#d1d5db;background:#f9fafb}
-.btn-open-store{padding:8px 18px;border:none;border-radius:8px;background:#2563eb;font-size:13px;font-weight:500;color:#fff;cursor:pointer;text-decoration:none;transition:all .15s}
-.btn-open-store:hover{background:#1d4ed8}
+.agent-icon{width:44px;height:44px;background:var(--brand-blue);border-radius:12px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px}
+.agent-name{font-size:18px;font-weight:700;color:var(--text-primary)}
+.agent-subtitle{font-size:13px;color:var(--text-secondary);margin-top:2px}
+.health-badge{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--success);padding:6px 14px;border-radius:20px;background:var(--success-light);border:1px solid var(--success-border)}
+.health-dot{width:7px;height:7px;background:var(--success);border-radius:50%;animation:blink 1.5s infinite}
+.scenario-triggers{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.scenario-triggers button{padding:6px 14px;border-radius:8px;font-size:12px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit}
+.scenario-trigger{background:transparent;border:1px solid var(--border-subtle);color:var(--text-secondary)}
+.scenario-trigger:hover{border-color:var(--brand-blue);color:var(--brand-blue);background:var(--brand-blue-light)}
+.scenario-trigger:active{transform:scale(0.97)}
+.scenario-batch{background:var(--brand-blue);border:1px solid var(--brand-blue);color:#fff}
+.scenario-batch:hover{background:#1d4ed8}
 
-/* ── Tabs ── */
-.tabs{display:flex;gap:0;border-bottom:1px solid #e5e7eb;margin-bottom:0}
-.tab{padding:12px 20px;font-size:14px;font-weight:500;color:#9ca3af;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .12s}
-.tab:hover{color:#4b5563}
-.tab.active{color:#1a1a2e;border-bottom-color:#1a1a2e;font-weight:600}
+/* Tabs */
+.tabs{display:flex;gap:0;border-bottom:2px solid var(--border-subtle);margin-bottom:24px}
+.tab{padding:10px 20px;font-size:13px;font-weight:500;color:var(--text-secondary);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s}
+.tab:hover{color:var(--text-primary)}
+.tab.active{color:var(--brand-blue);border-bottom-color:var(--brand-blue);font-weight:600}
 
-/* ── Activity Feed ── */
-.activity-feed{padding-top:8px}
-.activity-item{display:flex;gap:14px;padding:18px 4px;border-bottom:1px solid #f3f4f6;transition:background .1s;cursor:pointer}
-.activity-item:hover{background:#fafbfc}
-.activity-item:last-child{border-bottom:none}
-.activity-dot{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px;font-size:11px}
-.activity-dot.recovering{background:#dbeafe;color:#2563eb}
-.activity-dot.recovered{background:#dcfce7;color:#16a34a}
-.activity-dot.failed{background:#fee2e2;color:#dc2626}
-.activity-dot.processing{background:#e0e7ff;color:#4f46e5;animation:pulse 1.5s infinite}
+/* Metrics Row */
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
+.metric{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:12px;padding:20px 16px;box-shadow:var(--card-shadow);transition:all .2s}
+.metric:hover{box-shadow:var(--card-shadow-hover);border-color:var(--border-hover)}
+.metric-value{font-size:2em;font-weight:700;color:var(--brand-blue);letter-spacing:-0.02em;line-height:1}
+.metric-value.sv{color:var(--success)}.metric-value.wv{color:var(--warning)}.metric-value.rv{color:var(--error)}
+.metric-label{color:var(--text-muted);font-size:11px;margin-top:4px;font-weight:500;text-transform:uppercase;letter-spacing:0.04em}
+.metric:nth-child(1){border-left:3px solid var(--brand-blue)}
+.metric:nth-child(2){border-left:3px solid var(--success)}
+.metric:nth-child(3){border-left:3px solid var(--error)}
+.metric:nth-child(4){border-left:3px solid var(--warning)}
+
+/* Grid layouts */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
+
+/* Card */
+.card{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:14px;padding:20px;box-shadow:var(--card-shadow);transition:all .2s}
+.card:hover{box-shadow:var(--card-shadow-hover)}
+.card h2{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:14px;font-weight:600}
+
+/* Activity Feed */
+.activity-feed{max-height:600px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border-subtle) transparent;scroll-behavior:smooth}
+.activity-item{display:flex;gap:12px;padding:14px 8px;border-bottom:1px solid var(--border-subtle);font-size:13px;transition:all .2s;cursor:pointer;position:relative}
+.activity-item::before{content:'';position:absolute;left:24px;top:46px;bottom:-1px;width:2px;background:var(--border-subtle)}
+.activity-item:last-child::before{display:none}
+.activity-item:hover{background:var(--bg-surface)}
+.activity-icon{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+.activity-icon.recovering{background:var(--warning-light);color:var(--warning)}
+.activity-icon.recovered{background:var(--success-light);color:var(--success)}
+.activity-icon.failed{background:var(--error-light);color:var(--error)}
+.activity-icon.escalated{background:var(--brand-blue-light);color:var(--brand-blue)}
+.activity-icon.scheduled{background:var(--brand-blue-light);color:var(--brand-blue)}
 .activity-body{flex:1;min-width:0}
-.activity-title{font-size:14px;font-weight:500;color:#1a1a2e;line-height:1.4}
-.activity-title .amount{font-weight:600}
-.activity-time{font-size:12px;color:#9ca3af;margin-top:3px}
-.activity-live{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:11px;font-weight:600;color:#16a34a;flex-shrink:0;align-self:flex-start;padding-top:4px}
-.activity-live .dot{width:6px;height:6px;background:#16a34a;border-radius:50%;animation:pulse 1.5s infinite}
+.activity-title{font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px}
+.activity-title .live{color:var(--success);font-size:10px;font-weight:600}
+.activity-meta{color:var(--text-secondary);font-size:12px;margin-top:3px;display:flex;gap:12px;align-items:center}
+.activity-amount{font-weight:600;color:var(--text-primary)}
 
-/* ── Scenario Buttons ── */
-.scenarios{display:flex;gap:8px;flex-wrap:wrap;padding:16px 0;border-bottom:1px solid #f3f4f6}
-.scenario-btn{padding:6px 14px;border:1px solid #e5e7eb;border-radius:6px;background:#fff;font-size:12px;font-weight:500;color:#4b5563;cursor:pointer;transition:all .12s}
-.scenario-btn:hover{border-color:#2563eb;color:#2563eb;background:#eff6ff}
-.scenario-btn.batch{background:#1a1a2e;color:#fff;border-color:#1a1a2e}
-.scenario-btn.batch:hover{background:#2d2d4e}
+/* Table */
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border-subtle);font-size:12px}
+th{color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600}
+tr{transition:background .15s}
+tr:hover{background:var(--bg-surface)}
 
-/* ── Metrics Bar ── */
-.metrics-bar{display:flex;gap:24px;padding:16px 0;border-bottom:1px solid #f3f4f6}
-.metric-item{display:flex;flex-direction:column}
-.metric-val{font-size:20px;font-weight:700;letter-spacing:-0.02em}
-.metric-val.blue{color:#2563eb}
-.metric-val.green{color:#16a34a}
-.metric-val.red{color:#dc2626}
-.metric-val.amber{color:#d97706}
-.metric-lbl{font-size:11px;color:#9ca3af;margin-top:2px;font-weight:500}
+/* Badges */
+.badge{display:inline-block;padding:3px 10px;border-radius:8px;font-size:10px;font-weight:600;letter-spacing:0.02em}
+.bs{background:var(--success-light);color:var(--success);border:1px solid var(--success-border)}
+.bf{background:var(--error-light);color:var(--error);border:1px solid var(--error-border)}
+.bp{background:var(--brand-blue-light);color:var(--brand-blue);border:1px solid rgba(59,130,246,0.2)}
+.bw{background:var(--warning-light);color:var(--warning);border:1px solid var(--warning-border)}
+.btier-silent{background:var(--brand-blue-light);color:var(--brand-blue);border:1px solid rgba(59,130,246,0.2)}
+.btier-active{background:var(--warning-light);color:var(--warning);border:1px solid var(--warning-border)}
+.btier-hard{background:var(--error-light);color:var(--error);border:1px solid var(--error-border)}
 
-/* ── Drawer (Case Detail) ── */
-.drawer-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.2);z-index:200;opacity:0;pointer-events:none;transition:opacity .2s}
+/* Strategy items */
+.strategy-item{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border-subtle);font-size:12px}
+.strategy-code{color:var(--brand-blue);font-weight:600;min-width:60px;font-family:'SF Mono',SFMono-Regular,monospace;font-size:11px}
+.strategy-name{color:var(--text-primary);flex:1}
+.strategy-tier{font-size:10px;padding:3px 8px;border-radius:6px;font-weight:600}
+
+/* Penalty counter */
+.penalty-counter{text-align:center;padding:20px}
+.penalty-big{font-size:2.2em;font-weight:700;color:var(--success);letter-spacing:-0.02em}
+.penalty-sub{color:var(--text-muted);font-size:12px;margin-top:6px;font-weight:500}
+.penalty-usd{color:var(--brand-blue);font-size:14px;margin-top:10px;font-weight:600}
+
+/* Trail */
+.trail{max-height:500px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border-subtle) transparent}
+.trail-item{padding:12px;border-left:3px solid var(--border-subtle);margin-bottom:4px;border-radius:0 10px 10px 0;background:var(--bg-surface);font-size:12px;transition:background .15s}
+.trail-item:hover{background:var(--brand-blue-light)}
+.trail-item.t-detecting{border-left-color:var(--brand-blue)}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8B5CF6}.trail-item.t-deciding{border-left-color:var(--warning)}.trail-item.t-acting,.trail-item.t-acted{border-left-color:var(--success)}.trail-item.t-waiting{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-observed{border-left-color:#6366F1}.trail-item.t-stopping{border-left-color:var(--error)}
+.trail-time{color:var(--text-muted);font-size:10px;font-weight:500}.trail-msg{color:var(--text-primary);margin-top:3px;font-weight:500}.trail-detail{color:var(--text-secondary);margin-top:3px;font-size:11px;line-height:1.5}
+
+/* Toast */
+.toast{position:fixed;top:20px;right:20px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:12px;padding:12px 18px;font-size:12px;z-index:1000;transform:translateX(120%);transition:transform .3s cubic-bezier(.4,0,.2,1);font-weight:500;box-shadow:var(--card-shadow-hover)}
+.toast.show{transform:translateX(0)}.toast.success{border-left:3px solid var(--success)}.toast.info{border-left:3px solid var(--brand-blue)}
+
+/* Empty state */
+.empty{text-align:center;padding:40px;color:var(--text-muted);font-size:13px}
+
+/* Case detail drawer */
+.drawer-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:200;opacity:0;pointer-events:none;transition:opacity .25s}
 .drawer-overlay.open{opacity:1;pointer-events:all}
-.drawer{position:fixed;top:0;right:0;width:560px;height:100vh;background:#fff;border-left:1px solid #e5e7eb;z-index:201;transform:translateX(100%);transition:transform .25s cubic-bezier(.4,0,.2,1);overflow-y:auto;display:flex;flex-direction:column}
+.drawer{position:fixed;top:0;right:0;width:600px;height:100vh;background:var(--bg-canvas);border-left:1px solid var(--border-subtle);z-index:201;transform:translateX(100%);transition:transform .3s cubic-bezier(.4,0,.2,1);overflow-y:auto;display:flex;flex-direction:column;scroll-behavior:smooth}
 .drawer.open{transform:translateX(0)}
-.drawer-header{padding:20px 24px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center}
-.drawer-title{font-size:15px;font-weight:700;color:#1a1a2e}
-.drawer-close{width:32px;height:32px;border-radius:6px;border:1px solid #e5e7eb;background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;color:#9ca3af;transition:all .12s}
-.drawer-close:hover{background:#fee2e2;border-color:#fecaca;color:#dc2626}
-.drawer-body{padding:24px;flex:1}
+.drawer-header{padding:20px 24px;border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center}
+.drawer-title{font-size:16px;font-weight:700;color:var(--text-primary)}
+.drawer-close{width:32px;height:32px;border-radius:8px;border:1px solid var(--border-subtle);background:var(--bg-surface);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .15s}
+.drawer-close:hover{background:var(--error-light);border-color:var(--error);color:var(--error)}
+.drawer-body{padding:20px 24px;flex:1}
 .drawer-section{margin-bottom:20px}
-.drawer-section h3{font-size:11px;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px}
-.drawer-info{font-size:13px;color:#4b5563;line-height:1.7}
-.drawer-info b{color:#1a1a2e}
-.drawer-badge{display:inline-block;padding:3px 10px;border-radius:6px;font-size:10px;font-weight:600}
-.drawer-badge.green{background:#dcfce7;color:#16a34a}
-.drawer-badge.red{background:#fee2e2;color:#dc2626}
-.drawer-badge.blue{background:#dbeafe;color:#2563eb}
-.drawer-badge.amber{background:#fef3c7;color:#92400e}
-.drawer-trail{max-height:420px;overflow-y:auto}
-.drawer-trail-item{padding:10px 12px;border-left:3px solid #e5e7eb;margin-bottom:3px;font-size:12px;border-radius:0 6px 6px 0;background:#f9fafb;transition:background .1s}
-.drawer-trail-item:hover{background:#f3f4f6}
-.drawer-trail-item .time{color:#9ca3af;font-size:10px}
-.drawer-trail-item .msg{color:#1a1a2e;font-weight:500;margin-top:2px}
-.drawer-trail-item .detail{color:#6b7280;font-size:11px;margin-top:3px;line-height:1.5}
-.drawer-trail-item.t-detecting{border-left-color:#3b82f6}
-.drawer-trail-item.t-diagnosed,.drawer-trail-item.t-diagnosing{border-left-color:#8b5cf6}
-.drawer-trail-item.t-deciding{border-left-color:#f59e0b}
-.drawer-trail-item.t-acting,.drawer-trail-item.t-acted{border-left-color:#10b981}
-.drawer-trail-item.t-stopping{border-left-color:#ef4444}
-.drawer-trail-item.t-waiting{border-left-color:#f59e0b;background:#fffbeb}
+.drawer-section h3{font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:10px}
+.drawer-trail{max-height:400px;overflow-y:auto}
+.drawer-trail .trail-item{margin-bottom:6px}
 
-/* ── Footer Disclaimer ── */
-.disclaimer{text-align:center;padding:24px 0;font-size:12px;color:#9ca3af;border-top:1px solid #f3f4f6;margin-top:24px}
-
-/* ── Toast ── */
-.toast{position:fixed;top:68px;right:20px;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 18px;font-size:12px;font-weight:500;z-index:300;transform:translateX(120%);transition:transform .25s;box-shadow:0 4px 12px rgba(0,0,0,0.08)}
-.toast.show{transform:translateX(0)}
-.toast.success{border-left:3px solid #16a34a}
-.toast.info{border-left:3px solid #2563eb}
-
-/* ── Hidden metric containers (keep IDs alive for JS) ── */
-.hidden-metrics{display:none}
-
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 </style>
 </head>
 <body>
 
-<!-- ═══ Top Navigation Bar ═══ -->
-<nav class="topnav">
-  <a class="topnav-logo" href="/merchant">
-    <svg viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="4" fill="#2563eb"/><path d="M7 8h10M7 12h6M7 16h8" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
-    Razorpay
-  </a>
-  <div class="topnav-links">
-    <a class="topnav-link" href="#">Ray AI</a>
-    <a class="topnav-link active" href="/merchant">Payments</a>
-    <a class="topnav-link" href="#">Banking+</a>
-    <a class="topnav-link" href="#">Payroll</a>
-    <a class="topnav-link" href="#">More</a>
-  </div>
-  <div class="topnav-right">
-    <div class="search-wrap">
-      <span class="search-icon">&#x1F50D;</span>
-      <input class="topnav-search" placeholder="Search in payments" />
-    </div>
-    <div class="topnav-avatar">AB</div>
-  </div>
-</nav>
-
-<!-- ═══ Left Sidebar ═══ -->
+<!-- Sidebar Navigation -->
 <aside class="sidebar">
-  <div class="sidebar-section">Main</div>
-  <a class="sidebar-item" href="/merchant"><span class="icon">&#x1F3E0;</span> Home</a>
-  <a class="sidebar-item" href="#"><span class="icon">&#x1F4B3;</span> Transactions</a>
-  <a class="sidebar-item" href="#"><span class="icon">&#x1F4B0;</span> Settlements</a>
-  <a class="sidebar-item" href="#"><span class="icon">&#x1F504;</span> Reconciliation</a>
-  <a class="sidebar-item" href="#"><span class="icon">&#x1F4CA;</span> Reports</a>
-  <a class="sidebar-item active" href="/merchant"><span class="icon">&#x1F916;</span> Agent Studio <span class="sidebar-badge beta">Beta</span></a>
-
-  <div class="sidebar-section">Payment Products</div>
-  <a class="sidebar-item" href="/pay" target="_blank"><span class="icon">&#x1F6D2;</span> Payment Links</a>
-  <a class="sidebar-item" href="#"><span class="icon">&#x1F4C4;</span> Payment Pages</a>
-  <a class="sidebar-item" href="#"><span class="icon">&#x1F517;</span> Razorpay.me Link</a>
-  <div class="sidebar-more">+12 More &#x25BE;</div>
-
-  <div class="sidebar-section">Banking Products</div>
-  <a class="sidebar-item" href="#"><span class="icon">&#x2573;</span> X Banking</a>
-
-  <div class="sidebar-section">Loyalty Products</div>
-  <a class="sidebar-item" href="#"><span class="icon">&#x1F4B3;</span> Wallet</a>
-  <a class="sidebar-item" href="#"><span class="icon">&#x1F381;</span> Gift Cards</a>
-
-  <div class="sidebar-section">Account</div>
-  <a class="sidebar-item" href="#"><span class="icon">&#x2699;</span> Account &amp; Settings</a>
+  <div class="sidebar-logo">
+    <div class="sidebar-logo-icon">R</div>
+    <div>
+      <div class="sidebar-logo-text">AutoRecover</div>
+      <div class="sidebar-logo-sub">Agent Studio</div>
+    </div>
+  </div>
+  <nav class="sidebar-nav">
+    <div class="nav-section">Payment Products</div>
+    <a class="nav-item" href="/merchant"><span class="nav-icon">&#9673;</span> Dashboard<span class="nav-badge">Live</span></a>
+    <a class="nav-item" href="/pay" target="_blank"><span class="nav-icon">&#9671;</span> Store</a>
+    <a class="nav-item" href="/graph" target="_blank"><span class="nav-icon">&#10230;</span> Agent Flow</a>
+    <div class="nav-section">Agent Studio</div>
+    <a class="nav-item active" href="/merchant"><span class="nav-icon" style="width:18px;height:18px;background:var(--brand-blue);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-size:10px">&#10003;</span> Recovery Agent<span class="nav-badge" style="background:var(--success)">Active</span></a>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">&#8801;</span> Transactions</a>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">$</span> Settlements</a>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">&#128279;</span> Payment Links</a>
+    <div class="nav-section">Settings</div>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">&#9881;</span> Configuration</a>
+    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">&#8984;</span> API Keys</a>
+  </nav>
+  <div class="sidebar-footer">AutoRecover v2.0 — Buildathon</div>
 </aside>
 
-<!-- ═══ Main Content ═══ -->
+<!-- Main Content -->
 <div class="main">
-<div class="content">
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="breadcrumb">Agent Studio / <span>Recovery Agent</span></div>
+    </div>
+    <div class="topbar-right">
+      <div class="search-wrap"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:12px;color:var(--text-muted);z-index:1">&#128269;</span><input class="topbar-search" placeholder="Search payments..." /></div>
+      <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">🌓</button>
+      <a href="/pay" target="_blank" style="text-decoration:none"><button style="padding:7px 16px;border-radius:8px;border:1px solid var(--brand-blue);background:var(--brand-blue);color:#fff;font-size:12px;font-weight:600;cursor:pointer">Open Store</button></a>
+    </div>
+  </header>
 
-  <!-- Breadcrumb -->
-  <div class="breadcrumb"><a href="/merchant">My Agents</a> / <span>Payment Recovery Agent</span></div>
-
-  <!-- Agent Hero -->
-  <div class="agent-hero">
-    <div class="agent-identity">
-      <div class="agent-avatar">
-        <svg viewBox="0 0 28 28" fill="none"><circle cx="14" cy="10" r="5" stroke="#fff" stroke-width="2"/><path d="M6 24c0-4.4 3.6-8 8-8s8 3.6 8 8" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
-        <span class="edit-dot">&#x270E;</span>
+  <div class="content">
+    <!-- Agent Hero Card -->
+    <div class="agent-hero">
+      <div class="agent-identity">
+        <div class="agent-icon">🤖</div>
+        <div>
+          <div class="agent-name">Payment Recovery Agent</div>
+          <div class="agent-subtitle">Recovering failed payments with AI-powered multi-turn reasoning</div>
+        </div>
       </div>
-      <div>
-        <div class="agent-name">Payment Recovery Agent</div>
-        <div class="agent-health"><span class="dot"></span> Healthy</div>
+      <div class="health-badge"><span class="health-dot"></span> Healthy &amp; Active</div>
+    </div>
+    <div class="scenario-triggers">
+      <button class="scenario-trigger" onclick="simulateScenario('degradation')">504 Degradation</button>
+      <button class="scenario-trigger" onclick="simulateScenario('abandonment')">Cart Abandonment</button>
+      <button class="scenario-trigger" onclick="simulateScenario('card_expiry')">Expired Card</button>
+      <button class="scenario-trigger" onclick="simulateScenario('bank_decline')">Bank Decline</button>
+      <button class="scenario-trigger" onclick="simulateScenario('voice_call')">Voice Call</button>
+      <button class="scenario-trigger scenario-batch" onclick="simulateScenario('batch')">Run 30-Case Batch</button>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <div class="tab active" onclick="showTab('activity')">Activity</div>
+      <div class="tab" onclick="showTab('settings')">Settings</div>
+    </div>
+
+    <!-- Tab: Activity -->
+    <div id="tab-activity">
+      <!-- Metrics -->
+      <div class="metrics">
+        <div class="metric"><div class="metric-value" id="m-total">0</div><div class="metric-label">Total Payments</div></div>
+        <div class="metric"><div class="metric-value sv" id="m-recovered">0</div><div class="metric-label">Recovered</div></div>
+        <div class="metric"><div class="metric-value rv" id="m-failed">0</div><div class="metric-label">Failed</div></div>
+        <div class="metric"><div class="metric-value" id="m-rate">0%</div><div class="metric-label">Recovery Rate</div></div>
+      </div>
+      <!-- Hidden metrics (kept for JS updateMetrics) -->
+      <div style="display:none"><div id="m-waiting">0</div><div id="m-penalties">0</div><div id="m-saved">$0.00</div></div>
+
+      <!-- Activity + Sidebar Cards -->
+      <div class="grid">
+        <!-- Activity Feed (left) -->
+        <div class="card">
+          <h2>Activity Feed <span class="live"><span class="health-dot"></span> Live</span></h2>
+          <div class="activity-feed" id="payments">
+            <div class="empty" id="empty-msg">No payments yet. Open the <a href="/pay" target="_blank" style="color:var(--brand-blue)">store</a> to start recovery.</div>
+          </div>
+        </div>
+
+        <!-- Right column: Agent Trail -->
+        <div style="display:flex;flex-direction:column;gap:16px">
+          <div class="card" style="flex:1">
+            <h2>Agent Trail</h2>
+            <div class="trail" id="trail"><div class="empty">Waiting for agent activity...</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hidden metric IDs for JS updateMetrics -->
+      <div style="display:none">
+        <span id="tier-silent-count">SILENT: 0</span>
+        <span id="tier-active-count">ACTIVE: 0</span>
+        <span id="tier-hard-count">HARD BLOCKED: 0</span>
+        <div id="decline-strategies"></div>
+        <div id="penalty-count">0</div>
+        <div id="penalty-value">$0.00 saved</div>
+      </div>
+
+      <div style="text-align:center;padding:12px 0;color:var(--text-muted);font-size:11px;position:sticky;bottom:0;background:var(--bg-canvas);border-top:1px solid var(--border-subtle)">
+        AI agents can make mistakes. Verify important decisions independently.
       </div>
     </div>
-    <div class="agent-actions">
-      <button class="btn-disable">&#x23F8; Disable</button>
-      <a class="btn-open-store" href="/pay" target="_blank">Open Store</a>
-    </div>
-  </div>
 
-  <!-- Tabs -->
-  <div class="tabs">
-    <div class="tab active" onclick="showTab('activity',this)">Activity</div>
-    <div class="tab" onclick="showTab('settings',this)">Settings</div>
-  </div>
-
-  <!-- ═══ Tab: Activity ═══ -->
-  <div id="tab-activity">
-
-    <!-- Scenario Triggers -->
-    <div class="scenarios">
-      <button class="scenario-btn" onclick="fetch('/api/simulate/degradation',{method:'POST'})">504 Degradation</button>
-      <button class="scenario-btn" onclick="fetch('/api/simulate/abandonment',{method:'POST'})">Cart Abandonment</button>
-      <button class="scenario-btn" onclick="fetch('/api/simulate/card_expiry',{method:'POST'})">Expired Card</button>
-      <button class="scenario-btn" onclick="fetch('/api/simulate/bank_decline',{method:'POST'})">Bank Decline</button>
-      <button class="scenario-btn" onclick="fetch('/api/simulate/voice_call',{method:'POST'})">Voice Call</button>
-      <button class="scenario-btn batch" onclick="fetch('/api/simulate/batch',{method:'POST'})">Run 30-Case Batch</button>
-    </div>
-
-    <!-- Metrics -->
-    <div class="metrics-bar">
-      <div class="metric-item"><div class="metric-val blue" id="m-total">0</div><div class="metric-lbl">Total</div></div>
-      <div class="metric-item"><div class="metric-val green" id="m-recovered">0</div><div class="metric-lbl">Recovered</div></div>
-      <div class="metric-item"><div class="metric-val red" id="m-failed">0</div><div class="metric-lbl">Failed</div></div>
-      <div class="metric-item"><div class="metric-val amber" id="m-rate">0%</div><div class="metric-lbl">Recovery Rate</div></div>
-    </div>
-
-    <!-- Hidden metric IDs (so existing JS doesn't break) -->
-    <div class="hidden-metrics">
-      <span id="m-waiting">0</span>
-      <span id="m-penalties">0</span>
-      <span id="m-saved">$0.00</span>
-      <span id="tier-silent-count"></span>
-      <span id="tier-active-count"></span>
-      <span id="tier-hard-count"></span>
-      <span id="decline-strategies"></span>
-      <span id="penalty-count">0</span>
-      <span id="penalty-value">$0.00</span>
-    </div>
-
-    <!-- Activity Feed -->
-    <div class="activity-feed" id="payments">
-      <div class="empty" id="empty-msg" style="text-align:center;padding:60px 20px;color:#9ca3af;font-size:14px">
-        No recovery activity yet. Open the <a href="/pay" target="_blank" style="color:#2563eb;text-decoration:none;font-weight:500">store</a> to trigger a payment failure, or click a scenario above.
+    <!-- Tab: Settings (placeholder) -->
+    <div id="tab-settings" style="display:none">
+      <div class="card">
+        <h2>Agent Configuration</h2>
+        <div style="padding:20px;color:var(--text-secondary);font-size:13px">
+          <p>Configure recovery agent parameters, guardrail policies, and notification templates.</p>
+          <p style="margin-top:12px;color:var(--text-muted);font-size:12px">Settings panel coming soon. Currently managed via configuration files.</p>
+        </div>
       </div>
     </div>
-
-    <!-- Disclaimer -->
-    <div class="disclaimer">AI agents can make mistakes. Please check important information.</div>
   </div>
-
-  <!-- ═══ Tab: Settings (placeholder) ═══ -->
-  <div id="tab-settings" style="display:none;padding:32px 0">
-    <div style="border:1px solid #e5e7eb;border-radius:12px;padding:32px;background:#f9fafb">
-      <h3 style="font-size:15px;font-weight:600;color:#1a1a2e;margin-bottom:8px">Agent Configuration</h3>
-      <p style="font-size:13px;color:#6b7280;line-height:1.6">Configure recovery agent parameters, guardrail policies, quiet hours, and notification templates. Currently managed via configuration files.</p>
-    </div>
-  </div>
-
 </div>
-</div>
 
-<!-- ═══ Case Detail Drawer ═══ -->
+<!-- Case Detail Drawer -->
 <div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
 <div class="drawer" id="drawer">
   <div class="drawer-header">
     <div class="drawer-title" id="drawer-title">Payment Details</div>
-    <button class="drawer-close" onclick="closeDrawer()">&#x2715;</button>
+    <button class="drawer-close" onclick="closeDrawer()">&#10005;</button>
   </div>
+  <div id="drawer-status-bar" style="height:4px;border-radius:0"></div>
   <div class="drawer-body" id="drawer-body">
-    <div style="text-align:center;padding:40px;color:#9ca3af;font-size:13px">Select a payment to view details</div>
+    <div class="empty">Select a payment to view details</div>
   </div>
 </div>
 
 <!-- Toast -->
 <div class="toast" id="toast"></div>
-
-<!-- ═══ Hidden trail containers (keeps JS alive) ═══ -->
-<div style="display:none" id="trail"></div>
-<div style="display:none" id="trail-full"></div>
 
 <script>
 const socket=io();
@@ -1280,145 +1304,168 @@ let tierStats={silent:0,active:0,hard_decline_blocked:0};
 let totalPenalties=0;
 let declineStrategies={};
 
+// Theme toggle
+function toggleTheme(){
+  const html=document.documentElement;
+  const current=html.getAttribute("data-theme");
+  html.setAttribute("data-theme",current==="light"?"dark":"light");
+  localStorage.setItem("theme",html.getAttribute("data-theme"));
+}
+(function(){const saved=localStorage.getItem("theme");if(saved)document.documentElement.setAttribute("data-theme",saved)})();
+
 // Tab switching
-function showTab(name,el){
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  el.classList.add('active');
-  document.querySelectorAll('[id^=tab-]').forEach(p=>p.style.display='none');
-  document.getElementById('tab-'+name).style.display='block';
+function showTab(name){
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  document.querySelectorAll("[id^=tab-]").forEach(p=>p.style.display="none");
+  event.target.classList.add("active");
+  document.getElementById("tab-"+name).style.display="block";
 }
 
 // Drawer
 function openDrawer(paymentId){
   const p=paymentsData.find(x=>x.payment_id===paymentId);
   if(!p)return;
-  document.getElementById('drawer-title').textContent=p.payment_id;
-  const body=document.getElementById('drawer-body');
-  const statusCls=p.status==='recovered'?'green':p.status==='failed'?'red':'blue';
-  const statusLabel=(p.status||'recovering').charAt(0).toUpperCase()+(p.status||'recovering').slice(1);
-  const tierCls=(p.recovery_tier||'active')==='silent'?'blue':(p.recovery_tier||'active')==='hard_decline_blocked'?'red':'amber';
-  let html=`<div class="drawer-section"><h3>Payment Info</h3><div class="drawer-info">
-    <b>Amount:</b> INR ${p.amount.toLocaleString()}<br>
-    <b>Status:</b> <span class="drawer-badge ${statusCls}">${statusLabel}</span><br>
-    <b>Recovery Tier:</b> <span class="drawer-badge ${tierCls}">${(p.recovery_tier||'active').toUpperCase()}</span><br>
-    <b>Strategy:</b> ${p.decline_strategy||'—'}<br>
-    <b>Attempts:</b> ${p.attempts||0}
-  </div></div>`;
+  document.getElementById("drawer-title").textContent=p.payment_id;
+  const bar=document.getElementById("drawer-status-bar");
+  const statusColors={recovering:"var(--brand-blue)",awaiting_customer:"var(--brand-blue)",recovered:"var(--success)",failed:"var(--error)",escalated:"var(--brand-blue)",scheduled:"var(--warning)"};
+  bar.style.background=statusColors[p.status]||"var(--brand-blue)";
+  const body=document.getElementById("drawer-body");
+  const tierLabel=(p.recovery_tier||"active").toUpperCase();
+  const tierCls=p.recovery_tier==="silent"?"btier-silent":p.recovery_tier==="hard_decline_blocked"?"btier-hard":"btier-active";
+  const statusBadge=p.status==="recovered"?"bs":p.status==="failed"?"bf":p.status==="escalated"?"bp":"bw";
+  let html=`<div class="drawer-section"><h3>Payment Info</h3><div style="font-size:13px;color:var(--text-secondary);display:flex;flex-wrap:wrap;gap:12px"><span><b>Amount:</b> INR ${p.amount.toLocaleString()}</span><span><b>Status:</b> <span class="badge ${statusBadge}">${p.status}</span></span><span class="badge ${tierCls}" style="font-size:11px">${tierLabel}</span><span><b>Attempts:</b> ${p.attempts||0}</span></div></div>`;
+  if(p.decline_strategy){html+=`<div class="drawer-section"><h3>Decline Strategy</h3><div style="font-size:13px;color:var(--text-secondary)">${p.decline_strategy}</div></div>`}
+  if(p.penalties_prevented){html+=`<div class="drawer-section"><h3>Penalties Prevented</h3><div style="font-size:13px;color:var(--success);font-weight:600">${p.penalties_prevented} blocked ($${(p.penalties_prevented*0.10).toFixed(2)} saved)</div></div>`}
   if(p.trail&&p.trail.length){
-    html+=`<div class="drawer-section"><h3>Agent Reasoning (${p.trail.length} steps)</h3><div class="drawer-trail">`;
+    const diagnosed=p.trail.find(e=>e.step==="diagnosed"||e.step==="diagnosing");
+    const decided=p.trail.find(e=>e.step==="deciding");
+    if(diagnosed){html+=`<div class="drawer-section"><h3>Diagnosis</h3><div style="font-size:13px;color:var(--text-secondary)">${diagnosed.msg}${diagnosed.detail?'<br>'+diagnosed.detail:''}</div></div>`}
+    if(decided){html+=`<div class="drawer-section"><h3>Strategy</h3><div style="font-size:13px;color:var(--text-secondary)">${decided.msg}${decided.detail?'<br>'+decided.detail:''}</div></div>`}
+    html+=`<div class="drawer-section"><h3>Agent Trail (${p.trail.length} steps)</h3><div class="drawer-trail">`;
     p.trail.forEach(e=>{
-      html+=`<div class="drawer-trail-item t-${e.step}"><div class="time">${e.ts}</div><div class="msg">${e.msg}</div>${e.detail?'<div class="detail">'+e.detail+'</div>':''}</div>`;
+      html+=`<div class="trail-item t-${e.step}" style="cursor:pointer" onclick="var d=this.querySelector('.trail-detail');if(d)d.style.display=d.style.display==='none'?'block':'none'"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail" style="display:none">'+e.detail+'</div>':''}</div>`;
     });
     html+=`</div></div>`;
   }
   body.innerHTML=html;
-  document.getElementById('drawer-overlay').classList.add('open');
-  document.getElementById('drawer').classList.add('open');
+  document.getElementById("drawer-overlay").classList.add("open");
+  document.getElementById("drawer").classList.add("open");
 }
 function closeDrawer(){
-  document.getElementById('drawer-overlay').classList.remove('open');
-  document.getElementById('drawer').classList.remove('open');
+  document.getElementById("drawer-overlay").classList.remove("open");
+  document.getElementById("drawer").classList.remove("open");
 }
 
 function updateMetrics(){
-  const t=paymentsData.length,r=paymentsData.filter(p=>p.status==='recovered').length,w=paymentsData.filter(p=>p.status==='recovering'||p.status==='awaiting_customer').length,f=paymentsData.filter(p=>p.status==='failed').length;
-  document.getElementById('m-total').textContent=t;
-  document.getElementById('m-recovered').textContent=r;
-  document.getElementById('m-waiting').textContent=w;
-  document.getElementById('m-failed').textContent=f;
-  document.getElementById('m-rate').textContent=t>0?Math.round(r/t*100)+'%':'0%';
-  document.getElementById('m-penalties').textContent=totalPenalties;
-  document.getElementById('m-saved').textContent='$'+(totalPenalties*0.10).toFixed(2);
-  document.getElementById('penalty-count').textContent=totalPenalties;
-  document.getElementById('penalty-value').textContent='$'+(totalPenalties*0.10).toFixed(2)+' saved';
-  document.getElementById('tier-silent-count').textContent='SILENT: '+tierStats.silent;
-  document.getElementById('tier-active-count').textContent='ACTIVE: '+tierStats.active;
-  document.getElementById('tier-hard-count').textContent='HARD BLOCKED: '+tierStats.hard_decline_blocked;
+  const t=paymentsData.length,r=paymentsData.filter(p=>p.status==="recovered").length,w=paymentsData.filter(p=>p.status==="recovering"||p.status==="awaiting_customer").length,f=paymentsData.filter(p=>p.status==="failed").length;
+  document.getElementById("m-total").textContent=t;document.getElementById("m-recovered").textContent=r;
+  document.getElementById("m-waiting").textContent=w;document.getElementById("m-failed").textContent=f;
+  document.getElementById("m-rate").textContent=t>0?Math.round(r/t*100)+"%":"0%";
+  document.getElementById("m-penalties").textContent=totalPenalties;
+  document.getElementById("m-saved").textContent="$"+(totalPenalties*0.10).toFixed(2);
+  document.getElementById("penalty-count").textContent=totalPenalties;
+  document.getElementById("penalty-value").textContent="$"+(totalPenalties*0.10).toFixed(2)+" saved";
+  document.getElementById("tier-silent-count").textContent="SILENT: "+tierStats.silent;
+  document.getElementById("tier-active-count").textContent="ACTIVE: "+tierStats.active;
+  document.getElementById("tier-hard-count").textContent="HARD BLOCKED: "+tierStats.hard_decline_blocked;
 }
 
 function renderDeclineStrategies(){
-  const el=document.getElementById('decline-strategies');
+  const el=document.getElementById("decline-strategies");
   const keys=Object.keys(declineStrategies);
-  if(keys.length===0){el.innerHTML='';return}
+  if(keys.length===0){el.innerHTML='<div class="empty" style="padding:8px">Waiting...</div>';return}
   el.innerHTML=keys.map(code=>{
     const s=declineStrategies[code];
-    return code+': '+s.strategy+' ('+s.tier+')';
-  }).join(', ');
+    const tierCls=s.tier==="silent"?"btier-silent":s.tier==="hard_decline_blocked"?"btier-hard":"btier-active";
+    const tierLabel=s.tier==="silent"?"SILENT":s.tier==="hard_decline_blocked"?"BLOCKED":"ACTIVE";
+    return `<div class="strategy-item"><span class="strategy-code">${code}</span><span class="strategy-name">${s.strategy}</span><span class="strategy-tier ${tierCls}">${tierLabel}</span></div>`;
+  }).join("");
 }
 
 function renderPayments(){
-  const el=document.getElementById('payments'),empty=document.getElementById('empty-msg');
-  if(paymentsData.length===0){empty.style.display='block';el.innerHTML='';el.appendChild(empty);return}
-  empty.style.display='none';
-  const timeLabels=['Just now','2 min ago','5 min ago','12 min ago','28 min ago','1 hour ago','3 hours ago','6 hours ago','10 hours ago','14 hours ago'];
+  const el=document.getElementById("payments"),empty=document.getElementById("empty-msg");
+  const times=["Just now","2 min ago","5 min ago","12 min ago","18 min ago","25 min ago","38 min ago","52 min ago","1 hr ago","2 hr ago"];
+  if(paymentsData.length===0){empty.style.display="block";el.innerHTML="";el.appendChild(empty);return}
+  empty.style.display="none";
   el.innerHTML=paymentsData.map((p,i)=>{
-    const dotCls=p.status==='recovered'?'recovered':p.status==='failed'?'failed':(p.status==='recovering'||p.status==='awaiting_customer')?'processing':'recovering';
-    const icon=p.status==='recovered'?'&#x2713;':p.status==='failed'?'&#x2717;':'&#x25CF;';
-    const isLive=p.status==='recovering'||p.status==='awaiting_customer';
-    const action=p.status==='recovered'?'Recovered':p.status==='failed'?'Failed':p.status==='awaiting_customer'?'Awaiting response':'Recovering';
-    const time=timeLabels[Math.min(i,timeLabels.length-1)];
-    const amountStr='&#8377;'+p.amount.toLocaleString();
+    const iconCls=p.status==="recovered"?"recovered":p.status==="recovering"||p.status==="awaiting_customer"?"recovering":p.status==="failed"?"failed":p.status==="escalated"?"escalated":"scheduled";
+    const icon=p.status==="recovered"?"✓":p.status==="failed"?"✕":p.status==="escalated"?"↗":p.status==="scheduled"?"⏱":"●";
+    const live=p.status==="recovering"||p.status==="awaiting_customer"?'<span class="live"><span class="health-dot"></span> Live</span>':'';
+    const tierCls=p.recovery_tier==="silent"?"btier-silent":p.recovery_tier==="hard_decline_blocked"?"btier-hard":"btier-active";
+    const tierLabel=(p.recovery_tier||"active").toUpperCase();
+    const action=p.status==="recovered"?"Recovery confirmed":p.status==="escalated"?"Escalated to human":p.status==="scheduled"?"Retry scheduled":p.status==="awaiting_customer"?"Awaiting response":"Recovering";
+    const ts=times[i]||(i*7+3)+" min ago";
     return `<div class="activity-item" onclick="openDrawer('${p.payment_id}')">
-      <div class="activity-dot ${dotCls}">${icon}</div>
+      <div class="activity-icon ${iconCls}">${icon}</div>
       <div class="activity-body">
-        <div class="activity-title">${action} ${p.payment_id.slice(0,16)} &mdash; <span class="amount">${amountStr}</span></div>
-        <div class="activity-time">${time}</div>
+        <div class="activity-title"><span>${action} ${p.payment_id.slice(0,16)}</span><span style="margin-left:auto;display:flex;align-items:center;gap:8px;flex-shrink:0"><span class="activity-amount">INR ${p.amount.toLocaleString()}</span><span class="badge ${tierCls}">${tierLabel}</span>${live}</span></div>
+        <div class="activity-meta"><span>${ts}</span></div>
       </div>
-      ${isLive?'<div class="activity-live"><span class="dot"></span> Live</div>':''}
     </div>`;
-  }).join('');
+  }).join("");
 }
 
 function renderTrail(trail){
-  ['trail','trail-full'].forEach(id=>{
-    const el=document.getElementById(id);
-    if(!el)return;
-    if(!trail||trail.length===0)return;
-    el.innerHTML=trail.map(e=>`<div>${e.ts} ${e.msg}</div>`).join('');
-  });
+  const el=document.getElementById("trail");
+  if(!el)return;
+  if(!trail||trail.length===0){el.innerHTML='<div class="empty">Waiting for agent activity...</div>';return}
+  el.innerHTML=trail.map(e=>{
+    let specHtml='';
+    if(e.ui_spec){
+      specHtml=`<div class="trail-detail" style="margin-top:6px;padding:8px;border-radius:6px;border-left:3px solid #8B5CF6;background:var(--bg-surface)">
+        <strong style="color:#8B5CF6">UI Spec:</strong> ${e.ui_spec.headline||''} — ${e.ui_spec.primary_cta_text||''}
+      </div>`;
+    }
+    return `<div class="trail-item t-${e.step}"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail">'+e.detail+'</div>':''}${specHtml}</div>`;
+  }).join("");
+  el.scrollTop=el.scrollHeight;
 }
 
-function showToast(msg,type){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+type+' show';setTimeout(()=>t.className='toast',3000)}
+function showToast(msg,type){const t=document.getElementById("toast");t.textContent=msg;t.className="toast "+type+" show";setTimeout(()=>t.className="toast",3000)}
 
-socket.on('connect',()=>showToast('Connected to live feed','info'));
+function simulateScenario(scenario){
+  showToast("Running "+scenario+"...","info");
+  fetch("/api/simulate/"+scenario,{method:"POST"}).then(r=>r.json()).then(d=>{
+    showToast(scenario+": "+(d.status||d.cases+" cases"),d.status==="ok"?"success":"info");
+  }).catch(()=>showToast(scenario+": request sent","info"));
+}
 
-socket.on('tier_update',function(data){
-  const tier=data.tier||'active';
+socket.on("connect",()=>showToast("Connected to live feed","info"));
+
+socket.on("tier_update",function(data){
+  const tier=data.tier||"active";
   if(tierStats[tier]!==undefined)tierStats[tier]++;
   if(data.penalties_prevented)totalPenalties+=data.penalties_prevented;
   updateMetrics();
 });
 
-socket.on('decline_strategy',function(data){
+socket.on("decline_strategy",function(data){
   if(data.failure_code){
     declineStrategies[data.failure_code]={strategy:data.strategy,tier:data.tier};
     renderDeclineStrategies();
   }
 });
 
-socket.on('agent_event',function(data){
+socket.on("agent_event",function(data){
   const idx=paymentsData.findIndex(p=>p.payment_id===data.payment_id);
-  if(data.event==='progress'||data.event==='complete'){
-    const p={payment_id:data.payment_id,amount:data.amount||0,status:data.status||'recovering',last_action:data.last_action,last_detail:data.last_detail,attempts:data.attempts||0,trail:data.trail||[],recovery_tier:data.recovery_tier||'active',decline_strategy:data.decline_strategy||'',penalties_prevented:data.penalties_prevented||0};
+  if(data.event==="progress"||data.event==="complete"){
+    const p={payment_id:data.payment_id,amount:data.amount||0,status:data.status||"recovering",last_action:data.last_action,last_detail:data.last_detail,attempts:data.attempts||0,trail:data.trail||[],recovery_tier:data.recovery_tier||"active",decline_strategy:data.decline_strategy||"",penalties_prevented:data.penalties_prevented||0};
     if(idx>=0)paymentsData[idx]={...paymentsData[idx],...p};else paymentsData.unshift(p);
     renderPayments();updateMetrics();
   }
   if(idx>=0&&paymentsData[idx].trail)renderTrail(paymentsData[idx].trail);
   else if(data.msg){
-    ['trail','trail-full'].forEach(id=>{
-      const existing=document.getElementById(id);
-      if(!existing)return;
-      if(existing.querySelector('.empty'))existing.innerHTML='';
+    const existing=document.getElementById("trail");
+    if(existing){
+      if(existing.querySelector(".empty"))existing.innerHTML="";
       existing.innerHTML+=`<div class="trail-item t-${data.event}"><div class="trail-time">${data.ts}</div><div class="trail-msg">${data.msg}</div>${data.detail?'<div class="trail-detail">'+data.detail+'</div>':''}</div>`;
       existing.scrollTop=existing.scrollHeight;
-    });
+    }
   }
-  if(data.event==='waiting_for_customer')showToast(`[${data.payment_id.slice(0,10)}] Waiting for customer response`,'info');
-  if(data.event==='complete')showToast(`[${data.payment_id.slice(0,10)}] ${data.status}`,data.status==='recovered'?'success':'info');
+  if(data.event==="waiting_for_customer")showToast(`[${data.payment_id.slice(0,10)}] Waiting for customer response`,"info");
+  if(data.event==="complete")showToast(`[${data.payment_id.slice(0,10)}] ${data.status}`,data.status==="recovered"?"success":"info");
 });
 </script></body></html>"""
-
-
 
 
 # ─── Routes ───────────────────────────────────────────────────

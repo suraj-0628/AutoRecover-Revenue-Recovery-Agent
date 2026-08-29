@@ -191,11 +191,12 @@
     }
 
     /* Left Panel Console Output — Fixed Viewing Window */
+    /* ── Agent Execution Monologue ── */
     .terminal-box {
       background: #0d1117;
       border: 1px solid var(--border-color);
-      border-radius: 4px;
-      padding: 10px;
+      border-radius: 6px;
+      padding: 8px 10px;
       font-size: 0.78rem;
       line-height: 1.55;
       height: 380px;
@@ -204,19 +205,127 @@
       flex-shrink: 0;
       overflow-y: auto;
       color: var(--text-main);
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
     }
+    /* ── Trace Step (collapsible entry) ── */
+    .trace-step {
+      border-radius: 4px;
+      border: 1px solid transparent;
+      transition: border-color 0.15s;
+    }
+    .trace-step:hover {
+      border-color: #21262d;
+    }
+    .trace-header {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 8px;
+      cursor: pointer;
+      user-select: none;
+      border-radius: 4px;
+      transition: background 0.12s;
+    }
+    .trace-header:hover {
+      background: #161b22;
+    }
+    .trace-chevron {
+      color: var(--text-muted);
+      font-size: 0.7rem;
+      width: 10px;
+      flex-shrink: 0;
+      transition: transform 0.2s;
+      font-family: monospace;
+    }
+    .trace-step.open .trace-chevron {
+      transform: rotate(90deg);
+    }
+    .trace-tag {
+      font-weight: 600;
+      font-size: 0.75rem;
+      flex-shrink: 0;
+    }
+    .trace-title {
+      color: var(--text-bright);
+      font-weight: 500;
+      font-size: 0.78rem;
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .trace-time {
+      color: #484f58;
+      font-size: 0.7rem;
+      flex-shrink: 0;
+      font-family: monospace;
+    }
+    .trace-tier {
+      flex-shrink: 0;
+    }
+    /* ── Collapsible body (hidden by default) ── */
+    .trace-body {
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.25s ease, padding 0.2s ease;
+      padding: 0 8px 0 26px;
+    }
+    .trace-step.open .trace-body {
+      max-height: 500px;
+      padding: 4px 8px 8px 26px;
+    }
+    .trace-detail {
+      color: var(--text-muted);
+      font-size: 0.73rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border-left: 2px solid #21262d;
+      padding-left: 10px;
+      margin-top: 2px;
+    }
+    .trace-detail strong {
+      color: var(--text-main);
+    }
+    /* ── Inline detail chips inside trace body ── */
+    .trace-chip {
+      display: inline-block;
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 3px;
+      padding: 1px 6px;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      margin: 1px 2px;
+    }
+    .trace-chip.green { color: var(--accent-green); border-color: #1a3a2a; }
+    .trace-chip.red   { color: var(--accent-red);   border-color: #3d1a1a; }
+    .trace-chip.blue  { color: var(--accent-blue);  border-color: #1a2a3d; }
+    .trace-chip.amber { color: var(--accent-amber); border-color: #3d2e1a; }
+    .trace-chip.purple{ color: var(--accent-purple);border-color: #2d1a3d; }
+
+    /* Legacy log-line fallback (used by system init) */
     .log-line {
-      margin-bottom: 6px;
+      margin-bottom: 4px;
+      padding: 3px 8px;
       animation: fadeIn 0.15s ease-in;
       white-space: pre-wrap;
       word-break: break-word;
+      font-size: 0.78rem;
+      color: var(--text-main);
     }
-    .tag-thinking { color: var(--accent-purple); font-weight: 600; }
-    .tag-diagnosing { color: var(--accent-blue); font-weight: 600; }
-    .tag-guardrail { color: var(--accent-amber); font-weight: 600; }
-    .tag-kg { color: var(--accent-green); font-weight: 600; }
-    .tag-acting { color: var(--accent-red); font-weight: 600; }
-    .tag-harness { color: #3b82f6; font-weight: 600; }
+    .log-line.tier-silent { border-left: 2px solid #3b82f6; padding-left: 10px; }
+    .log-line.tier-active { border-left: 2px solid #f59e0b; padding-left: 10px; }
+    .log-line.tier-hard   { border-left: 2px solid #ef4444; padding-left: 10px; }
+
+    .tag-thinking  { color: var(--accent-purple); font-weight: 600; }
+    .tag-diagnosing{ color: var(--accent-blue);   font-weight: 600; }
+    .tag-guardrail { color: var(--accent-amber);  font-weight: 600; }
+    .tag-kg        { color: var(--accent-green);  font-weight: 600; }
+    .tag-acting    { color: var(--accent-red);    font-weight: 600; }
+    .tag-harness   { color: #3b82f6;             font-weight: 600; }
 
     /* OpenCode Tool Call Card */
     .tool-card {
@@ -327,11 +436,6 @@
       color: var(--accent-blue);
       margin-top: 4px;
     }
-
-    /* Tier-colored stream entries */
-    .log-line.tier-silent { border-left: 2px solid #3b82f6; padding-left: 6px; }
-    .log-line.tier-active { border-left: 2px solid #f59e0b; padding-left: 6px; }
-    .log-line.tier-hard { border-left: 2px solid #ef4444; padding-left: 6px; }
 
     /* AI Silent Mode Active Banner — glowing blue operational banner */
     .silent-banner {
@@ -690,7 +794,13 @@
         
         <!-- Thought Stream Console -->
         <div class="terminal-box" id="terminal-stream">
-          <div class="log-line"><span class="tag-kg">[SYSTEM]</span> Agentic HUD Initialized. Listening to Razorpay Webhooks & Session Heartbeats...</div>
+          <div class="trace-step">
+            <div class="trace-header">
+              <span class="trace-chevron" style="visibility:hidden;">▸</span>
+              <span class="trace-tag" style="color:var(--accent-green);">[SYSTEM]</span>
+              <span class="trace-title">Agentic HUD Initialized — Listening to Razorpay Webhooks &amp; Session Heartbeats</span>
+            </div>
+          </div>
         </div>
 
         <!-- OpenCode Tool Call Card -->
@@ -973,29 +1083,102 @@
 
     fetchMetrics();
 
-    function formatDetail(detail) {
-      if (!detail) return "";
-      let clean = detail.replace(/↳/g, "").trim();
-      return `<br/><span style="color:#8b949e; font-size:0.75rem; white-space:pre-wrap;">${clean}</span>`;
+    function toggleStep(el) {
+      var step = el.closest('.trace-step');
+      if (step) step.classList.toggle('open');
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function formatDetailChips(detail) {
+      if (!detail) return '';
+      var clean = String(detail).replace(/\u2193/g, '').trim();
+      var lines = clean.split(/\n/).filter(function(l) { return l.trim(); });
+      var html = '<div class="trace-detail">';
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        var colonIdx = line.indexOf(':');
+        if (colonIdx > 0 && colonIdx < 40) {
+          var key = escapeHtml(line.substring(0, colonIdx).trim());
+          var val = escapeHtml(line.substring(colonIdx + 1).trim());
+          var cls = /ok|success|recovered|high/i.test(val) ? 'green'
+                  : /fail|error|low|block/i.test(val) ? 'red'
+                  : /attempt|retry/i.test(val) ? 'amber'
+                  : /memory|history/i.test(val) ? 'purple' : 'blue';
+          html += '<span class="trace-chip ' + cls + '">' + key + ': ' + val + '</span> ';
+        } else {
+          html += '<span style="color:#8b949e; font-size:0.72rem;">' + escapeHtml(line) + '</span> ';
+        }
+      }
+      html += '</div>';
+      return html;
+    }
+
+    var TAG_COLORS = {
+      'DETECT': 'var(--accent-red)',
+      'DIAGNOSE': 'var(--accent-blue)',
+      'ROOT CAUSE': 'var(--accent-green)',
+      'THINK': 'var(--accent-purple)',
+      'PLAN': 'var(--accent-purple)',
+      'GUARDRAIL': 'var(--accent-amber)',
+      'MEMORY': 'var(--accent-purple)',
+      'KG': 'var(--accent-green)',
+      'ACTION': 'var(--accent-red)',
+      'HARNESS': '#3b82f6',
+      'SUCCESS': 'var(--accent-green)',
+      'ORDER': 'var(--accent-green)',
+      'GATEWAY': 'var(--accent-red)',
+      'CHECKOUT': 'var(--accent-purple)',
+      'PAYMENT': 'var(--accent-amber)',
+      'BATCH': 'var(--accent-green)',
+      'SCHEDULED': '#3b82f6',
+      'SYSTEM': 'var(--accent-green)',
+    };
+
+    function buildStepHtml(tag, text, detail, tier, ts) {
+      var tagColor = TAG_COLORS[tag] || 'var(--text-muted)';
+      var tierBadge = tier ? '<span class="tier-badge tier-' + escapeHtml(tier) + ' trace-tier"><span class="tier-dot"></span> ' + escapeHtml(tier.toUpperCase()) + '</span>' : '';
+      var isReasoning = /THINK|PLAN|DIAGNOSE|GUARD|MEMORY|KG|ROOT CAUSE/i.test(tag);
+      var openCls = isReasoning ? ' open' : '';
+      var detailHtml = detail ? formatDetailChips(detail) : '';
+      var html = '<div class="trace-header" onclick="toggleStep(this)">'
+        + '<span class="trace-chevron">\u25b8</span>'
+        + '<span class="trace-tag" style="color:' + tagColor + '">[' + escapeHtml(tag) + ']</span>'
+        + '<span class="trace-title">' + escapeHtml(text) + '</span>'
+        + tierBadge
+        + '<span class="trace-time">' + escapeHtml(ts) + '</span>'
+        + '</div>'
+        + '<div class="trace-body">' + detailHtml + '</div>';
+      return { html: html, openCls: openCls };
     }
 
     function logThought(tag, tagCls, text, detail) {
-      const line = document.createElement("div");
-      line.className = "log-line";
-      const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      line.innerHTML = `<span style="color:#484f58; font-size:0.72rem; margin-right:6px;">[${ts}]</span><span class="${tagCls}">[${tag}]</span> <strong style="color:#f0f6fc;">${text}</strong> ${formatDetail(detail)}`;
-      terminal.appendChild(line);
-      terminal.scrollTop = terminal.scrollHeight;
+      try {
+        var step = document.createElement('div');
+        step.className = 'trace-step';
+        var ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        var built = buildStepHtml(tag, text, detail, '', ts);
+        step.innerHTML = built.html;
+        if (built.openCls) step.classList.add(built.openCls.trim());
+        terminal.appendChild(step);
+        terminal.scrollTop = terminal.scrollHeight;
+      } catch(e) { console.error('logThought error:', e); }
     }
 
     function logThoughtWithTier(tag, tagCls, text, detail, tier) {
-      const line = document.createElement("div");
-      line.className = "log-line" + (tier ? " tier-" + tier : "");
-      const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      const tierBadge = tier ? `<span class="tier-badge tier-${tier}" style="margin-left:6px;"><span class="tier-dot"></span> ${tier.toUpperCase()}</span>` : "";
-      line.innerHTML = `<span style="color:#484f58; font-size:0.72rem; margin-right:6px;">[${ts}]</span><span class="${tagCls}">[${tag}]</span> <strong style="color:#f0f6fc;">${text}</strong>${tierBadge} ${formatDetail(detail)}`;
-      terminal.appendChild(line);
-      terminal.scrollTop = terminal.scrollHeight;
+      try {
+        var step = document.createElement('div');
+        step.className = 'trace-step';
+        var ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        var built = buildStepHtml(tag, text, detail, tier, ts);
+        step.innerHTML = built.html;
+        if (built.openCls) step.classList.add(built.openCls.trim());
+        terminal.appendChild(step);
+        terminal.scrollTop = terminal.scrollHeight;
+      } catch(e) { console.error('logThoughtWithTier error:', e); }
     }
 
     function submitCardExpiryFix(event, pid) {
@@ -1067,7 +1250,10 @@
           if (data.payment_id) activePaymentId = data.payment_id;
           if (data.status === "batch_completed") {
             logThought("BATCH", "tag-kg", "Batch Evaluation Complete!", data.summary);
-    fetchMetrics();
+            fetchMetrics();
+          }
+        });
+    }
 
     // Tier update socket handler
     socket.on("tier_update", function(data) {
@@ -1084,7 +1270,6 @@
       if (data.payday_target_date) {
         document.getElementById("tele-payday").textContent = "Next: " + data.payday_target_date;
       }
-      // Show silent banner when tier is silent
       if (tier === "silent") {
         showSilentBanner(data.payday_target_date || "", data.decline_strategy || "");
       }
@@ -1099,16 +1284,28 @@
 
     // Scheduled job socket handler — display real retry scheduler output
     socket.on("scheduled_job", function(data) {
-      const line = document.createElement("div");
-      line.className = "log-line tier-silent";
+      const step = document.createElement("div");
+      step.className = "trace-step open";
       const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      line.innerHTML = `<span style="color:#484f58; font-size:0.72rem; margin-right:6px;">[${ts}]</span><span class="tag-kg" style="color:#3b82f6; font-weight:700;">[SCHEDULED]</span> <strong style="color:#f0f6fc;">Background Retry Job Created</strong> <span class="tier-badge tier-silent" style="margin-left:6px;"><span class="tier-dot"></span> SILENT</span><br/><span style="color:#8b949e; font-size:0.75rem; white-space:pre-wrap;">Job: ${data.job_id} | Target: ${data.target_timestamp} | Confidence: ${(data.confidence*100).toFixed(0)}% | ${data.reason}</span>`;
-      terminal.appendChild(line);
+      step.innerHTML = `
+        <div class="trace-header" onclick="toggleStep(this)">
+          <span class="trace-chevron">▸</span>
+          <span class="trace-tag" style="color:#3b82f6;">[SCHEDULED]</span>
+          <span class="trace-title">Background Retry Job Created</span>
+          <span class="tier-badge tier-silent trace-tier"><span class="tier-dot"></span> SILENT</span>
+          <span class="trace-time">${ts}</span>
+        </div>
+        <div class="trace-body">
+          <div class="trace-detail">
+            <span class="trace-chip blue">Job: ${data.job_id}</span>
+            <span class="trace-chip">Target: ${data.target_timestamp}</span>
+            <span class="trace-chip green">Confidence: ${(data.confidence*100).toFixed(0)}%</span>
+            <span class="trace-chip purple">${data.reason}</span>
+          </div>
+        </div>`;
+      terminal.appendChild(step);
       terminal.scrollTop = terminal.scrollHeight;
     });
-          }
-        });
-    }
 
     socket.on("agent_stream", function(data) {
       if (data.payment_id) activePaymentId = data.payment_id;
