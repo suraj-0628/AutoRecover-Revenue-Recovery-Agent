@@ -214,9 +214,22 @@
       border-radius: 4px;
       border: 1px solid transparent;
       transition: border-color 0.15s;
+      animation: traceStepEnter 0.35s cubic-bezier(0.22, 1, 0.36, 1) backwards;
     }
     .trace-step:hover {
       border-color: #21262d;
+    }
+    @keyframes traceStepEnter {
+      from {
+        opacity: 0;
+        transform: translateY(8px) scale(0.98);
+        filter: blur(1px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+        filter: blur(0);
+      }
     }
     .trace-header {
       display: flex;
@@ -227,9 +240,14 @@
       user-select: none;
       border-radius: 4px;
       transition: background 0.12s;
+      border-left: 2px solid transparent;
+      transition: background 0.12s, border-color 0.2s;
     }
     .trace-header:hover {
       background: #161b22;
+    }
+    .trace-step.open .trace-header {
+      border-left-color: var(--accent-blue);
     }
     .trace-chevron {
       color: var(--text-muted);
@@ -269,12 +287,12 @@
     .trace-body {
       max-height: 0;
       overflow: hidden;
-      transition: max-height 0.25s ease, padding 0.2s ease;
+      transition: max-height 0.3s cubic-bezier(0.22, 1, 0.36, 1), padding 0.25s ease;
       padding: 0 8px 0 26px;
     }
     .trace-step.open .trace-body {
       max-height: 500px;
-      padding: 4px 8px 8px 26px;
+      padding: 6px 8px 10px 26px;
     }
     .trace-detail {
       color: var(--text-muted);
@@ -1110,6 +1128,27 @@
       return { html: html, openCls: openCls };
     }
 
+    var _traceCounter = 0;
+    var _traceQueue = [];
+    var _traceDraining = false;
+
+    function _appendTraceStep(stepEl) {
+      _traceQueue.push(stepEl);
+      if (!_traceDraining) _drainTraceQueue();
+    }
+
+    function _drainTraceQueue() {
+      if (_traceQueue.length === 0) { _traceDraining = false; return; }
+      _traceDraining = true;
+      var el = _traceQueue.shift();
+      _traceCounter++;
+      var delay = Math.min(_traceCounter * 60, 300);
+      el.style.animationDelay = delay + 'ms';
+      terminal.appendChild(el);
+      terminal.scrollTop = terminal.scrollHeight;
+      setTimeout(_drainTraceQueue, 80);
+    }
+
     function logThought(tag, tagCls, text, detail) {
       try {
         var step = document.createElement('div');
@@ -1118,8 +1157,7 @@
         var built = buildStepHtml(tag, text, detail, '', ts);
         step.innerHTML = built.html;
         if (built.openCls) step.classList.add(built.openCls.trim());
-        terminal.appendChild(step);
-        terminal.scrollTop = terminal.scrollHeight;
+        _appendTraceStep(step);
       } catch(e) { console.error('logThought error:', e); }
     }
 
@@ -1131,8 +1169,7 @@
         var built = buildStepHtml(tag, text, detail, tier, ts);
         step.innerHTML = built.html;
         if (built.openCls) step.classList.add(built.openCls.trim());
-        terminal.appendChild(step);
-        terminal.scrollTop = terminal.scrollHeight;
+        _appendTraceStep(step);
       } catch(e) { console.error('logThoughtWithTier error:', e); }
     }
 
