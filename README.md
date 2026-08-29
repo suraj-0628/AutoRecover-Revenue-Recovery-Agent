@@ -145,17 +145,18 @@ The system embeds an official Razorpay API Error Knowledge Base (`src/recovery_a
 
 ---
 
-## 🖥️ OpenCode Developer IDE Interface & Operations HUD
+## 🖥️ Razorpay Agent Studio-Inspired Dashboard
 
-The Merchant Dashboard ([http://localhost:5002/merchant](http://localhost:5002/merchant)) is designed as an **OpenCode-inspired technical IDE**:
+The Merchant Dashboard ([http://localhost:5002/merchant](http://localhost:5002/merchant)) is designed as a **professional SaaS operations hub** inspired by Razorpay's Agent Studio:
 
-- **Monospace Typography**: `JetBrains Mono` and `Fira Code`.
-- **Dark IDE Palette**: Crisp `#0d1117` background with `#30363d` 1px borders and clean status trace badges (`[DETECT]`, `[DIAGNOSE]`, `[GUARDRAIL]`, `[ACTION]`, `[SUCCESS]`).
-- **Fixed Monologue Viewing Window**: Strictly bounded `380px` height (`min-height: 380px`, `max-height: 380px`) with auto-scrolling terminal logs.
-- **Tool Execution Code Cards**: Displays real Razorpay SDK API JSON response objects (`RazorpaySDK.Order.create`, `RazorpaySDK.Payment.capture`).
-- **Claude-Style Dual View Switcher**:
-  - `[ Canvas View ]`: Dynamic Generative UI morphing cards (WhatsApp link, Card Expiry form, Hinglish Voice AI Call, 5-step progress pipeline).
-  - `[ Store Checkout (/pay) ]`: Embedded live browser iframe pointing to `http://localhost:5002/pay` for testing real checkout payment flows inside the split-screen HUD.
+- **Sidebar Navigation**: Working links to Dashboard, Store, Agent Flow, Configuration.
+- **Activity Feed**: Real-time payment events with status badges, tier indicators, and clickable case detail drawers.
+- **Dark/Light Theme Toggle**: Persists via localStorage. Light theme (default) with `#F7F8FA` canvas, dark mode with `#020617` canvas.
+- **7-Metric Dashboard**: Total Payments, Recovered, Awaiting Customer, Failed, Recovery Rate, Penalties Prevented, Fines Saved.
+- **Case Detail Drawer**: Click any payment in the activity feed to open a full-width drawer with payment info + agent reasoning trail.
+- **Recovery Tier Badges**: Silent (blue), Active (amber), Hard Blocked (red) — real-time tier distribution.
+- **Decline Strategy Cards**: Maps failure codes to strategies (PAYDAY_TIMING, METADATA_ENRICHMENT, etc.).
+- **Penalties Counter**: Shows hard decline retries blocked and Visa/MC fines saved.
 
 ---
 
