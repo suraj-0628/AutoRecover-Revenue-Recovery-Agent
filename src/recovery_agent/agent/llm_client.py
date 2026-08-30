@@ -6,6 +6,12 @@ Provides structured output parsing with Pydantic validation.
 When the LLM server is unavailable or returning invalid responses,
 all calls return None immediately so downstream code falls back
 to rule-based logic.
+
+TIMEOUT ARCHITECTURE:
+  - LLM_TIMEOUT (env var, default 25s): Total budget for ALL models combined.
+  - Per-model cap: LLM_TIMEOUT / len(candidates), min 5s.
+  - If primary model doesn't respond within per-model cap, immediately
+    try one fallback, then fall back to heuristic. Total never exceeds LLM_TIMEOUT.
 """
 from __future__ import annotations
 
@@ -13,6 +19,7 @@ import json
 import os
 import socket
 import threading
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -36,8 +43,8 @@ def _ensure_phoenix():
     except Exception as e:
         print(f"Observability disabled: {e}")
 
-# Timeout for LLM calls — allow time for complete dynamic reasoning completions
-# Override via LLM_TIMEOUT env var for production use (e.g., LLM_TIMEOUT=30)
+# Total budget for ALL LLM fallback models combined.
+# Override via LLM_TIMEOUT env var (e.g., LLM_TIMEOUT=15).
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "25"))
 
 _llm_available: bool | None = None
@@ -73,9 +80,9 @@ def _check_llm_reachable() -> bool:
 
 DEFAULT_MODELS = [
     "antigravity/gemini-2.5-flash",
-    "auto/best-reasoning",
-    "antigravity/gemini-3.6-flash-high",
     "no-think/antigravity/claude-sonnet-4-6",
+    "antigravity/gemini-3.6-flash-high",
+    "auto/best-reasoning",
 ]
 
 def get_llm(
@@ -97,15 +104,52 @@ def get_llm(
     )
 
 
+def _invoke_with_timeout(llm: ChatOpenAI, messages: list, deadline: float) -> Any | None:
+    """Run llm.invoke in a daemon thread with a hard timeout based on a shared deadline.
+
+    Returns response on success, None on timeout/error.
+    The deadline is an absolute timestamp (time.monotonic() + seconds).
+    """
+    result = [None]
+    exc = [None]
+
+    def _target():
+        try:
+            result[0] = llm.invoke(messages)
+        except Exception as e:
+            exc[0] = e
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=remaining)
+    if t.is_alive():
+        print(f"[LLM TIMEOUT] Model exceeded deadline ({remaining:.1f}s remaining)")
+        return None
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
+
+
 def invoke_llm(
     prompt: str,
     system: str = "",
     temperature: float = 0,
     max_tokens: int = 512,
 ) -> str | None:
-    """Invoke the LLM with multi-model fallback.
+    """Invoke the LLM with budget-capped multi-model fallback.
 
-    Returns the raw string response, or None on failure.
+    Total time across ALL models is capped at LLM_TIMEOUT seconds.
+    Per-model timeout scales down with number of candidates so the total
+    never exceeds the budget. Falls back to heuristic immediately on timeout.
+
+    Architecture:
+      - 4 candidates, 25s budget → ~6s per model cap
+      - 4 candidates, 15s budget → ~3s per model cap
+      - Primary model always gets first shot
     """
     _ensure_phoenix()
     if not _check_llm_reachable():
@@ -114,15 +158,25 @@ def invoke_llm(
     primary_model = os.getenv("LLM_MODEL", "antigravity/gemini-2.5-flash")
     candidate_models = [primary_model] + [m for m in DEFAULT_MODELS if m != primary_model]
 
+    deadline = time.monotonic() + LLM_TIMEOUT
+    per_model_timeout = max(5, LLM_TIMEOUT // max(1, len(candidate_models)))
+
     for model in candidate_models:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"[LLM BUDGET EXHAUSTED] Total {LLM_TIMEOUT}s budget spent. Falling back to heuristic.")
+            break
+
+        model_timeout = min(per_model_timeout, remaining)
+
         try:
             llm = get_llm(temperature=temperature, max_tokens=max_tokens, model_name=model)
             messages = []
             if system:
                 messages.append(SystemMessage(content=system))
             messages.append(HumanMessage(content=prompt))
-            response = llm.invoke(messages)
-            if response and response.content:
+            response = _invoke_with_timeout(llm, messages, deadline)
+            if response is not None and response.content:
                 return response.content.strip()
         except Exception as e:
             print(f"[LLM ERROR with model {model}]: {e}")

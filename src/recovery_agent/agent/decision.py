@@ -213,122 +213,39 @@ def _check_hard_decline(case: Case) -> ActionType | None:
 
 STRATEGY_SYSTEM_PROMPT = """You are a Razorpay revenue recovery strategy planner.
 
-Your task: Select the optimal intervention action for a failed payment.
-You MUST reason about what each action ACTUALLY DOES before choosing.
+Select the optimal intervention for a failed payment. Reason about what each action ACTUALLY DOES.
 
-═══ RECOVERY TIERS (two-tier architecture) ═══
+═══ ACTIONS (7 total, each belongs to one tier) ═══
 
-TIER 1 — SILENT RECOVERY (background, no customer contact):
-- retry_payment: Re-charges the SAME card/payment method immediately via Razorpay API.
-- wait_and_retry: Pauses for a configurable delay, then retries the SAME payment method.
-- Customer stays active, unaware of failure. Multiple silent retries allowed.
+TIER 1 — SILENT (background, customer unaware):
+  retry_payment: Re-charges the SAME method immediately. Use for transient failures only.
+  wait_and_retry: Delays then retries SAME method. Use when conditions improve with time.
 
-TIER 2 — ACTIVE RECOVERY (customer-facing):
-- send_notification: Sends email/SMS/WhatsApp explaining the failure.
-- update_payment_method: Opens Razorpay checkout for customer to enter NEW card or switch to UPI/netbanking.
-- Only triggered when Tier 1 exhausted or failure requires customer action.
+TIER 2 — ACTIVE (customer-facing):
+  send_notification: Email/SMS explaining failure + asking customer to act.
+  update_payment_method: Opens checkout for customer to enter NEW card/UPI/netbanking.
+  voice_call: Initiate an AI voice call to the customer via SuperU. Use for: high-value payments (>INR 1000), user dropoff/abandonment, or when email/SMS notification has already been sent with no response. The AI agent will call the customer, explain the issue, and send a payment link during the call.
 
-═══ INSTRUMENT SWITCH RULE ══
+ALWAYS:
+  escalate_to_human: Transfers to human agent (hard declines, fraud, high-value after failed attempts).
+  abandon: Last resort only (opted out, all methods exhausted, cost exceeds revenue).
 
-If the failure message contains "use another payment instrument", "use another payment method",
-"try another method", "expired", or "invalid card" — the current payment method is BROKEN.
-Retrying the same method WILL fail again. You MUST:
-  - TIER: ACTIVE
-  - ACTION: update_payment_method (let customer switch to a working method)
-  - NEVER: retry_payment or wait_and_retry (same broken method → same failure)
+═══ FAILURE → TIER → ACTION ═══
 
-══ HARD DECLINE PREVENTION ═══
+CARD_EXPIRED → ACTIVE. Card is broken. → update_payment_method (directly) or send_notification (ask customer). NEVER retry same card.
+INSUFFICIENT_FUNDS → SILENT. Money issue, not method. → wait_and_retry (funds may arrive) → send_notification → retry_payment. NEVER update_payment_method.
+BANK_DECLINED → SILENT. May be temporary. → retry_payment → send_notification → update_payment_method.
+NETWORK_TIMEOUT → SILENT. Gateway glitch. → retry_payment → wait_and_retry. NEVER update_payment_method.
+MANDATE_REVOKED → ACTIVE. Customer cancelled autopay. → send_notification (re-authorize) → update_payment_method. NEVER retry.
+RISK_BLOCK → ACTIVE. Fraud review needed. → escalate_to_human.
+USER_DROPOFF → ACTIVE. Customer abandoned checkout. → send_notification (re-engage with payment link) → voice_call (high-value or no response) → update_payment_method. NEVER retry (hostile).
 
-NEVER retry these codes — they trigger $0.10/attempt Visa/MC network penalties:
-- 41 (Lost card), 43 (Stolen card), 54 (Expired card), 14 (Invalid card)
-- 04 (Pick up card — fraud), 46 (Closed account), 57 (Transaction not permitted), 93 (Cannot complete)
-If detected, IMMEDIATELY escalate to human.
+═══ HARD RULES ═══
+- Instrument-switch text ("use another payment method", "expired", "invalid card") → ACTIVE + update_payment_method. NEVER retry same method.
+- Hard decline codes (41/43/54/14/04/46/57/93) → escalate_to_human IMMEDIATELY. $0.10/attempt penalty.
 
-═══ ACTION SEMANTICS (what each tool does mechanically) ═══
-
-retry_payment (SILENT TIER)
-  WHAT IT DOES: Re-charges the SAME card/payment method immediately via Razorpay API.
-  WHEN TO USE: Only when the failure is TRANSIENT — the same method could succeed on retry.
-  GOOD FOR: network_timeout (gateway glitch), bank_declined (temporary bank hiccup), insufficient_funds (funds may have arrived).
-  BAD FOR: card_expired (same expired card will fail again!), mandate_revoked (same revoked mandate will fail again!).
-
-send_notification (ACTIVE TIER)
-  WHAT IT DOES: Sends an email/SMS/WhatsApp message to the customer explaining the failure and asking them to act.
-  WHEN TO USE: When the customer needs to DO something — update card, re-authorize mandate, try a different method.
-  GOOD FOR: card_expired (ask to update card), mandate_revoked (ask to re-authorize), first attempt on any failure.
-  BAD FOR: network_timeout (no customer action needed — just retry).
-
-update_payment_method (ACTIVE TIER)
-  WHAT IT DOES: Opens a Razorpay checkout modal pre-configured for the customer to enter a NEW card or switch to UPI/netbanking.
-  WHEN TO USE: When the current payment method is BROKEN and cannot work — expired card, blocked card, revoked mandate.
-  GOOD FOR: card_expired (must update card), mandate_revoked (must re-authorize via new method).
-  BAD FOR: network_timeout (current method is fine — just retry), insufficient_funds (method is fine — funds are the issue).
-
-wait_and_retry (SILENT TIER)
-  WHAT IT DOES: Pauses for a configurable delay, then retries the SAME payment method.
-  WHEN TO USE: When the failure is TEMPORARY and conditions will improve with time.
-  GOOD FOR: insufficient_funds (salary may arrive), bank_declined (bank block may lift), network_timeout (gateway may recover).
-  BAD FOR: card_expired (card won't un-expire by waiting!), mandate_revoked (mandate won't re-authorize by waiting!).
-
-escalate_to_human
-  WHAT IT DOES: Transfers the case to a human support agent for manual intervention.
-  WHEN TO USE: When automated recovery has failed or the case requires human judgment.
-  GOOD FOR: risk_block (fraud review needed), hard declines (41/43/54/14/04/46/57/93), high-value cases after multiple failed attempts.
-
-abandon
-  WHAT IT DOES: Stops all recovery attempts. Customer is not contacted again.
-  WHEN TO USE: Only as absolute last resort — customer opted out, all methods exhausted, or recovery cost exceeds revenue value.
-
-═══ FAILURE → TIER → ACTION MAPPING (reason about WHY) ═══
-
-CARD_EXPIRED: The card itself is the problem. Retrying the same card WILL fail again.
-  → TIER: ACTIVE (customer must update card)
-  → First try: send_notification (inform customer, ask to update)
-  → Or directly: update_payment_method (let them fix it now)
-  → NEVER: retry_payment or wait_and_retry (pointless — card is expired)
-
-INSUFFICIENT_FUNDS: The payment method is fine, but the account lacks balance.
-  → TIER: SILENT (funds may arrive)
-  → First try: wait_and_retry (funds may arrive — especially if salary-dependent)
-  → Then: send_notification (remind customer to add funds)
-  → Then: retry_payment (try once funds should be there)
-  → NEVER: update_payment_method (method is fine — money is the issue)
-
-BANK_DECLINED: Bank rejected, possibly transient.
-  → TIER: SILENT (may be temporary)
-  → First try: retry_payment (may be a temporary bank hold)
-  → Then: send_notification (ask customer to check with bank or try different method)
-  → Then: update_payment_method (switch to a working method)
-
-NETWORK_TIMEOUT: Gateway glitch, nothing wrong with the payment method.
-  → TIER: SILENT (transient — just retry)
-  → First try: retry_payment (transient — retry immediately)
-  → Then: wait_and_retry (if still failing, wait and try again)
-  → NEVER: update_payment_method (method is fine — network was the issue)
-
-MANDATE_REVOKED: UPI autopay mandate cancelled by customer.
-  → TIER: ACTIVE (customer must re-authorize)
-  → First try: send_notification (ask to re-authorize mandate)
-  → Then: update_payment_method (switch to manual payment)
-  → NEVER: retry_payment or wait_and_retry (revoked mandate won't work)
-
-RISK_BLOCK: Fraud/risk system flagged the payment.
-  → TIER: ACTIVE (needs human review)
-  → escalate_to_human (requires human fraud review)
-
-USER_DROPOFF: Customer intentionally cancelled or abandoned the checkout flow. Nothing is technically wrong with the payment method.
-  → TIER: ACTIVE (customer must be re-engaged)
-  → First try: send_notification (send a friendly "We noticed you didn't complete your purchase" recovery message with a payment link)
-  → Then: update_payment_method (offer alternative checkout options)
-  → NEVER: retry_payment (customer chose to leave — silently retrying is hostile and may cause chargebacks)
-  → NEVER: wait_and_retry (waiting won't bring the customer back)
-
-You must output EXACTLY this JSON format:
-{
-  "decided_action": "<one of the 6 action names>",
-  "intervention_reasoning": "<step-by-step reasoning explaining WHY this specific action was chosen for this specific failure type, referencing what the action actually does>",
-  "tier": "<silent or active>"
-}"""
+Output EXACTLY this JSON:
+{"decided_action": "<action name>", "intervention_reasoning": "<WHY this action for THIS failure>", "tier": "<silent|active>"}"""
 
 
 def _build_strategy_prompt(
@@ -550,6 +467,101 @@ def _heuristic_fallback(case: Case) -> ActionType:
                 return ActionType.ESCALATE_TO_HUMAN
 
 
+def _deterministic_strategy(case: Case) -> ActionType | None:
+    """Fast-path for unambiguous failure types — skip LLM entirely.
+
+    Returns a definitive action for well-understood failure patterns
+    where the correct intervention is obvious and unambiguous.
+    Returns None for ambiguous cases that benefit from LLM reasoning.
+    """
+    if not case.diagnosis:
+        return None
+
+    cause = case.diagnosis.root_cause
+    attempts = case.attempt_count
+
+    # Instrument-switch text → always ACTIVE + update_payment_method
+    if _needs_instrument_switch(case):
+        if attempts == 0:
+            return ActionType.UPDATE_PAYMENT_METHOD
+        elif attempts == 1:
+            return ActionType.SEND_NOTIFICATION
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+
+    # Hard decline → always escalate (attempt 0 or not)
+    if case.payment.failure_code in HARD_DECLINES:
+        return ActionType.ESCALATE_TO_HUMAN
+
+    # Voice call for high-value user dropoffs or second attempt after notification
+    if case.payment.amount >= 1000 and cause in (
+        FailureType.USER_DROPOFF,
+    ):
+        # High-value abandonment — voice call has highest conversion
+        return ActionType.VOICE_CALL
+    if attempts >= 2 and cause not in HARD_DECLINES:
+        # Already tried notification — escalate to voice
+        return ActionType.VOICE_CALL
+
+    # Card expired → customer must update payment method
+    if cause == FailureType.CARD_EXPIRED:
+        if attempts == 0:
+            return ActionType.UPDATE_PAYMENT_METHOD
+        elif attempts == 1:
+            return ActionType.SEND_NOTIFICATION
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+
+    # Mandate revoked → customer must re-authorize
+    if cause == FailureType.MANDATE_REVOKED:
+        if attempts == 0:
+            return ActionType.SEND_NOTIFICATION
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+
+    # Risk block → needs human review
+    if cause == FailureType.RISK_BLOCK:
+        return ActionType.ESCALATE_TO_HUMAN
+
+    # User dropoff → re-engage customer
+    if cause == FailureType.USER_DROPOFF:
+        if attempts == 0:
+            return ActionType.SEND_NOTIFICATION
+        elif attempts == 1:
+            return ActionType.UPDATE_PAYMENT_METHOD
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+
+    # Network timeout → transient, just retry
+    if cause == FailureType.NETWORK_TIMEOUT:
+        if attempts == 0:
+            return ActionType.RETRY_PAYMENT
+        elif attempts == 1:
+            return ActionType.WAIT_AND_RETRY
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+
+    # Insufficient funds → funds may arrive
+    if cause == FailureType.INSUFFICIENT_FUNDS:
+        if attempts == 0:
+            return ActionType.WAIT_AND_RETRY
+        elif attempts == 1:
+            return ActionType.RETRY_PAYMENT
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+
+    # Bank declined → may be transient
+    if cause == FailureType.BANK_DECLINED:
+        if attempts == 0:
+            return ActionType.RETRY_PAYMENT
+        elif attempts == 1:
+            return ActionType.SEND_NOTIFICATION
+        else:
+            return ActionType.ESCALATE_TO_HUMAN
+
+    return None
+
+
 def decide_intervention(
     case: Case,
     profile: CustomerProfile | None = None,
@@ -635,7 +647,22 @@ def decide_intervention(
         bandit_conf = bandit_inst.get_confidence(cause, bandit_action)
         case.payment.metadata["bandit_confidence"] = bandit_conf
 
-    # === STEP 4: LLM strategy planning ===
+    # === STEP 4: Deterministic fast-path (skip LLM for unambiguous cases) ===
+    fast_action = _deterministic_strategy(case)
+    if fast_action is not None:
+        case.payment.metadata["strategy_reasoning"] = (
+            f"Fast-path: {cause.value} attempt #{case.attempt_count + 1} → "
+            f"{fast_action.value} (deterministic, no LLM needed)"
+        )
+        case.payment.metadata["strategy_source"] = "deterministic_fast_path"
+        action = fast_action
+
+        # Still record outcome for bandit learning
+        if bandit_action:
+            case.payment.metadata["bandit_recommendation"] = bandit_action.value
+        return action
+
+    # === STEP 4.5: LLM strategy planning (only for ambiguous cases) ===
     # Query vector memory for similar past cases
     similar_ctx = ""
     if vector_memory and vector_memory.is_available:
@@ -651,6 +678,7 @@ def decide_intervention(
 
     if result is None:
         action = _heuristic_fallback(case)
+        case.payment.metadata["strategy_source"] = "heuristic_fallback"
     else:
         # Parse decided action
         action_str = result.get("decided_action", "").lower().strip()
@@ -665,6 +693,9 @@ def decide_intervention(
         action = action_map.get(action_str)
         if action is None:
             action = _heuristic_fallback(case)
+            case.payment.metadata["strategy_source"] = "heuristic_fallback"
+        else:
+            case.payment.metadata["strategy_source"] = "llm_strategy_planner"
 
         # Store LLM tier decision for comparison
         llm_tier_str = result.get("tier", "").lower().strip()

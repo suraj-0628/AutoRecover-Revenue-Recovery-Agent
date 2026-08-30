@@ -42,6 +42,7 @@ class ActionType(str, Enum):
     UPDATE_PAYMENT_METHOD = "update_payment_method"
     WAIT_AND_RETRY = "wait_and_retry"
     ABANDON = "abandon"
+    VOICE_CALL = "voice_call"
 
 
 class RecoveryTier(str, Enum):
@@ -64,6 +65,7 @@ SILENT_ACTIONS = frozenset({
 ACTIVE_ACTIONS = frozenset({
     ActionType.SEND_NOTIFICATION,
     ActionType.UPDATE_PAYMENT_METHOD,
+    ActionType.VOICE_CALL,
 })
 
 # Hard decline codes — NEVER retry (Visa/MC network penalty prevention)

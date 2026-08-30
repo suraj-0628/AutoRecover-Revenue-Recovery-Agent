@@ -52,6 +52,7 @@ _TOOL_ACTION_MAP: dict[str, ActionType] = {
     "generate_smart_recovery_link": ActionType.UPDATE_PAYMENT_METHOD,
     "schedule_payday_retry": ActionType.WAIT_AND_RETRY,
     "escalate_to_human_agent": ActionType.ESCALATE_TO_HUMAN,
+    "initiate_voice_call": ActionType.VOICE_CALL,
 }
 
 MAX_HARNESS_ITERATIONS = 8
@@ -439,188 +440,243 @@ class AgentHarness:
         """
         from recovery_agent.agent.stopping import check_stopping_rules, transition_to_active_tier
 
+        try:
+            from opentelemetry import trace
+            tracer = trace.get_tracer("recovery-agent-harness")
+        except Exception:
+            tracer = None
+
         observations: list[Observation] = []
         tools_called_history: list[str] = []
         error_count = 0
 
-        for turn in range(MAX_HARNESS_ITERATIONS):
-            # Check stopping rules before each turn
-            should_stop, stop_reason = check_stopping_rules(case)
-            if should_stop:
-                case.status = CaseStatus.STOPPED
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case, observations=observations,
-                    final_status="stopped", total_turns=turn,
-                    tools_called=tools_called_history, error_count=error_count,
-                )
-            if stop_reason in ("SILENT_RETRY_FAILED", "SILENT_TIER_EXHAUSTED"):
-                case = transition_to_active_tier(case, stop_reason)
-                # Emit tier transition observation
-                observations.append(Observation(
-                    turn=turn + 1,
-                    reasoning=f"Tier transition: {stop_reason}",
-                    tool_calls=[], raw_response={"tier_transition": stop_reason},
-                ))
+        attrs = {
+            "payment_id": case.payment.payment_id,
+            "amount": case.payment.amount,
+            "failure_code": case.payment.failure_code or "",
+            "failure_reason": case.payment.failure_reason or "",
+            "customer_id": case.payment.customer_id or "",
+            "max_attempts": case.max_attempts,
+            "recovery_tier": case.recovery_tier.value if case.recovery_tier else "",
+        }
+        ctx = tracer.start_span("harness.run_recovery_case", attributes=attrs) if tracer else None
+        try:
+            for turn in range(MAX_HARNESS_ITERATIONS):
+                turn_ctx = tracer.start_span(
+                    f"harness.turn_{turn}",
+                    attributes={"turn": turn, "payment_id": case.payment.payment_id},
+                ) if tracer else None
+                try:
+                    # Check stopping rules before each turn
+                    should_stop, stop_reason = check_stopping_rules(case)
+                    if should_stop:
+                        case.status = CaseStatus.STOPPED
+                        self._ingest_outcome(case)
+                        if turn_ctx:
+                            turn_ctx.set_attribute("stop_reason", stop_reason)
+                            turn_ctx.set_attribute("final_status", "stopped")
+                        return HarnessResult(
+                            case=case, observations=observations,
+                            final_status="stopped", total_turns=turn,
+                            tools_called=tools_called_history, error_count=error_count,
+                        )
+                    if stop_reason in ("SILENT_RETRY_FAILED", "SILENT_TIER_EXHAUSTED"):
+                        case = transition_to_active_tier(case, stop_reason)
+                        observations.append(Observation(
+                            turn=turn + 1,
+                            reasoning=f"Tier transition: {stop_reason}",
+                            tool_calls=[], raw_response={"tier_transition": stop_reason},
+                        ))
 
-            similar_ctx = self.vector_memory.get_decision_context(case)
-            prompt = _build_harness_prompt(case, observations, tools_called_history, similar_ctx)
+                    similar_ctx = self.vector_memory.get_decision_context(case)
+                    prompt = _build_harness_prompt(case, observations, tools_called_history, similar_ctx)
 
-            result = invoke_llm_json(
-                prompt=prompt,
-                system=HARNESS_SYSTEM_PROMPT,
-                temperature=0,
-                max_tokens=1024,
+                    result = invoke_llm_json(
+                        prompt=prompt,
+                        system=HARNESS_SYSTEM_PROMPT,
+                        temperature=0,
+                        max_tokens=1024,
+                    )
+
+                    if result is None:
+                        self._ingest_outcome(case)
+                        if turn_ctx:
+                            turn_ctx.set_attribute("final_status", "llm_failed")
+                        return HarnessResult(
+                            case=case,
+                            observations=observations,
+                            final_status="failed",
+                            total_turns=turn,
+                            tools_called=tools_called_history,
+                            error_count=error_count,
+                        )
+
+                    reasoning = result.get("reasoning", "")
+                    tool_calls_raw = result.get("tool_calls", [])
+                    is_final = result.get("is_final", False)
+                    final_status = result.get("status", "in_progress")
+
+                    if turn_ctx:
+                        turn_ctx.set_attribute("reasoning", reasoning[:500])
+                        turn_ctx.set_attribute("tool_calls_count", len(tool_calls_raw))
+                        turn_ctx.set_attribute("is_final", is_final)
+
+                    tool_calls: list[ToolCall] = []
+
+                    for tc in tool_calls_raw:
+                        tool_name = tc.get("tool", "")
+                        arguments = tc.get("arguments", {})
+
+                        call_signature = f"{tool_name}({json.dumps(arguments, sort_keys=True)})"
+                        if call_signature in tools_called_history:
+                            tool_calls.append(ToolCall(
+                                tool=tool_name,
+                                arguments=arguments,
+                                result={"status": "blocked", "message": "Duplicate call prohibited — already attempted"},
+                                is_error=True,
+                            ))
+                            error_count += 1
+                            continue
+
+                        cached_metadata = {
+                            "method": case.payment.metadata.get("method", ""),
+                            "provider": case.payment.metadata.get("provider", ""),
+                            "error_code": case.payment.metadata.get("error_code", case.payment.failure_code),
+                            "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
+                            "error_source": case.payment.metadata.get("error_source", ""),
+                            "error_step": case.payment.metadata.get("error_step", ""),
+                            "failure_reason": case.payment.failure_reason,
+                            "amount": case.payment.amount,
+                            "bank": case.payment.metadata.get("bank", ""),
+                            "card_network": case.payment.metadata.get("card_network", ""),
+                        }
+                        if cached_metadata["method"] or cached_metadata["error_code"]:
+                            arguments["cached_metadata"] = cached_metadata
+
+                        tool_span = tracer.start_span(
+                            f"tool.{tool_name}",
+                            attributes={"tool.name": tool_name, "payment_id": case.payment.payment_id},
+                        ) if tracer else None
+                        try:
+                            decided_action = case.payment.metadata.get("decided_action", "")
+                            if tool_name == "escalate_to_human_agent" and decided_action != "escalate_to_human":
+                                exec_result = {"status": "blocked", "message": f"Escalation blocked: strategy planner decided '{decided_action}', not escalate_to_human"}
+                                is_error = True
+                            elif guardrail_result := self._guardrail_intercept(case, tool_name, arguments):
+                                exec_result = guardrail_result
+                                is_error = True
+                            else:
+                                exec_result = execute_tool(tool_name, arguments)
+                                is_error = exec_result.get("status") in ("error", "unavailable")
+
+                            if tool_span:
+                                tool_span.set_attribute("tool.status", exec_result.get("status", "unknown"))
+                                tool_span.set_attribute("tool.is_error", is_error)
+                                if is_error:
+                                    tool_span.set_attribute("tool.error", exec_result.get("message", "")[:200])
+                        finally:
+                            if tool_span:
+                                tool_span.end()
+
+                        tc_record = ToolCall(
+                            tool=tool_name,
+                            arguments=arguments,
+                            result=exec_result,
+                            is_error=is_error,
+                        )
+                        tool_calls.append(tc_record)
+                        tools_called_history.append(call_signature)
+
+                        if is_error:
+                            error_count += 1
+                            error_msg = exec_result.get("message", "unknown error")
+                            reflection = _reflect_on_error(case, tool_name, error_msg, observations)
+                            reasoning += f" [Reflection: {reflection}]"
+
+                        self._apply_tool_result(case, tool_name, exec_result)
+
+                    obs = Observation(
+                        turn=turn + 1,
+                        reasoning=reasoning,
+                        tool_calls=tool_calls,
+                        raw_response=result,
+                    )
+                    observations.append(obs)
+
+                    if is_final:
+                        status_map = {
+                            "action_dispatched": "action_dispatched",
+                            "recovered": "action_dispatched",
+                            "escalated": "escalated",
+                            "failed": "failed",
+                            "max_iterations": "max_iterations",
+                        }
+                        final = status_map.get(final_status, "failed")
+                        if final == "escalated":
+                            case.status = CaseStatus.ESCALATED
+                        elif final == "action_dispatched":
+                            case.status = CaseStatus.AWAITING_CUSTOMER
+                        else:
+                            case.status = CaseStatus.STOPPED
+
+                        self._ingest_outcome(case)
+                        if ctx:
+                            ctx.set_attribute("final_status", final)
+                            ctx.set_attribute("total_turns", turn + 1)
+                            ctx.set_attribute("tools_called_count", len(tools_called_history))
+                        return HarnessResult(
+                            case=case,
+                            observations=observations,
+                            final_status=final,
+                            total_turns=turn + 1,
+                            tools_called=tools_called_history,
+                            error_count=error_count,
+                        )
+
+                    if turn + 1 >= MAX_HARNESS_ITERATIONS:
+                        case.status = CaseStatus.STOPPED
+                        self._ingest_outcome(case)
+                        if ctx: ctx.set_attribute("final_status", "max_iterations")
+                        return HarnessResult(
+                            case=case,
+                            observations=observations,
+                            final_status="max_iterations",
+                            total_turns=turn + 1,
+                            tools_called=tools_called_history,
+                            error_count=error_count,
+                        )
+
+                    if case.attempt_count >= case.max_attempts:
+                        case.status = CaseStatus.STOPPED
+                        self._ingest_outcome(case)
+                        if ctx: ctx.set_attribute("final_status", "max_iterations")
+                        return HarnessResult(
+                            case=case,
+                            observations=observations,
+                            final_status="max_iterations",
+                            total_turns=turn + 1,
+                            tools_called=tools_called_history,
+                            error_count=error_count,
+                        )
+                finally:
+                    if turn_ctx:
+                        turn_ctx.end()
+
+            case.status = CaseStatus.STOPPED
+            if ctx:
+                ctx.set_attribute("final_status", "max_iterations")
+                ctx.set_attribute("total_turns", MAX_HARNESS_ITERATIONS)
+            return HarnessResult(
+                case=case,
+                observations=observations,
+                final_status="max_iterations",
+                total_turns=MAX_HARNESS_ITERATIONS,
+                tools_called=tools_called_history,
+                error_count=error_count,
             )
-
-            if result is None:
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case,
-                    observations=observations,
-                    final_status="failed",
-                    total_turns=turn,
-                    tools_called=tools_called_history,
-                    error_count=error_count,
-                )
-
-            reasoning = result.get("reasoning", "")
-            tool_calls_raw = result.get("tool_calls", [])
-            is_final = result.get("is_final", False)
-            final_status = result.get("status", "in_progress")
-
-            tool_calls: list[ToolCall] = []
-
-            for tc in tool_calls_raw:
-                tool_name = tc.get("tool", "")
-                arguments = tc.get("arguments", {})
-
-                call_signature = f"{tool_name}({json.dumps(arguments, sort_keys=True)})"
-                if call_signature in tools_called_history:
-                    tool_calls.append(ToolCall(
-                        tool=tool_name,
-                        arguments=arguments,
-                        result={"status": "blocked", "message": "Duplicate call prohibited — already attempted"},
-                        is_error=True,
-                    ))
-                    error_count += 1
-                    continue
-
-                cached_metadata = {
-                    "method": case.payment.metadata.get("method", ""),
-                    "provider": case.payment.metadata.get("provider", ""),
-                    "error_code": case.payment.metadata.get("error_code", case.payment.failure_code),
-                    "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
-                    "error_source": case.payment.metadata.get("error_source", ""),
-                    "error_step": case.payment.metadata.get("error_step", ""),
-                    "failure_reason": case.payment.failure_reason,
-                    "amount": case.payment.amount,
-                    "bank": case.payment.metadata.get("bank", ""),
-                    "card_network": case.payment.metadata.get("card_network", ""),
-                }
-                if cached_metadata["method"] or cached_metadata["error_code"]:
-                    arguments["cached_metadata"] = cached_metadata
-
-                # Block escalate_to_human_agent unless strategy planner decided it
-                decided_action = case.payment.metadata.get("decided_action", "")
-                if tool_name == "escalate_to_human_agent" and decided_action != "escalate_to_human":
-                    exec_result = {"status": "blocked", "message": f"Escalation blocked: strategy planner decided '{decided_action}', not escalate_to_human"}
-                    is_error = True
-                # Guardrail interception — block/modify action tools before execution
-                elif guardrail_result := self._guardrail_intercept(case, tool_name, arguments):
-                    exec_result = guardrail_result
-                    is_error = True
-                else:
-                    exec_result = execute_tool(tool_name, arguments)
-                    is_error = exec_result.get("status") in ("error", "unavailable")
-
-                tc_record = ToolCall(
-                    tool=tool_name,
-                    arguments=arguments,
-                    result=exec_result,
-                    is_error=is_error,
-                )
-                tool_calls.append(tc_record)
-                tools_called_history.append(call_signature)
-
-                if is_error:
-                    error_count += 1
-                    error_msg = exec_result.get("message", "unknown error")
-                    reflection = _reflect_on_error(case, tool_name, error_msg, observations)
-                    reasoning += f" [Reflection: {reflection}]"
-
-                self._apply_tool_result(case, tool_name, exec_result)
-
-            obs = Observation(
-                turn=turn + 1,
-                reasoning=reasoning,
-                tool_calls=tool_calls,
-                raw_response=result,
-            )
-            observations.append(obs)
-
-            if is_final:
-                # The harness NEVER confirms recovery — only webhooks and customer
-                # responses can do that. The harness dispatches actions and hands
-                # control back to the system execution layer.
-                status_map = {
-                    "action_dispatched": "action_dispatched",
-                    "recovered": "action_dispatched",  # LLM cannot claim recovery
-                    "escalated": "escalated",
-                    "failed": "failed",
-                    "max_iterations": "max_iterations",
-                }
-                final = status_map.get(final_status, "failed")
-                if final == "escalated":
-                    case.status = CaseStatus.ESCALATED
-                elif final == "action_dispatched":
-                    case.status = CaseStatus.AWAITING_CUSTOMER
-                else:
-                    case.status = CaseStatus.STOPPED
-
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case,
-                    observations=observations,
-                    final_status=final,
-                    total_turns=turn + 1,
-                    tools_called=tools_called_history,
-                    error_count=error_count,
-                )
-
-            if turn + 1 >= MAX_HARNESS_ITERATIONS:
-                case.status = CaseStatus.STOPPED
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case,
-                    observations=observations,
-                    final_status="max_iterations",
-                    total_turns=turn + 1,
-                    tools_called=tools_called_history,
-                    error_count=error_count,
-                )
-
-            if case.attempt_count >= case.max_attempts:
-                case.status = CaseStatus.STOPPED
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case,
-                    observations=observations,
-                    final_status="max_iterations",
-                    total_turns=turn + 1,
-                    tools_called=tools_called_history,
-                    error_count=error_count,
-                )
-
-        case.status = CaseStatus.STOPPED
-        return HarnessResult(
-            case=case,
-            observations=observations,
-            final_status="max_iterations",
-            total_turns=MAX_HARNESS_ITERATIONS,
-            tools_called=tools_called_history,
-            error_count=error_count,
-        )
+        finally:
+            if ctx:
+                ctx.end()
 
     async def run_recovery_case_async(self, case: Case) -> HarnessResult:
         """Run the full multi-turn harness loop on a case (async, non-blocking).
@@ -630,197 +686,241 @@ class AgentHarness:
         """
         from recovery_agent.agent.stopping import check_stopping_rules, transition_to_active_tier
 
+        try:
+            from opentelemetry import trace
+            tracer = trace.get_tracer("recovery-agent-harness-async")
+        except Exception:
+            tracer = None
+
         observations: list[Observation] = []
-        tools_called_history: list[str] = []  # For repetition prohibition
+        tools_called_history: list[str] = []
         error_count = 0
 
-        for turn in range(MAX_HARNESS_ITERATIONS):
-            # Check stopping rules before each turn
-            should_stop, stop_reason = check_stopping_rules(case)
-            if should_stop:
-                case.status = CaseStatus.STOPPED
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case, observations=observations,
-                    final_status="stopped", total_turns=turn,
-                    tools_called=tools_called_history, error_count=error_count,
-                )
-            if stop_reason in ("SILENT_RETRY_FAILED", "SILENT_TIER_EXHAUSTED"):
-                case = transition_to_active_tier(case, stop_reason)
-                observations.append(Observation(
-                    turn=turn + 1,
-                    reasoning=f"Tier transition: {stop_reason}",
-                    tool_calls=[], raw_response={"tier_transition": stop_reason},
-                ))
+        attrs = {
+            "payment_id": case.payment.payment_id,
+            "amount": case.payment.amount,
+            "failure_code": case.payment.failure_code or "",
+            "failure_reason": case.payment.failure_reason or "",
+            "customer_id": case.payment.customer_id or "",
+            "max_attempts": case.max_attempts,
+            "recovery_tier": case.recovery_tier.value if case.recovery_tier else "",
+            "async": True,
+        }
+        ctx = tracer.start_span("harness.run_recovery_case_async", attributes=attrs) if tracer else None
+        try:
+            for turn in range(MAX_HARNESS_ITERATIONS):
+                turn_ctx = tracer.start_span(
+                    f"harness.turn_{turn}",
+                    attributes={"turn": turn, "payment_id": case.payment.payment_id},
+                ) if tracer else None
+                try:
+                    should_stop, stop_reason = check_stopping_rules(case)
+                    if should_stop:
+                        case.status = CaseStatus.STOPPED
+                        self._ingest_outcome(case)
+                        if turn_ctx:
+                            turn_ctx.set_attribute("stop_reason", stop_reason)
+                            turn_ctx.set_attribute("final_status", "stopped")
+                        return HarnessResult(
+                            case=case, observations=observations,
+                            final_status="stopped", total_turns=turn,
+                            tools_called=tools_called_history, error_count=error_count,
+                        )
+                    if stop_reason in ("SILENT_RETRY_FAILED", "SILENT_TIER_EXHAUSTED"):
+                        case = transition_to_active_tier(case, stop_reason)
+                        observations.append(Observation(
+                            turn=turn + 1,
+                            reasoning=f"Tier transition: {stop_reason}",
+                            tool_calls=[], raw_response={"tier_transition": stop_reason},
+                        ))
 
-            # 1. Context Engineering — build compacted prompt with similar cases
-            similar_ctx = self.vector_memory.get_decision_context(case)
-            prompt = _build_harness_prompt(case, observations, tools_called_history, similar_ctx)
+                    similar_ctx = self.vector_memory.get_decision_context(case)
+                    prompt = _build_harness_prompt(case, observations, tools_called_history, similar_ctx)
 
-            # 2. LLM Tool Plan — ask LLM to choose next tool(s) (non-blocking)
-            result = await invoke_llm_json_async(
-                prompt=prompt,
-                system=HARNESS_SYSTEM_PROMPT,
-                temperature=0,
-                max_tokens=1024,
+                    result = await invoke_llm_json_async(
+                        prompt=prompt,
+                        system=HARNESS_SYSTEM_PROMPT,
+                        temperature=0,
+                        max_tokens=1024,
+                    )
+
+                    if result is None:
+                        self._ingest_outcome(case)
+                        if turn_ctx:
+                            turn_ctx.set_attribute("final_status", "llm_failed")
+                        return HarnessResult(
+                            case=case,
+                            observations=observations,
+                            final_status="failed",
+                            total_turns=turn,
+                            tools_called=tools_called_history,
+                            error_count=error_count,
+                        )
+
+                    reasoning = result.get("reasoning", "")
+                    tool_calls_raw = result.get("tool_calls", [])
+                    is_final = result.get("is_final", False)
+                    final_status = result.get("status", "in_progress")
+
+                    if turn_ctx:
+                        turn_ctx.set_attribute("reasoning", reasoning[:500])
+                        turn_ctx.set_attribute("tool_calls_count", len(tool_calls_raw))
+                        turn_ctx.set_attribute("is_final", is_final)
+
+                    tool_calls: list[ToolCall] = []
+
+                    for tc in tool_calls_raw:
+                        tool_name = tc.get("tool", "")
+                        arguments = tc.get("arguments", {})
+
+                        call_signature = f"{tool_name}({json.dumps(arguments, sort_keys=True)})"
+                        if call_signature in tools_called_history:
+                            tool_calls.append(ToolCall(
+                                tool=tool_name,
+                                arguments=arguments,
+                                result={"status": "blocked", "message": "Duplicate call prohibited — already attempted"},
+                                is_error=True,
+                            ))
+                            error_count += 1
+                            continue
+
+                        cached_metadata = {
+                            "method": case.payment.metadata.get("method", ""),
+                            "provider": case.payment.metadata.get("provider", ""),
+                            "error_code": case.payment.metadata.get("error_code", case.payment.failure_code),
+                            "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
+                            "error_source": case.payment.metadata.get("error_source", ""),
+                            "error_step": case.payment.metadata.get("error_step", ""),
+                            "failure_reason": case.payment.failure_reason,
+                            "amount": case.payment.amount,
+                            "bank": case.payment.metadata.get("bank", ""),
+                            "card_network": case.payment.metadata.get("card_network", ""),
+                        }
+                        if cached_metadata["method"] or cached_metadata["error_code"]:
+                            arguments["cached_metadata"] = cached_metadata
+
+                        tool_span = tracer.start_span(
+                            f"tool.{tool_name}",
+                            attributes={"tool.name": tool_name, "payment_id": case.payment.payment_id},
+                        ) if tracer else None
+                        try:
+                            guardrail_result = self._guardrail_intercept(case, tool_name, arguments)
+                            if guardrail_result is not None:
+                                exec_result = guardrail_result
+                                is_error = True
+                            else:
+                                exec_result = await execute_tool_async(tool_name, arguments)
+                                is_error = exec_result.get("status") in ("error", "unavailable")
+
+                            if tool_span:
+                                tool_span.set_attribute("tool.status", exec_result.get("status", "unknown"))
+                                tool_span.set_attribute("tool.is_error", is_error)
+                                if is_error:
+                                    tool_span.set_attribute("tool.error", exec_result.get("message", "")[:200])
+                        finally:
+                            if tool_span:
+                                tool_span.end()
+
+                        tc_record = ToolCall(
+                            tool=tool_name,
+                            arguments=arguments,
+                            result=exec_result,
+                            is_error=is_error,
+                        )
+                        tool_calls.append(tc_record)
+                        tools_called_history.append(call_signature)
+
+                        if is_error:
+                            error_count += 1
+                            error_msg = exec_result.get("message", "unknown error")
+                            reflection = await _reflect_on_error_async(case, tool_name, error_msg, observations)
+                            reasoning += f" [Reflection: {reflection}]"
+
+                        self._apply_tool_result(case, tool_name, exec_result)
+
+                    obs = Observation(
+                        turn=turn + 1,
+                        reasoning=reasoning,
+                        tool_calls=tool_calls,
+                        raw_response=result,
+                    )
+                    observations.append(obs)
+
+                    if is_final:
+                        status_map = {
+                            "action_dispatched": "action_dispatched",
+                            "recovered": "action_dispatched",
+                            "escalated": "escalated",
+                            "failed": "failed",
+                            "max_iterations": "max_iterations",
+                        }
+                        final = status_map.get(final_status, "failed")
+                        if final == "escalated":
+                            case.status = CaseStatus.ESCALATED
+                        elif final == "action_dispatched":
+                            case.status = CaseStatus.AWAITING_CUSTOMER
+                        else:
+                            case.status = CaseStatus.STOPPED
+
+                        self._ingest_outcome(case)
+                        if ctx:
+                            ctx.set_attribute("final_status", final)
+                            ctx.set_attribute("total_turns", turn + 1)
+                            ctx.set_attribute("tools_called_count", len(tools_called_history))
+                        return HarnessResult(
+                            case=case,
+                            observations=observations,
+                            final_status=final,
+                            total_turns=turn + 1,
+                            tools_called=tools_called_history,
+                            error_count=error_count,
+                        )
+
+                    if turn + 1 >= MAX_HARNESS_ITERATIONS:
+                        case.status = CaseStatus.STOPPED
+                        self._ingest_outcome(case)
+                        if ctx: ctx.set_attribute("final_status", "max_iterations")
+                        return HarnessResult(
+                            case=case,
+                            observations=observations,
+                            final_status="max_iterations",
+                            total_turns=turn + 1,
+                            tools_called=tools_called_history,
+                            error_count=error_count,
+                        )
+
+                    if case.attempt_count >= case.max_attempts:
+                        case.status = CaseStatus.STOPPED
+                        self._ingest_outcome(case)
+                        if ctx: ctx.set_attribute("final_status", "max_iterations")
+                        return HarnessResult(
+                            case=case,
+                            observations=observations,
+                            final_status="max_iterations",
+                            total_turns=turn + 1,
+                            tools_called=tools_called_history,
+                            error_count=error_count,
+                        )
+                finally:
+                    if turn_ctx:
+                        turn_ctx.end()
+
+            case.status = CaseStatus.STOPPED
+            self._ingest_outcome(case)
+            if ctx:
+                ctx.set_attribute("final_status", "max_iterations")
+                ctx.set_attribute("total_turns", MAX_HARNESS_ITERATIONS)
+            return HarnessResult(
+                case=case,
+                observations=observations,
+                final_status="max_iterations",
+                total_turns=MAX_HARNESS_ITERATIONS,
+                tools_called=tools_called_history,
+                error_count=error_count,
             )
-
-            if result is None:
-                # LLM unavailable — fall back to heuristic
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case,
-                    observations=observations,
-                    final_status="failed",
-                    total_turns=turn,
-                    tools_called=tools_called_history,
-                    error_count=error_count,
-                )
-
-            reasoning = result.get("reasoning", "")
-            tool_calls_raw = result.get("tool_calls", [])
-            is_final = result.get("is_final", False)
-            final_status = result.get("status", "in_progress")
-
-            # 3. Execute tool calls
-            tool_calls: list[ToolCall] = []
-
-            for tc in tool_calls_raw:
-                tool_name = tc.get("tool", "")
-                arguments = tc.get("arguments", {})
-
-                # Repetition prohibition
-                call_signature = f"{tool_name}({json.dumps(arguments, sort_keys=True)})"
-                if call_signature in tools_called_history:
-                    tool_calls.append(ToolCall(
-                        tool=tool_name,
-                        arguments=arguments,
-                        result={"status": "blocked", "message": "Duplicate call prohibited — already attempted"},
-                        is_error=True,
-                    ))
-                    error_count += 1
-                    continue
-
-                # Execute the tool — pass cached metadata from case context
-                # so simulated payments don't call live Razorpay API (which would 404)
-                cached_metadata = {
-                    "method": case.payment.metadata.get("method", ""),
-                    "provider": case.payment.metadata.get("provider", ""),
-                    "error_code": case.payment.metadata.get("error_code", case.payment.failure_code),
-                    "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
-                    "error_source": case.payment.metadata.get("error_source", ""),
-                    "error_step": case.payment.metadata.get("error_step", ""),
-                    "failure_reason": case.payment.failure_reason,
-                    "amount": case.payment.amount,
-                    "bank": case.payment.metadata.get("bank", ""),
-                    "card_network": case.payment.metadata.get("card_network", ""),
-                }
-                if cached_metadata["method"] or cached_metadata["error_code"]:
-                    arguments["cached_metadata"] = cached_metadata
-
-                # Guardrail interception — block/modify action tools before execution
-                guardrail_result = self._guardrail_intercept(case, tool_name, arguments)
-                if guardrail_result is not None:
-                    exec_result = guardrail_result
-                    is_error = True
-                else:
-                    exec_result = await execute_tool_async(tool_name, arguments)
-                    is_error = exec_result.get("status") in ("error", "unavailable")
-
-                tc_record = ToolCall(
-                    tool=tool_name,
-                    arguments=arguments,
-                    result=exec_result,
-                    is_error=is_error,
-                )
-                tool_calls.append(tc_record)
-                tools_called_history.append(call_signature)
-
-                # 4. Error Reflection — if tool failed, reflect
-                if is_error:
-                    error_count += 1
-                    error_msg = exec_result.get("message", "unknown error")
-                    reflection = await _reflect_on_error_async(case, tool_name, error_msg, observations)
-                    reasoning += f" [Reflection: {reflection}]"
-
-                # 5. Observation Feed — update case based on tool results
-                self._apply_tool_result(case, tool_name, exec_result)
-
-            # Record observation
-            obs = Observation(
-                turn=turn + 1,
-                reasoning=reasoning,
-                tool_calls=tool_calls,
-                raw_response=result,
-            )
-            observations.append(obs)
-
-            # Check stopping conditions
-            if is_final:
-                # The harness NEVER confirms recovery — only webhooks and customer
-                # responses can do that.
-                status_map = {
-                    "action_dispatched": "action_dispatched",
-                    "recovered": "action_dispatched",  # LLM cannot claim recovery
-                    "escalated": "escalated",
-                    "failed": "failed",
-                    "max_iterations": "max_iterations",
-                }
-                final = status_map.get(final_status, "failed")
-                if final == "escalated":
-                    case.status = CaseStatus.ESCALATED
-                elif final == "action_dispatched":
-                    case.status = CaseStatus.AWAITING_CUSTOMER
-                else:
-                    case.status = CaseStatus.STOPPED
-
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case,
-                    observations=observations,
-                    final_status=final,
-                    total_turns=turn + 1,
-                    tools_called=tools_called_history,
-                    error_count=error_count,
-                )
-
-            # Check max iterations
-            if turn + 1 >= MAX_HARNESS_ITERATIONS:
-                case.status = CaseStatus.STOPPED
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case,
-                    observations=observations,
-                    final_status="max_iterations",
-                    total_turns=turn + 1,
-                    tools_called=tools_called_history,
-                    error_count=error_count,
-                )
-
-            # Check attempt-based stopping
-            if case.attempt_count >= case.max_attempts:
-                case.status = CaseStatus.STOPPED
-                self._ingest_outcome(case)
-                return HarnessResult(
-                    case=case,
-                    observations=observations,
-                    final_status="max_iterations",
-                    total_turns=turn + 1,
-                    tools_called=tools_called_history,
-                    error_count=error_count,
-                )
-
-        # Exhausted all iterations
-        case.status = CaseStatus.STOPPED
-        self._ingest_outcome(case)
-        return HarnessResult(
-            case=case,
-            observations=observations,
-            final_status="max_iterations",
-            total_turns=MAX_HARNESS_ITERATIONS,
-            tools_called=tools_called_history,
-            error_count=error_count,
-        )
+        finally:
+            if ctx:
+                ctx.end()
 
     def _ingest_outcome(self, case: Case) -> None:
         """Ingest completed case outcome into vector memory and strategy metrics."""

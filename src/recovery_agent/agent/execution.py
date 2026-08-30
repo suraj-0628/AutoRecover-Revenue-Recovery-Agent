@@ -12,9 +12,12 @@ Source: Tool Use pattern from Agentic AI (Andrew Ng), Module 3
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from recovery_agent.models import ActionType, Case, RecoveryTier
+
+logger = logging.getLogger(__name__)
 
 
 def execute_action(
@@ -169,6 +172,75 @@ def execute_action(
             "what_happened": "retry_scheduled",
             "observable": "retry_pending",
         }
+
+    elif action == ActionType.VOICE_CALL:
+        # STRICT: Block voice calls during tests — credits cost real money
+        import os as _os, sys as _sys
+        if _os.getenv("PYTEST_CURRENT_TEST") or "pytest" in _sys.modules:
+            logger.warning("[Execution] BLOCKED: Test environment — voice_call skipped for %s", payment_id)
+            return {
+                "action": "voice_call",
+                "detail": "Voice calls blocked during tests. Falling back to notification.",
+                "what_happened": "voice_call_test_blocked",
+                "observable": "fallback_to_notification",
+            }
+        try:
+            from recovery_agent.integrations.superu_client import get_superu_client
+            client = get_superu_client()
+            # Generate recovery link if not provided
+            if not recovery_link:
+                from recovery_agent.agent.tools import execute_tool
+                link_result = execute_tool("generate_smart_recovery_link", {
+                    "payment_id": payment_id,
+                    "allowed_rails": ["upi", "card", "netbanking"],
+                })
+                recovery_link = link_result.get("short_url") or link_result.get("link_url") or ""
+            customer_name = kwargs.get("customer_name", "Customer")
+            result = client.initiate_recovery_call(
+                payment_id=payment_id,
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                amount=amount,
+                failure_reason=failure_reason,
+                recovery_link=recovery_link,
+            )
+            if result.get("status") == "call_initiated":
+                return {
+                    "action": "voice_call",
+                    "detail": f"AI voice call initiated to {result.get('phone', customer_phone)} via SuperU",
+                    "what_happened": "voice_call_initiated",
+                    "observable": "call_outcome_pending",
+                    "campaign_id": result.get("campaign_id", ""),
+                    "channels": ["voice"],
+                }
+            elif result.get("status") == "skipped":
+                # SuperU not configured — fall back to notification
+                return execute_action(
+                    ActionType.SEND_NOTIFICATION,
+                    cause_value=cause_value,
+                    amount=amount,
+                    payment_id=payment_id,
+                    customer_email=customer_email,
+                    customer_phone=customer_phone,
+                    recovery_link=recovery_link,
+                    failure_reason=failure_reason,
+                    attempt_count=attempt_count,
+                    **kwargs,
+                )
+            else:
+                return {
+                    "action": "voice_call",
+                    "detail": f"Voice call failed: {result.get('error', 'unknown error')}. Falling back to notification.",
+                    "what_happened": "voice_call_error",
+                    "observable": "fallback_to_notification",
+                }
+        except Exception as e:
+            return {
+                "action": "voice_call",
+                "detail": f"Voice call error: {e}. Falling back to notification.",
+                "what_happened": "voice_call_exception",
+                "observable": "fallback_to_notification",
+            }
 
     elif action == ActionType.ESCALATE_TO_HUMAN:
         try:

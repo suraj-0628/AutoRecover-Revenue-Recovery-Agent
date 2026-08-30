@@ -158,6 +158,40 @@ TOOL_SCAPES: list[dict[str, Any]] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "initiate_voice_call",
+        "description": "Initiate an AI voice call via SuperU to recover a failed payment. The AI agent will call the customer, explain the issue, and send a payment link. Use for high-value payments (>INR 1000) or when notification has already been sent with no response.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "payment_id": {
+                    "type": "string",
+                    "description": "The Razorpay payment ID",
+                },
+                "customer_name": {
+                    "type": "string",
+                    "description": "Customer's name for personalization",
+                },
+                "customer_phone": {
+                    "type": "string",
+                    "description": "Customer's phone number (with country code)",
+                },
+                "amount": {
+                    "type": "number",
+                    "description": "Payment amount in INR",
+                },
+                "failure_reason": {
+                    "type": "string",
+                    "description": "Human-readable failure reason",
+                },
+                "recovery_link": {
+                    "type": "string",
+                    "description": "Razorpay payment link URL (auto-generated if empty)",
+                },
+            },
+            "required": ["payment_id", "customer_name", "customer_phone", "amount"],
+        },
+    },
 ]
 
 
@@ -437,6 +471,63 @@ def escalate_to_human_agent(payment_id: str, reason: str, **kwargs) -> dict[str,
     }
 
 
+def initiate_voice_call(
+    payment_id: str,
+    customer_name: str,
+    customer_phone: str,
+    amount: float,
+    failure_reason: str = "",
+    recovery_link: str = "",
+    **kwargs,
+) -> dict[str, Any]:
+    """Initiate an AI voice call via SuperU to recover a failed payment.
+
+    The AI voice agent will call the customer, explain the payment failure,
+    offer alternative payment methods, and send a Razorpay payment link.
+
+    CRITICAL: Never invoked during tests — credits cost real money.
+    """
+    import os as _os
+    import sys as _sys
+    # Double-guard: block in test environments at tool level too
+    if _os.getenv("PYTEST_CURRENT_TEST") or "pytest" in _sys.modules:
+        return {
+            "status": "skipped",
+            "reason": "test_environment",
+            "message": "Voice call blocked during tests — credits are real money.",
+        }
+
+    from recovery_agent.integrations.superu_client import get_superu_client
+
+    client = get_superu_client()
+
+    # Generate recovery link if not provided
+    if not recovery_link:
+        link_result = generate_smart_recovery_link(
+            payment_id=payment_id,
+            allowed_rails=["upi", "card", "netbanking"],
+        )
+        recovery_link = link_result.get("short_url") or link_result.get("link_url") or ""
+
+    result = client.initiate_recovery_call(
+        payment_id=payment_id,
+        customer_name=customer_name,
+        customer_phone=customer_phone,
+        amount=amount,
+        failure_reason=failure_reason,
+        recovery_link=recovery_link,
+    )
+
+    return {
+        "status": result.get("status", "unknown"),
+        "payment_id": payment_id,
+        "campaign_id": result.get("campaign_id", ""),
+        "phone": result.get("phone", customer_phone),
+        "detail": result.get("detail", ""),
+        "message": f"Voice call {result.get('status', 'unknown')} for {payment_id}",
+    }
+
+
 def query_payment_recovery_kb(
     query: str,
     domain: str = "all",
@@ -514,6 +605,7 @@ TOOL_FUNCTIONS: dict[str, callable] = {
     "generate_smart_recovery_link": generate_smart_recovery_link,
     "schedule_payday_retry": schedule_payday_retry,
     "escalate_to_human_agent": escalate_to_human_agent,
+    "initiate_voice_call": initiate_voice_call,
     "query_payment_recovery_kb": query_payment_recovery_kb,
 }
 

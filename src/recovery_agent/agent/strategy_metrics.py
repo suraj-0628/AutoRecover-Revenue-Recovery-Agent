@@ -57,23 +57,30 @@ class StrategyMetricsStore:
 
     Tracks (failure_type, action) → {successes, attempts} for empirical
     strategy selection. Thread-safe with connection-per-thread pattern.
+
+    Schema is created per-connection (not once at init) because :memory:
+    databases are per-connection with threading.local().
     """
 
     def __init__(self, db_path: str | Path | None = None):
         self._db_path = str(db_path) if db_path else ":memory:"
         self._local = threading.local()
-        self._init_schema()
+        self._initialized_local = threading.local()
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Get thread-local SQLite connection."""
+        """Get thread-local SQLite connection with schema guarantee."""
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self._db_path)
-            self._local.conn.row_factory = sqlite3.Row
+            conn = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+            # Ensure schema exists for THIS thread's connection
+            if not getattr(self._initialized_local, "done", False):
+                self._init_schema(conn)
+                self._initialized_local.done = True
         return self._local.conn
 
-    def _init_schema(self) -> None:
-        """Create tables if they don't exist."""
-        conn = self._get_conn()
+    def _init_schema(self, conn: sqlite3.Connection) -> None:
+        """Create tables on the given connection."""
         conn.execute("""
             CREATE TABLE IF NOT EXISTS strategy_metrics (
                 failure_type TEXT NOT NULL,
