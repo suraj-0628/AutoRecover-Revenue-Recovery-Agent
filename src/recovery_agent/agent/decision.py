@@ -13,6 +13,7 @@ Source: Planning pattern from Agentic AI (Andrew Ng), Module 5
 from __future__ import annotations
 
 from datetime import datetime
+import threading
 
 from recovery_agent.agent.decline_router import DeclineCodeRouter
 from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
@@ -28,6 +29,7 @@ from recovery_agent.models import (
     CustomerProfile,
     FailureType,
     HARD_DECLINES,
+    SOFT_DECLINES_CARD_UPDATE,
     RecoveryTier,
     SILENT_ACTIONS,
     ACTIVE_ACTIONS,
@@ -49,44 +51,56 @@ _strategy_metrics: StrategyMetricsStore | None = None
 # Shared ThompsonBandit instance (built once, reused)
 _thompson_bandit: ThompsonBandit | None = None
 
+_init_lock = threading.Lock()
+
 
 def _get_kg_router() -> RazorpayKnowledgeGraph:
-    """Lazy-init the shared KG router."""
+    """Lazy-init the shared KG router (thread-safe)."""
     global _kg_router
     if _kg_router is None:
-        _kg_router = RazorpayKnowledgeGraph()
+        with _init_lock:
+            if _kg_router is None:
+                _kg_router = RazorpayKnowledgeGraph()
     return _kg_router
 
 
 def _get_decline_router() -> DeclineCodeRouter:
-    """Lazy-init the shared decline router."""
+    """Lazy-init the shared decline router (thread-safe)."""
     global _decline_router
     if _decline_router is None:
-        _decline_router = DeclineCodeRouter()
+        with _init_lock:
+            if _decline_router is None:
+                _decline_router = DeclineCodeRouter()
     return _decline_router
 
 
 def _get_payday_scheduler() -> PaydayScheduler:
-    """Lazy-init the shared payday scheduler."""
+    """Lazy-init the shared payday scheduler (thread-safe)."""
     global _payday_scheduler
     if _payday_scheduler is None:
-        _payday_scheduler = PaydayScheduler()
+        with _init_lock:
+            if _payday_scheduler is None:
+                _payday_scheduler = PaydayScheduler()
     return _payday_scheduler
 
 
 def _get_strategy_metrics() -> StrategyMetricsStore:
-    """Lazy-init the shared strategy metrics store."""
+    """Lazy-init the shared strategy metrics store (thread-safe)."""
     global _strategy_metrics
     if _strategy_metrics is None:
-        _strategy_metrics = StrategyMetricsStore()
+        with _init_lock:
+            if _strategy_metrics is None:
+                _strategy_metrics = StrategyMetricsStore()
     return _strategy_metrics
 
 
 def _get_thompson_bandit() -> ThompsonBandit:
-    """Lazy-init the shared Thompson Sampling bandit."""
+    """Lazy-init the shared Thompson Sampling bandit (thread-safe)."""
     global _thompson_bandit
     if _thompson_bandit is None:
-        _thompson_bandit = ThompsonBandit(_get_strategy_metrics())
+        with _init_lock:
+            if _thompson_bandit is None:
+                _thompson_bandit = ThompsonBandit(_get_strategy_metrics())
     return _thompson_bandit
 
 
@@ -203,7 +217,8 @@ def _check_hard_decline(case: Case) -> ActionType | None:
     # Check via failure type
     if case.diagnosis:
         cause = case.diagnosis.root_cause
-        if cause == FailureType.CARD_EXPIRED and failure_code in ("54", "14"):
+        # Expired card (54) is NOT a hard decline — customer can update card
+        if cause == FailureType.CARD_EXPIRED and failure_code == "14":
             case.penalties_prevented += 1
             case.payment.metadata["hard_decline_blocked"] = True
             return ActionType.ESCALATE_TO_HUMAN
@@ -272,7 +287,7 @@ def _build_strategy_prompt(
     if profile:
         salary_info = "unknown"
         if profile.salary_window.typical_pay_day > 0:
-            current_day = datetime.now().day
+            current_day = datetime.now(timezone.utc).day
             in_window = abs(current_day - profile.salary_window.typical_pay_day) <= 2
             salary_info = (
                 f"pay day={profile.salary_window.typical_pay_day}, "
@@ -499,7 +514,7 @@ def _deterministic_strategy(case: Case) -> ActionType | None:
     ):
         # High-value abandonment — voice call has highest conversion
         return ActionType.VOICE_CALL
-    if attempts >= 2 and cause not in HARD_DECLINES:
+    if attempts >= 2 and case.payment.failure_code not in HARD_DECLINES:
         # Already tried notification — escalate to voice
         return ActionType.VOICE_CALL
 
@@ -688,6 +703,7 @@ def decide_intervention(
             "escalate_to_human": ActionType.ESCALATE_TO_HUMAN,
             "update_payment_method": ActionType.UPDATE_PAYMENT_METHOD,
             "wait_and_retry": ActionType.WAIT_AND_RETRY,
+            "voice_call": ActionType.VOICE_CALL,
             "abandon": ActionType.ABANDON,
         }
         action = action_map.get(action_str)
@@ -707,7 +723,6 @@ def decide_intervention(
     # === STEP 4.5: Bandit override (if high confidence) ===
     # If bandit has high confidence (>80%) and disagrees with LLM, override
     if bandit_action and bandit_action != action:
-        bandit_conf = bandit_inst.get_confidence(cause, bandit_action)
         if bandit_conf > 0.80:
             # Bandit is very confident — override LLM
             case.payment.metadata["bandit_override"] = True
@@ -726,6 +741,11 @@ def decide_intervention(
                 f"Tier 1 (Silent) active. {action.value} blocked. "
                 f"Falling back to wait_and_retry."
             )
+            # Log if bandit recommendation was overridden by tier
+            if bandit_action and bandit_action == action:
+                case.payment.metadata["tier_overrode_bandit"] = True
+                case.payment.metadata["tier_overrode_bandit_from"] = bandit_action.value
+                case.payment.metadata["tier_overrode_bandit_to"] = ActionType.WAIT_AND_RETRY.value
             action = ActionType.WAIT_AND_RETRY
     else:
         # Active tier: all actions allowed

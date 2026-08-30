@@ -2,10 +2,60 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
+from pathlib import Path
 
-from recovery_agent.agent import RecoveryAgent
-from recovery_agent.agent.evaluation import run_batch_evaluation
-from recovery_agent.models import Case
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def validate_config() -> list[str]:
+    """FLAW-47: Validate required environment variables at startup.
+
+    Returns list of warnings (non-fatal) or exits on critical missing config.
+    """
+    warnings = []
+    errors = []
+
+    # Critical: Razorpay test keys (needed for SDK)
+    if not os.getenv("RAZORPAY_KEY_ID"):
+        errors.append("RAZORPAY_KEY_ID not set — Razorpay SDK will not work")
+    if not os.getenv("RAZORPAY_KEY_SECRET"):
+        errors.append("RAZORPAY_KEY_SECRET not set — Razorpay SDK will not work")
+
+    # Optional but recommended: LLM endpoint
+    if not os.getenv("OMNIRoute"):
+        warnings.append("OMNIRoute not set — LLM calls will use fallback heuristic")
+
+    # Optional: SuperU voice calling
+    if not os.getenv("SUPERU_API_KEY"):
+        warnings.append("SUPERU_API_KEY not set — voice calls disabled")
+    if not os.getenv("SUPERU_ASSISTANT_ID"):
+        warnings.append("SUPERU_ASSISTANT_ID not set — voice calls disabled")
+
+    # Optional: Phoenix observability
+    if not os.getenv("PHOENIX_COLLECTOR_ENDPOINT"):
+        warnings.append("PHOENIX_COLLECTOR_ENDPOINT not set — tracing disabled")
+
+    # Print warnings
+    for w in warnings:
+        print(f"[config] WARNING: {w}", file=sys.stderr)
+
+    # Exit on critical errors
+    if errors:
+        for e in errors:
+            print(f"[config] ERROR: {e}", file=sys.stderr)
+        print("[config] Set these in .env file. Exiting.", file=sys.stderr)
+        sys.exit(1)
+
+    return warnings
+
+
+# Validate config on import
+if os.getenv("RECOVERY_AGENT_VALIDATE_CONFIG", "1") != "0":
+    validate_config()
 
 
 def run_single(payment_id: str = "pay_test_001", use_harness: bool = False) -> None:

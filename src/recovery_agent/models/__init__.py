@@ -73,12 +73,16 @@ ACTIVE_ACTIONS = frozenset({
 HARD_DECLINES = frozenset({
     "41",  # Lost card
     "43",  # Stolen card
-    "54",  # Expired card
     "14",  # Invalid card number
     "04",  # Pick up card (fraud)
     "46",  # Closed account
     "57",  # Transaction not permitted
     "93",  # Transaction cannot be completed
+})
+
+# Soft declines that should trigger UPDATE_PAYMENT_METHOD (not escalation)
+SOFT_DECLINES_CARD_UPDATE = frozenset({
+    "54",  # Expired card — customer can update card
 })
 
 

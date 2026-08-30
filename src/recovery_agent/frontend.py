@@ -166,7 +166,32 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
         return
     active_agent_payments.add(payment_id)
 
+    # BUG FIX: Add timeout to prevent hung threads from accumulating
+    import threading
+    _AGENT_TIMEOUT_SECONDS = 120  # 2 minutes max per agent execution
+    _agent_timer = None
+
+    def _timeout_handler():
+        print(f"[Frontend] Agent timeout for {payment_id} after {_AGENT_TIMEOUT_SECONDS}s")
+        try:
+            push_event(payment_id, "error", {
+                "step": "timeout",
+                "msg": f"Agent execution timed out after {_AGENT_TIMEOUT_SECONDS}s",
+                "detail": "The agent thread was terminated due to timeout. Possible LLM hang or network issue.",
+                "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            })
+        except Exception:
+            pass
+        if store.has_payment(payment_id):
+            p = store.get_payment(payment_id)
+            p["status"] = "timeout"
+            store.flush()
+
     try:
+        _agent_timer = threading.Timer(_AGENT_TIMEOUT_SECONDS, _timeout_handler)
+        _agent_timer.daemon = True
+        _agent_timer.start()
+
         _run_agent_for_payment_inner(payment_id, amount, failure_reason, customer, scenario_type, failure_code, error_source, error_step)
     except Exception as e:
         # Bug #3: Surface errors to the WebSocket trail instead of silently crashing
@@ -191,6 +216,8 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
             })
             store.flush()
     finally:
+        if _agent_timer:
+            _agent_timer.cancel()
         active_agent_payments.discard(payment_id)
 
 
@@ -348,7 +375,19 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             detail="Querying strategy metrics and planning optimal recovery intervention",
         )
         case.attempt_count = 0
-        case = run_decision(case)
+        # BUG FIX: Pass memory context to decision layer (was passing nothing)
+        from recovery_agent.agent.strategy_metrics import StrategyMetricsStore, ThompsonBandit
+        try:
+            strategy_metrics = StrategyMetricsStore()
+            bandit = ThompsonBandit(strategy_metrics)
+        except Exception:
+            strategy_metrics = None
+            bandit = None
+
+        case = run_decision(
+            case, profile=cust_profile, memory=memory_store,
+            strategy_metrics=strategy_metrics, bandit=bandit,
+        )
         action_val = case.payment.metadata.get("decided_action", "send_notification")
         action = ActionType(action_val)
         strategy_source = case.payment.metadata.get("strategy_source", "unknown")
@@ -641,17 +680,14 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                     "allowed_rails": ["upi", "card", "netbanking"],
                 })
 
-        execution = execute_action(
-            action=action_val,
-            cause_value=cause,
-            amount=amount,
-            payment_id=payment_id,
-            customer_email=customer_email,
-            customer_phone=customer.get("contact", ""),
-            recovery_link=sdk_res.get("short_url") or sdk_res.get("link_url"),
-            failure_reason=failure_reason,
-            attempt_count=case.attempt_count,
-        )
+        # BUG FIX: The harness already executed the tool — do NOT re-execute.
+        # Use the harness result directly instead of calling execute_action() again.
+        # This prevents duplicate Razorpay orders, duplicate emails, and double payment links.
+        execution = {
+            "action": action_val,
+            "detail": f"Harness executed {tool_name_str} after {harness_result.total_turns} turns",
+            "observable": sdk_res.get("observable", "none"),
+        }
 
         emit_thought(
             step="acted",
@@ -1256,7 +1292,8 @@ function showStore() {
 }
 
 /* ── Payment Logic (preserved) ── */
-const paymentId = "pay_" + Math.random().toString(36).substr(2,9);
+const urlParams = new URLSearchParams(window.location.search);
+const paymentId = urlParams.get("payment_id") || ("pay_" + Math.random().toString(36).substr(2,9));
 const socket = io();
 
 function getCustomerData() {
@@ -1392,6 +1429,20 @@ socket.on("ui_spec_overlay", function(data) {
   setTimeout(function() { overlay.classList.remove("visible"); }, 8000);
 });
 
+/* FLAW-38: Real-time payment status update (webhook push, not polling) */
+socket.on("payment_update", function(data) {
+  if (data.payment_id !== paymentId) return;
+  const s = document.getElementById("status");
+  if (data.status === "captured") {
+    s.className = "status-bar active s-success";
+    s.innerHTML = "Payment of INR " + (data.amount || 0).toLocaleString() + " captured successfully! Thank you.";
+    document.getElementById("action-box").classList.remove("visible");
+  } else if (data.status === "failed") {
+    s.className = "status-bar active s-failed";
+    s.innerHTML = "Payment could not be processed. Please try again or update your payment method.";
+  }
+});
+
 function applyGenerativeUISpec(spec) {
   if (!spec) return;
   if (spec.headline) { document.querySelector(".checkout-title").textContent = spec.headline; }
@@ -1410,466 +1461,6 @@ renderProducts();
 </body></html>"""
 
 
-# ─── Merchant Dashboard ───────────────────────────────────────
-MERCHANT_PAGE = """<!DOCTYPE html>
-<html lang="en" data-theme="light">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Revenue Recovery — Agent Studio</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
-<style>
-:root{
-  --bg-canvas:#FFFFFF;--bg-surface:#F7F8FA;--bg-card:#FFFFFF;
-  --border-subtle:#E5E7EB;--border-hover:#D1D5DB;
-  --text-primary:#1A1A2E;--text-secondary:#6B7280;--text-muted:#9CA3AF;
-  --brand-blue:#2563EB;--brand-blue-light:#EFF6FF;
-  --success:#16A34A;--success-light:#F0FDF4;--success-border:#BBF7D0;
-  --error:#DC2626;--error-light:#FEF2F2;--error-border:#FECACA;
-  --warning:#F59E0B;--warning-light:#FFFBEB;--warning-border:#FDE68A;
-  --accent-teal:#0EA5E9;
-  --sidebar-bg:#F7F8FA;--sidebar-active:#EFF6FF;--sidebar-active-text:#2563EB;
-  --card-shadow:0 1px 3px rgba(0,0,0,0.04),0 1px 2px rgba(0,0,0,0.02);
-  --card-shadow-hover:0 4px 12px rgba(0,0,0,0.06);
-}
-[data-theme="dark"]{
-  --bg-canvas:#020617;--bg-surface:#0F172A;--bg-card:rgba(15,23,42,0.7);
-  --border-subtle:rgba(255,255,255,0.06);--border-hover:rgba(255,255,255,0.1);
-  --text-primary:#F8FAFC;--text-secondary:#94A3B8;--text-muted:#475569;
-  --brand-blue:#3B82F6;--brand-blue-light:rgba(59,130,246,0.1);
-  --success:#10B981;--success-light:rgba(16,185,129,0.1);--success-border:rgba(16,185,129,0.2);
-  --error:#EF4444;--error-light:rgba(239,68,68,0.1);--error-border:rgba(239,68,68,0.2);
-  --warning:#F59E0B;--warning-light:rgba(245,158,11,0.1);--warning-border:rgba(245,158,11,0.2);
-  --sidebar-bg:#0F172A;--sidebar-active:rgba(59,130,246,0.1);--sidebar-active-text:#60A5FA;
-  --card-shadow:0 1px 3px rgba(0,0,0,0.2);--card-shadow-hover:0 4px 12px rgba(0,0,0,0.3);
-}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg-canvas);color:var(--text-primary);letter-spacing:-0.011em;min-height:100vh;display:flex;transition:background .3s,color .3s}
-
-/* Sidebar */
-.sidebar{width:220px;background:var(--sidebar-bg);border-right:1px solid var(--border-subtle);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:50;transition:background .3s}
-.sidebar-logo{padding:20px 20px 16px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:10px}
-.sidebar-logo-icon{width:32px;height:32px;background:var(--brand-blue);border-radius:6px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px;font-weight:700}
-.sidebar-logo-text{font-size:14px;color:var(--text-primary)}
-.sidebar-logo-sub{font-size:10px;color:var(--text-muted);font-weight:400;margin-top:1px}
-.sidebar-nav{flex:1;padding:12px 8px;overflow-y:auto}
-.nav-section{font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;padding:8px 12px 4px;margin-top:8px}
-.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;font-size:13px;font-weight:500;color:var(--text-secondary);text-decoration:none;transition:all .15s;cursor:pointer;border-bottom:2px solid transparent}
-.nav-item:hover{background:var(--brand-blue-light);color:var(--text-primary);border-bottom-color:var(--brand-blue)}
-.nav-item.active{background:var(--sidebar-active);color:var(--sidebar-active-text);font-weight:600}
-.nav-item .nav-icon{width:18px;text-align:center;font-size:14px;flex-shrink:0}
-.nav-badge{font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600;background:var(--brand-blue);color:#fff;margin-left:auto}
-.sidebar-footer{padding:12px 16px;border-top:1px solid var(--border-subtle);font-size:11px;color:var(--text-muted)}
-
-/* Main Area */
-.main{margin-left:220px;flex:1;display:flex;flex-direction:column;min-height:100vh;position:relative}
-.main::before{content:'';position:fixed;top:0;left:220px;right:0;bottom:0;background:radial-gradient(circle at 20% 50%,rgba(59,130,246,0.03) 0%,transparent 50%),radial-gradient(circle at 80% 20%,rgba(16,185,129,0.03) 0%,transparent 50%);pointer-events:none;z-index:0}
-.topbar{height:56px;background:var(--bg-canvas);border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center;padding:0 28px;position:sticky;top:0;z-index:40;transition:background .3s}
-.topbar-left{display:flex;align-items:center;gap:16px}
-.breadcrumb{font-size:13px;color:var(--text-secondary)}
-.breadcrumb span{color:var(--text-primary);font-weight:600}
-.topbar-right{display:flex;align-items:center;gap:12px}
-.topbar-search{background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:8px;padding:7px 14px 7px 32px;font-size:13px;color:var(--text-primary);width:220px;outline:none;transition:border-color .15s}
-.topbar-search:focus{border-color:var(--brand-blue)}
-.search-wrap{position:relative}
-.search-wrap::before{content:"\\1F50D";position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:12px;z-index:1}
-.theme-toggle{width:36px;height:36px;border-radius:8px;border:1px solid var(--border-subtle);background:var(--bg-surface);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .15s}
-.theme-toggle:hover{border-color:var(--brand-blue);background:var(--brand-blue-light)}
-
-/* Content */
-.content{padding:24px 28px;flex:1}
-.agent-hero{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:14px;padding:24px;margin-bottom:24px;box-shadow:var(--card-shadow);display:flex;justify-content:space-between;align-items:center;transition:all .2s}
-.agent-hero:hover{box-shadow:var(--card-shadow-hover)}
-.agent-identity{display:flex;align-items:center;gap:14px}
-.agent-icon{width:44px;height:44px;background:var(--brand-blue);border-radius:12px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px}
-.agent-name{font-size:18px;font-weight:700;color:var(--text-primary)}
-.agent-subtitle{font-size:13px;color:var(--text-secondary);margin-top:2px}
-.health-badge{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--success);padding:6px 14px;border-radius:20px;background:var(--success-light);border:1px solid var(--success-border)}
-.health-dot{width:7px;height:7px;background:var(--success);border-radius:50%;animation:blink 1.5s infinite}
-.scenario-triggers{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.scenario-triggers button{padding:6px 14px;border-radius:8px;font-size:12px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit}
-.scenario-trigger{background:transparent;border:1px solid var(--border-subtle);color:var(--text-secondary)}
-.scenario-trigger:hover{border-color:var(--brand-blue);color:var(--brand-blue);background:var(--brand-blue-light)}
-.scenario-trigger:active{transform:scale(0.97)}
-.scenario-batch{background:var(--brand-blue);border:1px solid var(--brand-blue);color:#fff}
-.scenario-batch:hover{background:#1d4ed8}
-
-/* Tabs */
-.tabs{display:flex;gap:0;border-bottom:2px solid var(--border-subtle);margin-bottom:24px}
-.tab{padding:10px 20px;font-size:13px;font-weight:500;color:var(--text-secondary);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s}
-.tab:hover{color:var(--text-primary)}
-.tab.active{color:var(--brand-blue);border-bottom-color:var(--brand-blue);font-weight:600}
-
-/* Metrics Row */
-.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
-.metric{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:12px;padding:20px 16px;box-shadow:var(--card-shadow);transition:all .2s}
-.metric:hover{box-shadow:var(--card-shadow-hover);border-color:var(--border-hover)}
-.metric-value{font-size:2em;font-weight:700;color:var(--brand-blue);letter-spacing:-0.02em;line-height:1}
-.metric-value.sv{color:var(--success)}.metric-value.wv{color:var(--warning)}.metric-value.rv{color:var(--error)}
-.metric-label{color:var(--text-muted);font-size:11px;margin-top:4px;font-weight:500;text-transform:uppercase;letter-spacing:0.04em}
-.metric:nth-child(1){border-left:3px solid var(--brand-blue)}
-.metric:nth-child(2){border-left:3px solid var(--success)}
-.metric:nth-child(3){border-left:3px solid var(--error)}
-.metric:nth-child(4){border-left:3px solid var(--warning)}
-
-/* Grid layouts */
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
-
-/* Card */
-.card{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:14px;padding:20px;box-shadow:var(--card-shadow);transition:all .2s}
-.card:hover{box-shadow:var(--card-shadow-hover)}
-.card h2{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:14px;font-weight:600}
-
-/* Activity Feed */
-.activity-feed{max-height:600px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border-subtle) transparent;scroll-behavior:smooth}
-.activity-item{display:flex;gap:12px;padding:14px 8px;border-bottom:1px solid var(--border-subtle);font-size:13px;transition:all .2s;cursor:pointer;position:relative}
-.activity-item::before{content:'';position:absolute;left:24px;top:46px;bottom:-1px;width:2px;background:var(--border-subtle)}
-.activity-item:last-child::before{display:none}
-.activity-item:hover{background:var(--bg-surface)}
-.activity-icon{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
-.activity-icon.recovering{background:var(--warning-light);color:var(--warning)}
-.activity-icon.recovered{background:var(--success-light);color:var(--success)}
-.activity-icon.failed{background:var(--error-light);color:var(--error)}
-.activity-icon.escalated{background:var(--brand-blue-light);color:var(--brand-blue)}
-.activity-icon.scheduled{background:var(--brand-blue-light);color:var(--brand-blue)}
-.activity-body{flex:1;min-width:0}
-.activity-title{font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px}
-.activity-title .live{color:var(--success);font-size:10px;font-weight:600}
-.activity-meta{color:var(--text-secondary);font-size:12px;margin-top:3px;display:flex;gap:12px;align-items:center}
-.activity-amount{font-weight:600;color:var(--text-primary)}
-
-/* Table */
-table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border-subtle);font-size:12px}
-th{color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600}
-tr{transition:background .15s}
-tr:hover{background:var(--bg-surface)}
-
-/* Badges */
-.badge{display:inline-block;padding:3px 10px;border-radius:8px;font-size:10px;font-weight:600;letter-spacing:0.02em}
-.bs{background:var(--success-light);color:var(--success);border:1px solid var(--success-border)}
-.bf{background:var(--error-light);color:var(--error);border:1px solid var(--error-border)}
-.bp{background:var(--brand-blue-light);color:var(--brand-blue);border:1px solid rgba(59,130,246,0.2)}
-.bw{background:var(--warning-light);color:var(--warning);border:1px solid var(--warning-border)}
-.btier-silent{background:var(--brand-blue-light);color:var(--brand-blue);border:1px solid rgba(59,130,246,0.2)}
-.btier-active{background:var(--warning-light);color:var(--warning);border:1px solid var(--warning-border)}
-.btier-hard{background:var(--error-light);color:var(--error);border:1px solid var(--error-border)}
-
-/* Strategy items */
-.strategy-item{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border-subtle);font-size:12px}
-.strategy-code{color:var(--brand-blue);font-weight:600;min-width:60px;font-family:'SF Mono',SFMono-Regular,monospace;font-size:11px}
-.strategy-name{color:var(--text-primary);flex:1}
-.strategy-tier{font-size:10px;padding:3px 8px;border-radius:6px;font-weight:600}
-
-/* Penalty counter */
-.penalty-counter{text-align:center;padding:20px}
-.penalty-big{font-size:2.2em;font-weight:700;color:var(--success);letter-spacing:-0.02em}
-.penalty-sub{color:var(--text-muted);font-size:12px;margin-top:6px;font-weight:500}
-.penalty-usd{color:var(--brand-blue);font-size:14px;margin-top:10px;font-weight:600}
-
-/* Trail */
-.trail{max-height:500px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border-subtle) transparent}
-.trail-item{padding:12px;border-left:3px solid var(--border-subtle);margin-bottom:4px;border-radius:0 10px 10px 0;background:var(--bg-surface);font-size:12px;transition:background .15s}
-.trail-item:hover{background:var(--brand-blue-light)}
-.trail-item.t-detecting{border-left-color:var(--brand-blue)}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8B5CF6}.trail-item.t-deciding{border-left-color:var(--warning)}.trail-item.t-acting,.trail-item.t-acted{border-left-color:var(--success)}.trail-item.t-waiting{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-observed{border-left-color:#6366F1}.trail-item.t-stopping{border-left-color:var(--error)}
-.trail-time{color:var(--text-muted);font-size:10px;font-weight:500}.trail-msg{color:var(--text-primary);margin-top:3px;font-weight:500}.trail-detail{color:var(--text-secondary);margin-top:3px;font-size:11px;line-height:1.5}
-
-/* Toast */
-.toast{position:fixed;top:20px;right:20px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:12px;padding:12px 18px;font-size:12px;z-index:1000;transform:translateX(120%);transition:transform .3s cubic-bezier(.4,0,.2,1);font-weight:500;box-shadow:var(--card-shadow-hover)}
-.toast.show{transform:translateX(0)}.toast.success{border-left:3px solid var(--success)}.toast.info{border-left:3px solid var(--brand-blue)}
-
-/* Empty state */
-.empty{text-align:center;padding:40px;color:var(--text-muted);font-size:13px}
-
-/* Case detail drawer */
-.drawer-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:200;opacity:0;pointer-events:none;transition:opacity .25s}
-.drawer-overlay.open{opacity:1;pointer-events:all}
-.drawer{position:fixed;top:0;right:0;width:600px;height:100vh;background:var(--bg-canvas);border-left:1px solid var(--border-subtle);z-index:201;transform:translateX(100%);transition:transform .3s cubic-bezier(.4,0,.2,1);overflow-y:auto;display:flex;flex-direction:column;scroll-behavior:smooth}
-.drawer.open{transform:translateX(0)}
-.drawer-header{padding:20px 24px;border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center}
-.drawer-title{font-size:16px;font-weight:700;color:var(--text-primary)}
-.drawer-close{width:32px;height:32px;border-radius:8px;border:1px solid var(--border-subtle);background:var(--bg-surface);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .15s}
-.drawer-close:hover{background:var(--error-light);border-color:var(--error);color:var(--error)}
-.drawer-body{padding:20px 24px;flex:1}
-.drawer-section{margin-bottom:20px}
-.drawer-section h3{font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:10px}
-.drawer-trail{max-height:400px;overflow-y:auto}
-.drawer-trail .trail-item{margin-bottom:6px}
-
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
-</style>
-</head>
-<body>
-
-<!-- Sidebar Navigation -->
-<aside class="sidebar">
-  <div class="sidebar-logo">
-    <div class="sidebar-logo-icon">R</div>
-    <div>
-      <div class="sidebar-logo-text">AutoRecover</div>
-      <div class="sidebar-logo-sub">Agent Studio</div>
-    </div>
-  </div>
-  <nav class="sidebar-nav">
-    <div class="nav-section">Payment Products</div>
-    <a class="nav-item" href="/merchant"><span class="nav-icon">&#9673;</span> Dashboard<span class="nav-badge">Live</span></a>
-    <a class="nav-item" href="/pay" target="_blank"><span class="nav-icon">&#9671;</span> Store</a>
-    <a class="nav-item" href="/graph" target="_blank"><span class="nav-icon">&#10230;</span> Agent Flow</a>
-    <div class="nav-section">Agent Studio</div>
-    <a class="nav-item active" href="/merchant"><span class="nav-icon" style="width:18px;height:18px;background:var(--brand-blue);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-size:10px">&#10003;</span> Recovery Agent<span class="nav-badge" style="background:var(--success)">Active</span></a>
-    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">&#8801;</span> Transactions</a>
-    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">$</span> Settlements</a>
-    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">&#128279;</span> Payment Links</a>
-    <div class="nav-section">Settings</div>
-    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">&#9881;</span> Configuration</a>
-    <a class="nav-item" href="#" onclick="return false"><span class="nav-icon">&#8984;</span> API Keys</a>
-  </nav>
-  <div class="sidebar-footer">AutoRecover v2.0 — Buildathon</div>
-</aside>
-
-<!-- Main Content -->
-<div class="main">
-  <header class="topbar">
-    <div class="topbar-left">
-      <div class="breadcrumb">Agent Studio / <span>Recovery Agent</span></div>
-    </div>
-    <div class="topbar-right">
-      <div class="search-wrap"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:12px;color:var(--text-muted);z-index:1">&#128269;</span><input class="topbar-search" placeholder="Search payments..." /></div>
-      <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">🌓</button>
-      <a href="/pay" target="_blank" style="text-decoration:none"><button style="padding:7px 16px;border-radius:8px;border:1px solid var(--brand-blue);background:var(--brand-blue);color:#fff;font-size:12px;font-weight:600;cursor:pointer">Open Store</button></a>
-    </div>
-  </header>
-
-  <div class="content">
-    <!-- Agent Hero Card -->
-    <div class="agent-hero">
-      <div class="agent-identity">
-        <div class="agent-icon">🤖</div>
-        <div>
-          <div class="agent-name">Payment Recovery Agent</div>
-          <div class="agent-subtitle">Recovering failed payments with AI-powered multi-turn reasoning</div>
-        </div>
-      </div>
-      <div class="health-badge"><span class="health-dot"></span> Healthy &amp; Active</div>
-    </div>
-    <div class="scenario-triggers">
-      <button class="scenario-trigger" onclick="simulateScenario('degradation')">504 Degradation</button>
-      <button class="scenario-trigger" onclick="simulateScenario('abandonment')">Cart Abandonment</button>
-      <button class="scenario-trigger" onclick="simulateScenario('card_expiry')">Expired Card</button>
-      <button class="scenario-trigger" onclick="simulateScenario('bank_decline')">Bank Decline</button>
-      <button class="scenario-trigger" onclick="simulateScenario('voice_call')">Voice Call</button>
-      <button class="scenario-trigger scenario-batch" onclick="simulateScenario('batch')">Run 30-Case Batch</button>
-    </div>
-
-    <!-- Tabs -->
-    <div class="tabs">
-      <div class="tab active" onclick="showTab('activity')">Activity</div>
-      <div class="tab" onclick="showTab('settings')">Settings</div>
-    </div>
-
-    <!-- Tab: Activity -->
-    <div id="tab-activity">
-      <!-- Metrics -->
-      <div class="metrics">
-        <div class="metric"><div class="metric-value" id="m-total">0</div><div class="metric-label">Total Payments</div></div>
-        <div class="metric"><div class="metric-value sv" id="m-recovered">0</div><div class="metric-label">Recovered</div></div>
-        <div class="metric"><div class="metric-value rv" id="m-failed">0</div><div class="metric-label">Failed</div></div>
-        <div class="metric"><div class="metric-value" id="m-rate">0%</div><div class="metric-label">Recovery Rate</div></div>
-      </div>
-      <!-- Hidden metrics (kept for JS updateMetrics) -->
-      <div style="display:none"><div id="m-waiting">0</div><div id="m-penalties">0</div><div id="m-saved">$0.00</div></div>
-
-      <!-- Activity + Sidebar Cards -->
-      <div class="grid">
-        <!-- Activity Feed (left) -->
-        <div class="card">
-          <h2>Activity Feed <span class="live"><span class="health-dot"></span> Live</span></h2>
-          <div class="activity-feed" id="payments">
-            <div class="empty" id="empty-msg">No payments yet. Open the <a href="/pay" target="_blank" style="color:var(--brand-blue)">store</a> to start recovery.</div>
-          </div>
-        </div>
-
-        <!-- Right column: Agent Trail -->
-        <div style="display:flex;flex-direction:column;gap:16px">
-          <div class="card" style="flex:1">
-            <h2>Agent Trail</h2>
-            <div class="trail" id="trail"><div class="empty">Waiting for agent activity...</div></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Hidden metric IDs for JS updateMetrics -->
-      <div style="display:none">
-        <span id="tier-silent-count">SILENT: 0</span>
-        <span id="tier-active-count">ACTIVE: 0</span>
-        <span id="tier-hard-count">HARD BLOCKED: 0</span>
-        <div id="decline-strategies"></div>
-        <div id="penalty-count">0</div>
-        <div id="penalty-value">$0.00 saved</div>
-      </div>
-
-      <div style="text-align:center;padding:12px 0;color:var(--text-muted);font-size:11px;position:sticky;bottom:0;background:var(--bg-canvas);border-top:1px solid var(--border-subtle)">
-        AI agents can make mistakes. Verify important decisions independently.
-      </div>
-    </div>
-
-    <!-- Tab: Settings (placeholder) -->
-    <div id="tab-settings" style="display:none">
-      <div class="card">
-        <h2>Agent Configuration</h2>
-        <div style="padding:20px;color:var(--text-secondary);font-size:13px">
-          <p>Configure recovery agent parameters, guardrail policies, and notification templates.</p>
-          <p style="margin-top:12px;color:var(--text-muted);font-size:12px">Settings panel coming soon. Currently managed via configuration files.</p>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Case Detail Drawer -->
-<div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
-<div class="drawer" id="drawer">
-  <div class="drawer-header">
-    <div class="drawer-title" id="drawer-title">Payment Details</div>
-    <button class="drawer-close" onclick="closeDrawer()">&#10005;</button>
-  </div>
-  <div id="drawer-status-bar" style="height:4px;border-radius:0"></div>
-  <div class="drawer-body" id="drawer-body">
-    <div class="empty">Select a payment to view details</div>
-  </div>
-</div>
-
-<!-- Toast -->
-<div class="toast" id="toast"></div>
-
-<script>
-const socket=io();
-let paymentsData=[];
-let tierStats={silent:0,active:0,hard_decline_blocked:0};
-let totalPenalties=0;
-let declineStrategies={};
-
-// Theme toggle
-function toggleTheme(){
-  const html=document.documentElement;
-  const current=html.getAttribute("data-theme");
-  html.setAttribute("data-theme",current==="light"?"dark":"light");
-  localStorage.setItem("theme",html.getAttribute("data-theme"));
-}
-(function(){const saved=localStorage.getItem("theme");if(saved)document.documentElement.setAttribute("data-theme",saved)})();
-
-// Tab switching
-function showTab(name){
-  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
-  document.querySelectorAll("[id^=tab-]").forEach(p=>p.style.display="none");
-  event.target.classList.add("active");
-  document.getElementById("tab-"+name).style.display="block";
-}
-
-// Drawer
-function openDrawer(paymentId){
-  const p=paymentsData.find(x=>x.payment_id===paymentId);
-  if(!p)return;
-  document.getElementById("drawer-title").textContent=p.payment_id;
-  const bar=document.getElementById("drawer-status-bar");
-  const statusColors={recovering:"var(--brand-blue)",awaiting_customer:"var(--brand-blue)",recovered:"var(--success)",failed:"var(--error)",escalated:"var(--brand-blue)",scheduled:"var(--warning)"};
-  bar.style.background=statusColors[p.status]||"var(--brand-blue)";
-  const body=document.getElementById("drawer-body");
-  const tierLabel=(p.recovery_tier||"active").toUpperCase();
-  const tierCls=p.recovery_tier==="silent"?"btier-silent":p.recovery_tier==="hard_decline_blocked"?"btier-hard":"btier-active";
-  const statusBadge=p.status==="recovered"?"bs":p.status==="failed"?"bf":p.status==="escalated"?"bp":"bw";
-  let html=`<div class="drawer-section"><h3>Payment Info</h3><div style="font-size:13px;color:var(--text-secondary);display:flex;flex-wrap:wrap;gap:12px"><span><b>Amount:</b> INR ${p.amount.toLocaleString()}</span><span><b>Status:</b> <span class="badge ${statusBadge}">${p.status}</span></span><span class="badge ${tierCls}" style="font-size:11px">${tierLabel}</span><span><b>Attempts:</b> ${p.attempts||0}</span>${p.decline_strategy==='voice_call'?'<br><b>Channel:</b> <span class="drawer-badge blue">AI Voice Call (SuperU)</span>':''}</div></div>`;
-  if(p.decline_strategy){html+=`<div class="drawer-section"><h3>Decline Strategy</h3><div style="font-size:13px;color:var(--text-secondary)">${p.decline_strategy}</div></div>`}
-  if(p.penalties_prevented){html+=`<div class="drawer-section"><h3>Penalties Prevented</h3><div style="font-size:13px;color:var(--success);font-weight:600">${p.penalties_prevented} blocked ($${(p.penalties_prevented*0.10).toFixed(2)} saved)</div></div>`}
-  if(p.trail&&p.trail.length){
-    const diagnosed=p.trail.find(e=>e.step==="diagnosed"||e.step==="diagnosing");
-    const decided=p.trail.find(e=>e.step==="deciding");
-    if(diagnosed){html+=`<div class="drawer-section"><h3>Diagnosis</h3><div style="font-size:13px;color:var(--text-secondary)">${diagnosed.msg}${diagnosed.detail?'<br>'+diagnosed.detail:''}</div></div>`}
-    if(decided){html+=`<div class="drawer-section"><h3>Strategy</h3><div style="font-size:13px;color:var(--text-secondary)">${decided.msg}${decided.detail?'<br>'+decided.detail:''}</div></div>`}
-    html+=`<div class="drawer-section"><h3>Agent Trail (${p.trail.length} steps)</h3><div class="drawer-trail">`;
-    p.trail.forEach(e=>{
-      html+=`<div class="trail-item t-${e.step}" style="cursor:pointer" onclick="var d=this.querySelector('.trail-detail');if(d)d.style.display=d.style.display==='none'?'block':'none'"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail" style="display:none">'+e.detail+'</div>':''}</div>`;
-    });
-    html+=`</div></div>`;
-  }
-  body.innerHTML=html;
-  document.getElementById("drawer-overlay").classList.add("open");
-  document.getElementById("drawer").classList.add("open");
-}
-function closeDrawer(){
-  document.getElementById("drawer-overlay").classList.remove("open");
-  document.getElementById("drawer").classList.remove("open");
-}
-
-function updateMetrics(){
-  const t=paymentsData.length,r=paymentsData.filter(p=>p.status==="recovered").length,w=paymentsData.filter(p=>p.status==="recovering"||p.status==="awaiting_customer").length,f=paymentsData.filter(p=>p.status==="failed").length;
-  document.getElementById("m-total").textContent=t;document.getElementById("m-recovered").textContent=r;
-  document.getElementById("m-waiting").textContent=w;document.getElementById("m-failed").textContent=f;
-  document.getElementById("m-rate").textContent=t>0?Math.round(r/t*100)+"%":"0%";
-  document.getElementById("m-penalties").textContent=totalPenalties;
-  document.getElementById("m-saved").textContent="$"+(totalPenalties*0.10).toFixed(2);
-  document.getElementById("penalty-count").textContent=totalPenalties;
-  document.getElementById("penalty-value").textContent="$"+(totalPenalties*0.10).toFixed(2)+" saved";
-  document.getElementById("tier-silent-count").textContent="SILENT: "+tierStats.silent;
-  document.getElementById("tier-active-count").textContent="ACTIVE: "+tierStats.active;
-  document.getElementById("tier-hard-count").textContent="HARD BLOCKED: "+tierStats.hard_decline_blocked;
-}
-
-function renderDeclineStrategies(){
-  const el=document.getElementById("decline-strategies");
-  const keys=Object.keys(declineStrategies);
-  if(keys.length===0){el.innerHTML='<div class="empty" style="padding:8px">Waiting...</div>';return}
-  el.innerHTML=keys.map(code=>{
-    const s=declineStrategies[code];
-    const tierCls=s.tier==="silent"?"btier-silent":s.tier==="hard_decline_blocked"?"btier-hard":"btier-active";
-    const tierLabel=s.tier==="silent"?"SILENT":s.tier==="hard_decline_blocked"?"BLOCKED":"ACTIVE";
-    return `<div class="strategy-item"><span class="strategy-code">${code}</span><span class="strategy-name">${s.strategy}</span><span class="strategy-tier ${tierCls}">${tierLabel}</span></div>`;
-  }).join("");
-}
-
-function renderPayments(){
-  const el=document.getElementById("payments"),empty=document.getElementById("empty-msg");
-  const times=["Just now","2 min ago","5 min ago","12 min ago","18 min ago","25 min ago","38 min ago","52 min ago","1 hr ago","2 hr ago"];
-  if(paymentsData.length===0){empty.style.display="block";el.innerHTML="";el.appendChild(empty);return}
-  empty.style.display="none";
-  el.innerHTML=paymentsData.map((p,i)=>{
-    const iconCls=p.status==="recovered"?"recovered":p.status==="recovering"||p.status==="awaiting_customer"?"recovering":p.status==="failed"?"failed":p.status==="escalated"?"escalated":"scheduled";
-    const icon=p.status==="recovered"?"✓":p.status==="failed"?"✕":p.status==="escalated"?"↗":p.status==="scheduled"?"⏱":"●";
-    const live=p.status==="recovering"||p.status==="awaiting_customer"?'<span class="live"><span class="health-dot"></span> Live</span>':'';
-    const tierCls=p.recovery_tier==="silent"?"btier-silent":p.recovery_tier==="hard_decline_blocked"?"btier-hard":"btier-active";
-    const tierLabel=(p.recovery_tier||"active").toUpperCase();
-    const action=p.status==="recovered"?"Recovery confirmed":p.status==="escalated"?"Escalated to human":p.status==="scheduled"?"Retry scheduled":p.status==="awaiting_customer"?"Awaiting response":p.status==="voice_call"?"Voice Call Active":"Recovering";
-    const ts=times[i]||(i*7+3)+" min ago";
-    return `<div class="activity-item" onclick="openDrawer('${p.payment_id}')">
-      <div class="activity-icon ${iconCls}">${icon}</div>
-      <div class="activity-body">
-        <div class="activity-title"><span>${action} ${p.payment_id.slice(0,16)}</span><span style="margin-left:auto;display:flex;align-items:center;gap:8px;flex-shrink:0"><span class="activity-amount">INR ${p.amount.toLocaleString()}</span><span class="badge ${tierCls}">${tierLabel}</span>${live}</span></div>
-        <div class="activity-meta"><span>${ts}</span></div>
-      </div>
-    </div>`;
-  }).join("");
-}
-
-function renderTrail(trail){
-  const el=document.getElementById("trail");
-  if(!el)return;
-  if(!trail||trail.length===0){el.innerHTML='<div class="empty">Waiting for agent activity...</div>';return}
-  el.innerHTML=trail.map(e=>{
-    let specHtml='';
-    if(e.ui_spec){
-      specHtml=`<div class="trail-detail" style="margin-top:6px;padding:8px;border-radius:6px;border-left:3px solid #8B5CF6;background:var(--bg-surface)">
-        <strong style="color:#8B5CF6">UI Spec:</strong> ${e.ui_spec.headline||''} — ${e.ui_spec.primary_cta_text||''}
-      </div>`;
-    }
-    return `<div class="trail-item t-${e.step}"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail">'+e.detail+'</div>':''}${specHtml}</div>`;
-  }).join('');
-}
-</script></body></html>"""
-
 
 # ─── Routes ───────────────────────────────────────────────────
 @app.route("/")
@@ -1881,10 +1472,80 @@ def merchant_page():
 def pay_page():
     return render_template_string(PAY_PAGE)
 
+@app.route("/api/ui-spec", methods=["POST"])
+def api_ui_spec():
+    """FLAW-35: Generate LLM-powered UI morphing spec for customer checkout."""
+    data = request.get_json(force=True, silent=True) or {}
+    payment_id = data.get("payment_id", "")
+    amount = data.get("amount", 0)
+    failure_type = data.get("failure_type", "network_error")
+    failure_reason = data.get("failure_reason", "")
+
+    try:
+        from recovery_agent.models import FailureType
+        from recovery_agent.agent.llm_client import invoke_llm_json
+        ft = FailureType(failure_type) if failure_type in [e.value for e in FailureType] else FailureType.NETWORK_ERROR
+        spec = _generate_ui_spec(
+            llm_fn=invoke_llm_json,
+            cause=ft.value,
+            amount=amount,
+            failure_reason=failure_reason,
+            recommended_rail="payment_link",
+            customer_name="",
+            action="send_notification",
+            scenario_type="standard",
+        )
+        return jsonify({"status": "ok", "spec": spec.model_dump()})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @app.route("/graph")
 def graph_page():
     from recovery_agent.dashboard import GRAPH_TEMPLATE
     return render_template_string(GRAPH_TEMPLATE)
+
+@app.route("/api/agent-trace/<payment_id>")
+def api_agent_trace(payment_id: str):
+    """FLAW-37: Return full agent decision trace for merchant debugging."""
+    trail = store.get_trail(payment_id)
+    payment = store.get_payment(payment_id)
+    return jsonify({
+        "payment_id": payment_id,
+        "status": payment.get("status", "unknown") if payment else "not_found",
+        "trail": trail or [],
+        "total_steps": len(trail or []),
+    })
+
+@app.route("/api/eval/run", methods=["POST"])
+def api_eval_run():
+    """FLAW-45: Trigger batch evaluation via API (automated eval pipeline)."""
+    data = request.get_json(force=True, silent=True) or {}
+    num_cases = data.get("num_cases", 30)
+
+    try:
+        from recovery_agent.agent.evaluation import (
+            run_batch_evaluation,
+            detect_regression,
+        )
+        result = run_batch_evaluation(num_cases=num_cases)
+        regression = detect_regression(result)
+
+        return jsonify({
+            "status": "ok",
+            "recovery_rate": result.recovery_rate,
+            "recovered": result.recovered,
+            "total_cases": result.total_cases,
+            "recovered_amount": result.recovered_amount,
+            "regression": {
+                "is_regression": regression.is_regression,
+                "baseline": regression.baseline_value,
+                "current": regression.current_value,
+                "change": regression.change,
+                "reason": regression.reason,
+            },
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route("/api/simulate/<scenario>", methods=["POST", "GET"])
 def simulate_scenario(scenario: str):
@@ -1918,7 +1579,7 @@ def simulate_scenario(scenario: str):
     store.save_payment(payment_id, {
         "payment_id": payment_id,
         "amount": amount,
-        "status": "recovering",
+        "status": "pending",
         "attempts": 0,
         "last_action": "",
         "last_detail": "",
@@ -1928,7 +1589,9 @@ def simulate_scenario(scenario: str):
         "penalties_prevented": 0,
     })
 
-    socketio.start_background_task(run_agent_for_payment, payment_id, amount, reason, customer, stype, fail_code, err_source, err_step)
+    # Agent starts ONLY when customer attempts payment and it fails (via /api/payment-failed).
+    # This ensures the agent runs with real payment context, not before the customer acts.
+    store.flush()
     return jsonify({"status": "simulating", "scenario": scenario, "payment_id": payment_id, "amount": amount, "reason": reason})
 
 @app.route("/api/create-order", methods=["POST"])
@@ -1958,9 +1621,10 @@ def payment_failed():
     if store.has_payment(payment_id):
         if store.get_payment(payment_id).get("status") == "recovering":
             return jsonify({"status": "already_recovering", "payment_id": payment_id})
-    if not store.has_payment(payment_id):
+        # Only update status — preserve order_id and other fields from create_order()
+        store.update_payment(payment_id, status="recovering")
+    else:
         store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
-    store.update_payment(payment_id, status="recovering")
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)
     return jsonify({"status": "recovery_started"})
 
@@ -1981,11 +1645,20 @@ def customer_responded():
         is_simulated = order_id.startswith("order_rzp_") or order_id.startswith("order_sim_")
         order_paid = False
 
-        if order_id and not is_simulated and razorpay_client.is_configured:
-            order_data = razorpay_client.fetch_order(order_id)
-            order_status = order_data.get("status", "")
-            order_paid = order_status == "paid"
-        elif is_simulated or not razorpay_client.is_configured:
+        # BUG FIX: Always verify via Razorpay API when configured, even for simulated orders
+        # Previously, simulated orders were auto-marked as paid without verification
+        if razorpay_client.is_configured:
+            if order_id:
+                order_data = razorpay_client.fetch_order(order_id)
+                order_status = order_data.get("status", "")
+                order_paid = order_status == "paid"
+            # Also try fetching the payment directly
+            if not order_paid:
+                payment_data = razorpay_client.fetch_payment(payment_id)
+                if payment_data.get("status") == "captured":
+                    order_paid = True
+        elif is_simulated:
+            # Only trust simulated orders when Razorpay is NOT configured (dev mode)
             order_paid = True
 
         if order_paid:
@@ -2084,6 +1757,12 @@ def webhook_forward():
             "status": "recovered",
             "amount": amount,
             "payment_id": payment_id,
+        })
+        # FLAW-38: Emit real-time payment_update for customer checkout
+        socketio.emit("payment_update", {
+            "payment_id": payment_id,
+            "status": "captured",
+            "amount": amount,
         })
         store.flush()
 

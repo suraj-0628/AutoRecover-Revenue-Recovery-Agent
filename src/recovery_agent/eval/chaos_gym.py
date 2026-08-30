@@ -726,7 +726,9 @@ def _z_test_proportions(p1: float, n1: int, p2: float, n2: int) -> dict:
     phi = d * math.exp(-abs_z * abs_z / 2.0) * (
         t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
     )
-    p_value = 2.0 * (1.0 - (1.0 - phi)) if abs_z > 0 else 1.0
+    # The phi here is the Abramowitz & Stegun approximation of (1 - Phi(|z|)),
+    # NOT the PDF. So the two-tailed p-value is simply 2 * phi.
+    p_value = 2.0 * phi if abs_z > 0 else 1.0
     p_value = max(0.0, min(1.0, p_value))
 
     return {
@@ -792,7 +794,7 @@ def _run_baseline_episode(env: RevenueLossEnvironment, seed_val: int) -> dict:
         actions_taken.append(action.value)
 
         # Baseline: no hard decline prevention (retries even on hard declines)
-        if cause in HARD_DECLINES:
+        if failure_code in HARD_DECLINES:
             penalties_prevented += 0  # Baseline doesn't prevent penalties
 
         # Baseline: simple random success check (no state-aware evaluation)
@@ -833,12 +835,29 @@ def run_before_after_benchmark(seed: int = 42, count: int = 50) -> dict:
     Uses identical random seeds for both runs to ensure fair comparison.
     Returns detailed comparison metrics with statistical significance testing.
     """
+    from recovery_agent.agent.memory import CustomerMemoryStore
+    from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
+    from recovery_agent.agent.guardrails import GuardrailEngine
+    from recovery_agent.agent.squad import SquadOrchestrator
+
     env = RevenueLossEnvironment(seed=seed)
     baseline_results = []
     enhanced_results = []
 
     for i in range(count):
         episode_seed = seed + i
+
+        # BUG FIX: Reset agent memory between episodes to prevent contamination
+        # Previous episodes' customer profiles, salary windows, and payment history
+        # were bleeding into new episodes, making benchmark results invalid
+        env.memory_store = CustomerMemoryStore()
+        env.kg_router = RazorpayKnowledgeGraph()
+        env.guardrail_engine = GuardrailEngine()
+        env.squad = SquadOrchestrator(
+            memory_store=env.memory_store,
+            kg_router=env.kg_router,
+            guardrail_engine=env.guardrail_engine,
+        )
 
         # Baseline: legacy behavior (no silent tier, no hard decline prevention)
         baseline_episode = _run_baseline_episode(env, episode_seed)
@@ -962,7 +981,101 @@ def run_before_after_benchmark(seed: int = 42, count: int = 50) -> dict:
             f"Friction delta: {friction_delta:+.3f}\n"
             f"Penalties saved: {penalties_saved} (${penalties_value_usd:.2f} / INR {penalties_value_inr:.2f})\n"
             f"Silent tier recoveries: {e_silent_recoveries}/{e_silent_total} ({silent_recovery_pct:.1f}%)\n"
-            f"Statistical significance: z={significance['z']}, p={significance['p_value']}, "
-            f"significant={'YES' if significance['significant'] else 'NO'} (p < 0.05)"
+             f"Statistical significance: z={significance['z']}, p={significance['p_value']}, "
+             f"significant={'YES' if significance['significant'] else 'NO'} (p < 0.05)"
         ),
     }
+
+
+# --- FLAW-44: Dynamic Persona Generation ---
+
+def generate_dynamic_persona(seed: int | None = None) -> PersonaConfig:
+    """Generate a randomized customer persona with realistic behavioral variation.
+
+    FLAW-44: Customer personas are too simple. This generates dynamic personas
+    with randomized response rates, mood thresholds, and channel preferences.
+    """
+    rng = random.Random(seed)
+
+    channels = ["sms", "email", "whatsapp", "push"]
+    moods = [CustomerMood.COOPERATIVE, CustomerMood.FRUSTRATED, CustomerMood.NON_RESPONSIVE]
+
+    # Generate randomized response rates with realistic patterns
+    base_response = rng.uniform(0.05, 0.4)
+    response_rates = {
+        ActionType.SEND_NOTIFICATION: base_response + rng.uniform(-0.1, 0.1),
+        ActionType.RETRY_PAYMENT: base_response + rng.uniform(-0.15, 0.15),
+        ActionType.UPDATE_PAYMENT_METHOD: base_response + rng.uniform(-0.1, 0.2),
+        ActionType.WAIT_AND_RETRY: min(1.0, base_response + rng.uniform(0.1, 0.4)),
+        ActionType.ESCALATE_TO_HUMAN: rng.uniform(0.01, 0.15),
+        ActionType.ABANDON: rng.uniform(0.0, 0.05),
+    }
+    # Clamp all rates to [0, 1]
+    for k in response_rates:
+        response_rates[k] = max(0.0, min(1.0, response_rates[k]))
+
+    return PersonaConfig(
+        name=f"Dynamic_{rng.randint(1000, 9999)}",
+        response_rates=response_rates,
+        mood_after_message=rng.choice(moods),
+        mood_threshold_messages=rng.randint(1, 6),
+        preferred_channel=rng.choice(channels),
+        conversion_after_salary=rng.uniform(0.3, 0.9),
+        will_revoke_mandate=rng.random() < 0.1,
+    )
+
+
+# --- FLAW-42: Webhook Simulation ---
+
+def generate_webhook_payload(
+    event_type: str = "payment.failed",
+    payment_id: str = "",
+    amount: float = 2999.0,
+    error_code: str = "gateway_timeout",
+    **kwargs,
+) -> dict:
+    """Generate a realistic Razorpay webhook payload for testing.
+
+    FLAW-42: Chaos Gym uses mock events, not real webhook payloads.
+    This generates payloads matching Razorpay's actual webhook schema.
+    """
+    import time
+
+    payment_id = payment_id or f"pay_chaos_{uuid.uuid4().hex[:8]}"
+    now = int(time.time())
+
+    base_payload = {
+        "event": event_type,
+        "created_at": now,
+        "payload": {
+            "payment": {
+                "entity": {
+                    "id": payment_id,
+                    "entity": "payment",
+                    "amount": int(amount * 100),
+                    "currency": "INR",
+                    "status": "failed",
+                    "order_id": f"order_chaos_{uuid.uuid4().hex[:8]}",
+                    "method": kwargs.get("method", "card"),
+                    "description": kwargs.get("description", f"Payment of INR {amount}"),
+                    "error_code": error_code,
+                    "error_description": kwargs.get("error_description", f"Payment failed: {error_code}"),
+                    "error_step": kwargs.get("error_step", "payment_authorization"),
+                    "error_source": kwargs.get("error_source", "gateway"),
+                    "contact": kwargs.get("contact", "+919876543210"),
+                    "email": kwargs.get("email", "customer@example.com"),
+                    "created_at": now,
+                    "notes": kwargs.get("notes", {}),
+                }
+            }
+        },
+    }
+
+    if event_type == "payment.captured":
+        base_payload["payload"]["payment"]["entity"]["status"] = "captured"
+        base_payload["payload"]["payment"]["entity"].pop("error_code", None)
+        base_payload["payload"]["payment"]["entity"].pop("error_description", None)
+        base_payload["payload"]["payment"]["entity"].pop("error_step", None)
+        base_payload["payload"]["payment"]["entity"].pop("error_source", None)
+
+    return base_payload

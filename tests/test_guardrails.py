@@ -46,19 +46,19 @@ class TestQuietHourGuardrail:
 
     def test_early_morning_deferred(self):
         gh = QuietHourGuardrail()
-        now = datetime(2026, 8, 25, 6, 0, tzinfo=timezone.utc)  # 6 AM
+        now = datetime(2026, 8, 25, 1, 0, tzinfo=timezone.utc)  # 1 AM UTC (quiet: <03:00)
         result = gh.check(ActionType.SEND_NOTIFICATION, now=now)
         assert result.verdict == GuardrailVerdict.MODIFIED
 
-    def test_8am边界_passes(self):
+    def test_8am_boundary_passes(self):
         gh = QuietHourGuardrail()
-        now = datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)  # 8 AM
+        now = datetime(2026, 8, 25, 4, 0, tzinfo=timezone.utc)  # 4 AM UTC (after quiet end)
         result = gh.check(ActionType.SEND_NOTIFICATION, now=now)
         assert result.verdict == GuardrailVerdict.PASS
 
-    def test_9pm边界_deferred(self):
+    def test_9pm_boundary_deferred(self):
         gh = QuietHourGuardrail()
-        now = datetime(2026, 8, 25, 21, 0, tzinfo=timezone.utc)  # 9 PM
+        now = datetime(2026, 8, 25, 16, 0, tzinfo=timezone.utc)  # 4 PM UTC (quiet: ≥16:00)
         result = gh.check(ActionType.SEND_NOTIFICATION, now=now)
         assert result.verdict == GuardrailVerdict.MODIFIED
 

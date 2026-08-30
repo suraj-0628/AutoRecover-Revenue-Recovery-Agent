@@ -16,12 +16,62 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
 POLL_INTERVAL = int(os.getenv("DAEMON_POLL_INTERVAL", "60"))  # seconds
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5002")
+
+
+def register_retry_job(
+    payment_id: str,
+    amount: float,
+    target_timestamp: str,
+    action: str = "retry_payment",
+    method: str = "card",
+    customer: dict | None = None,
+    reason: str = "",
+    confidence: float = 0.5,
+) -> dict:
+    """Register a background retry job with the StateStore.
+
+    Returns the job dict with all fields the frontend expects to
+    spread into a socket emit and store as ``scheduled_job``.
+    """
+    import uuid
+    from recovery_agent.state_store import StateStore
+
+    store = StateStore()
+    job_id = f"retry_{payment_id}_{uuid.uuid4().hex[:8]}"
+
+    metadata = {
+        "amount": amount,
+        "method": method,
+        "customer": customer or {},
+        "reason": reason,
+        "confidence": confidence,
+    }
+
+    store.schedule_job(
+        job_id=job_id,
+        payment_id=payment_id,
+        target_time=target_timestamp,
+        action=action,
+        metadata=metadata,
+    )
+    store.flush()
+
+    return {
+        "job_id": job_id,
+        "payment_id": payment_id,
+        "target_timestamp": target_timestamp,
+        "action": action,
+        "method": method,
+        "reason": reason,
+        "confidence": confidence,
+        "status": "scheduled",
+    }
 
 
 # --- Retry Execution ---
@@ -112,6 +162,40 @@ def notify_frontend(job: dict[str, Any], result: dict[str, Any]) -> bool:
 
 # --- Daemon Loop ---
 
+def _check_daemon_guardrails(job: dict) -> bool:
+    """Check if a retry job should be deferred due to guardrail policies.
+
+    Returns True if the job should be deferred (blocked), False if OK to execute.
+    """
+    from datetime import timedelta
+
+    # Check quiet hours (9 PM – 8 AM IST)
+    now_utc = datetime.now(timezone.utc)
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    now_ist = now_utc + IST_OFFSET
+    hour = now_ist.hour
+    if hour >= 21 or hour < 8:
+        print(f"[daemon] DEFERRED: Quiet hours active (IST {now_ist.strftime('%H:%M')}). Job will retry next poll.")
+        return True
+
+    # Check frequency cap: max 2 communications per 24h per payment
+    from recovery_agent.state_store import StateStore
+    store = StateStore()
+    payment_id = job.get("payment_id", "")
+    trail = store.get_trail(payment_id)
+    now_ts = now_utc.isoformat()
+    recent_comms = [
+        e for e in trail
+        if e.get("step", "").startswith(("notification", "superu_call", "scheduled"))
+        and e.get("ts", "") > (now_utc - timedelta(hours=24)).isoformat()
+    ]
+    if len(recent_comms) >= 2:
+        print(f"[daemon] DEFERRED: Frequency cap reached for {payment_id} ({len(recent_comms)} in 24h).")
+        return True
+
+    return False
+
+
 def _process_due_jobs() -> int:
     """Check StateStore for due jobs and execute them. Returns count executed."""
     from recovery_agent.state_store import StateStore
@@ -124,15 +208,31 @@ def _process_due_jobs() -> int:
     for job in due_jobs:
         job_id = job.get("job_id", "")
         payment_id = job.get("payment_id", "")
+
+        # Check guardrails before executing
+        if _check_daemon_guardrails(job):
+            # Defer: move target_time to next poll interval
+            new_target = (now + timedelta(seconds=POLL_INTERVAL * 2)).isoformat()
+            with store._lock:
+                store._jobs[job_id]["target_time"] = new_target
+            store.flush()
+            continue
+
         print(f"[daemon] Executing retry job {job_id} for payment {payment_id}")
 
         result = execute_retry(job)
 
         if result.get("status") in ("retry_created", "link_created"):
-            store.complete_job(job_id)
-            store.flush()
-            notify_frontend(job, result)
-            print(f"[daemon] Job {job_id} executed: {result.get('status')}")
+            # Notify frontend FIRST, then mark complete
+            notified = notify_frontend(job, result)
+            if notified:
+                store.complete_job(job_id)
+                store.flush()
+                print(f"[daemon] Job {job_id} executed and frontend notified: {result.get('status')}")
+            else:
+                store.fail_job(job_id, "Frontend notification failed — will retry")
+                store.flush()
+                print(f"[daemon] Job {job_id} executed but frontend notification FAILED")
         else:
             store.fail_job(job_id, result.get("message", "Unknown error"))
             store.flush()

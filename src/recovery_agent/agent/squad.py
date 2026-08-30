@@ -19,6 +19,8 @@ from recovery_agent.agent.execution import execute_action
 from recovery_agent.agent.guardrails import GuardrailEngine, GuardrailCheckResult
 from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
 from recovery_agent.agent.memory import CustomerMemoryStore
+from recovery_agent.agent.strategy_metrics import StrategyMetricsStore, ThompsonBandit
+from recovery_agent.agent.vector_memory import VectorMemoryStore
 from recovery_agent.models import (
     ActionType,
     Attempt,
@@ -66,11 +68,22 @@ class DiagnosticAgent:
 
 
 class StrategyPlannerAgent:
-    """Generates multi-step recovery plans using Memory + KG Router.
+    """Generates multi-step recovery plans using Memory + KG Router + Vector Memory + Bandit.
 
-    Uses customer payment history (Pillar 1) and Knowledge Graph API
-    discovery (Pillar 2) to select the optimal intervention.
+    Uses customer payment history (Pillar 1), Knowledge Graph API
+    discovery (Pillar 2), vector memory context, and Thompson Bandit
+    empirical evidence to select the optimal intervention.
     """
+
+    def __init__(
+        self,
+        vector_memory: VectorMemoryStore | None = None,
+        strategy_metrics: StrategyMetricsStore | None = None,
+        bandit: ThompsonBandit | None = None,
+    ):
+        self.vector_memory = vector_memory
+        self.strategy_metrics = strategy_metrics
+        self.bandit = bandit
 
     def plan(
         self,
@@ -79,9 +92,15 @@ class StrategyPlannerAgent:
         kg_router: RazorpayKnowledgeGraph,
         memory: CustomerMemoryStore,
     ) -> ActionType:
-        """Choose intervention based on diagnosis, memory, and KG discovery."""
+        """Choose intervention based on diagnosis, memory, KG, vector memory, and bandit."""
         action = decide_intervention(
-            case, profile=profile, memory=memory, kg_router=kg_router,
+            case,
+            profile=profile,
+            memory=memory,
+            kg_router=kg_router,
+            vector_memory=self.vector_memory,
+            strategy_metrics=self.strategy_metrics,
+            bandit=self.bandit,
         )
         # Store the decided action in case metadata for downstream use
         case.payment.metadata["decided_action"] = action.value
@@ -122,7 +141,14 @@ class ToolExecutionAgent:
     ) -> dict:
         """Execute the action and return observable outcome dict."""
         cause_value = case.diagnosis.root_cause.value if case.diagnosis else "unknown"
-        return execute_action(action, cause_value, case.payment.amount)
+        return execute_action(
+            action,
+            cause_value,
+            case.payment.amount,
+            payment_id=case.payment.payment_id,
+            customer_email=case.payment.metadata.get("customer_email", ""),
+            customer_phone=case.payment.metadata.get("customer_phone", ""),
+        )
 
 
 # --- Squad Orchestrator ---
@@ -138,6 +164,9 @@ class SquadOrchestrator:
         memory_store: CustomerMemoryStore | None = None,
         kg_router: RazorpayKnowledgeGraph | None = None,
         guardrail_engine: GuardrailEngine | None = None,
+        vector_memory: VectorMemoryStore | None = None,
+        strategy_metrics: StrategyMetricsStore | None = None,
+        bandit: ThompsonBandit | None = None,
     ):
         self.memory = memory_store or CustomerMemoryStore()
         self.kg_router = kg_router or RazorpayKnowledgeGraph()
@@ -145,7 +174,11 @@ class SquadOrchestrator:
 
         # Instantiate specialized agents
         self.diagnostic = DiagnosticAgent()
-        self.planner = StrategyPlannerAgent()
+        self.planner = StrategyPlannerAgent(
+            vector_memory=vector_memory,
+            strategy_metrics=strategy_metrics,
+            bandit=bandit,
+        )
         self.compliance = ComplianceOverseerAgent(self.guardrails)
         self.executor = ToolExecutionAgent()
 

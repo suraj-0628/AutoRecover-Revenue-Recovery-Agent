@@ -863,21 +863,6 @@
         <span class="panel-title">
           Live Customer View
         </span>
-
-        <!-- View Switcher -->
-        <div class="view-toggle-bar">
-          <button class="toggle-btn active" id="btn-view-canvas" onclick="switchRightPanelTab('canvas')">
-            Canvas View
-          </button>
-          <button class="toggle-btn" id="btn-view-store" onclick="switchRightPanelTab('store')">
-            Store Checkout (/pay)
-          </button>
-        </div>
-      </div>
-
-      <!-- Real Store View Mode (/pay embedded iframe) -->
-      <div id="store-view-mode" style="display:none; height:calc(100% - 40px); padding:8px; background:#0d1117;">
-        <iframe src="/pay" id="store-iframe" style="width:100%; height:100%; border:none; border-radius:4px; background:#ffffff;"></iframe>
       </div>
 
       <!-- Generative Canvas View Mode -->
@@ -931,8 +916,8 @@
 
           <!-- Morph Container -->
           <div id="morph-container">
-            <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504 (HDFC Netbanking drop)')">
-              Pay INR 4,999.00 Now
+            <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas()">
+              Open Customer Checkout
             </button>
           </div>
         </div>
@@ -1001,27 +986,6 @@
 
     let activePaymentId = "";
     let lastTier = "";
-
-    function switchRightPanelTab(mode) {
-      const btnCanvas = document.getElementById("btn-view-canvas");
-      const btnStore = document.getElementById("btn-view-store");
-      const canvasMode = document.getElementById("canvas-view-mode");
-      const storeMode = document.getElementById("store-view-mode");
-
-      if (mode === "canvas") {
-        btnCanvas.classList.add("active");
-        btnStore.classList.remove("active");
-        canvasMode.style.display = "flex";
-        storeMode.style.display = "none";
-      } else {
-        btnStore.classList.add("active");
-        btnCanvas.classList.remove("active");
-        storeMode.style.display = "block";
-        canvasMode.style.display = "none";
-        const iframe = document.getElementById("store-iframe");
-        if (iframe) iframe.src = "/pay";
-      }
-    }
 
     function resetProgressPills() {
       document.getElementById("p-detect").className = "step-pill";
@@ -1250,42 +1214,11 @@
       });
     }
 
-    function startPaymentFromCanvas(scenarioReason) {
-      const paymentId = "pay_sim_" + Math.floor(1000 + Math.random() * 9000);
-      const amount = 4999.0;
-      activePaymentId = paymentId;
-      
-      resetProgressPills();
-      document.getElementById("progress-status-label").textContent = "CREATING RAZORPAY ORDER...";
-      logThought("CHECKOUT", "tag-thinking", `Initiating Razorpay Checkout for ${paymentId}...`, `Amount: INR ${amount.toFixed(2)}`);
-
-      fetch("/api/create-order", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ amount: amount, payment_id: paymentId })
-      })
-      .then(r => r.json())
-      .then(data => {
-        logThought("ORDER", "tag-kg", `Razorpay Order Created: ${data.order_id}`, `Paise: ${data.amount} | Currency: ${data.currency} | Key: ${data.key_id || 'rzp_test_demo'}`);
-        document.getElementById("progress-status-label").textContent = "PROCESSING PAYMENT...";
-        
-        setTimeout(() => {
-          logThought("GATEWAY", "tag-acting", `Razorpay Gateway Failure Event Fired!`, `Reason: ${scenarioReason || 'Gateway Timeout 504 (HDFC Netbanking drop)'}`);
-          fetch("/api/payment-failed", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              payment_id: paymentId,
-              amount: amount,
-              failure_code: "gateway_timeout",
-              failure_reason: scenarioReason || "Gateway Timeout 504 (HDFC Netbanking drop)",
-              error_source: "gateway",
-              error_step: "payment_authorization",
-              customer: { name: "Rahul Kumar", email: "rahul@example.com" }
-            })
-          });
-        }, 800);
-      });
+    function startPaymentFromCanvas() {
+      logThought("CHECKOUT", "tag-thinking", "Opening customer checkout page...");
+      // Pass payment_id so customer checkout uses the same ID as the merchant dashboard
+      const pid = activePaymentId || "";
+      window.location.href = "/pay" + (pid ? "?payment_id=" + encodeURIComponent(pid) : "");
     }
 
     function triggerScenario(name) {

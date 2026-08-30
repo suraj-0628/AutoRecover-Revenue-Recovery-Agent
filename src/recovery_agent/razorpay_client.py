@@ -80,6 +80,17 @@ class RazorpayClient:
     def is_configured(self) -> bool:
         return self.client is not None and bool(self.key_id and self.key_secret)
 
+    @staticmethod
+    def check_error(result: dict[str, Any]) -> dict[str, Any]:
+        """BUG FIX: Check if a Razorpay SDK result contains an error.
+
+        Raises RuntimeError if the result contains an error field.
+        This prevents silent error propagation where callers assume success.
+        """
+        if "error" in result:
+            raise RuntimeError(f"Razorpay API error: {result['error']}")
+        return result
+
     def create_order(
         self,
         amount: float,
@@ -106,6 +117,7 @@ class RazorpayClient:
                 "attempts": 1,
                 "notes": notes or {"recovery_agent": "AutoRecover_v2"},
                 "created_at": int(time.time()),
+                "_simulated": True,  # BUG FIX: Mark as simulated for downstream detection
             }
 
         try:
@@ -263,13 +275,13 @@ class RazorpayClient:
                 "entity": "payment",
                 "amount": int(amount * 100) if amount else 0,
                 "currency": "INR",
-                "status": "captured",
+                "status": "failed",
                 "order_id": f"order_rzp_{clean_id}",
-                "captured": True,
-                "fee": int((amount or 0) * 2),
-                "tax": int((amount or 0) * 0.36),
-                "error_code": None,
-                "error_description": None,
+                "captured": False,
+                "fee": 0,
+                "tax": 0,
+                "error_code": "CAPTURE_FAILED",
+                "error_description": str(e),
                 "created_at": int(time.time()),
             }
 
@@ -285,8 +297,9 @@ class RazorpayClient:
 
         try:
             params: dict[str, Any] = {}
-            if amount:
+            if amount is not None and amount > 0:
                 params["amount"] = int(amount * 100)
+            # BUG FIX: amount=0.0 or None means full refund (Razorpay default)
             if notes:
                 params["notes"] = notes
 

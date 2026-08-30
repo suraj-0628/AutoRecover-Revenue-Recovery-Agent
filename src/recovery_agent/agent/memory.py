@@ -60,9 +60,7 @@ class CustomerMemoryStore:
             with lock:
                 yield
         except Timeout:
-            print(f"[memory] WARNING: Could not acquire file lock within 10s: {lock_path}")
-            # Proceed without lock — better than deadlock
-            yield
+            raise IOError(f"Could not acquire file lock within 10s: {lock_path}. Aborting to prevent data corruption.")
 
     # --- Profile Access ---
 
@@ -163,6 +161,9 @@ class CustomerMemoryStore:
             failure_type=attempt.get("failure_type", ""),
         )
         profile.payment_history.append(record)
+        # Prune to last 50 entries to prevent unbounded growth
+        if len(profile.payment_history) > 50:
+            profile.payment_history = profile.payment_history[-50:]
 
         ft = attempt.get("failure_type", "")
         if ft:
