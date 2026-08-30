@@ -44,10 +44,13 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Logs
-data/audit_logs/*.jsonl
-data/live_*.json
+# Logs & Runtime Data
+data/audit_logs/
+data/escalations/
+data/outbox/
+data/*.json
 /tmp/
+
 
 # Secrets
 *.pem
