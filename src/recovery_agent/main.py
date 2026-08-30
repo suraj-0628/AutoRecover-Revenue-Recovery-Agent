@@ -139,11 +139,41 @@ def run_chaos_gym(episodes: int = 10, seed: int | None = None, use_harness: bool
     print("=" * 60)
 
 
+def run_phoenix_eval(payment_id: str | None = None) -> None:
+    """Run Phoenix agent evaluations."""
+    from recovery_agent.eval.phoenix_evals import PhoenixEvaluator
+
+    evaluator = PhoenixEvaluator()
+    report = evaluator.run_evaluation(payment_id=payment_id)
+
+    print("=" * 60)
+    print("PHOENIX AGENT EVALUATION REPORT")
+    print("=" * 60)
+    print(f"Total evaluations: {report['total_evaluations']}")
+    print(f"Passed: {report['passed']}")
+    print(f"Failed: {report['failed']}")
+    print(f"Pass rate: {report['pass_rate']}")
+    print(f"Annotations written to Phoenix: {report['annotations_written']}")
+    print()
+    print("By Evaluator:")
+    for name, stats in report["by_evaluator"].items():
+        total = stats["total"]
+        passed = stats["pass"]
+        pct = (passed / total * 100) if total else 0
+        print(f"  {name}: {passed}/{total} passed ({pct:.0f}%)")
+    if report["failed_evaluations"]:
+        print()
+        print("Failures:")
+        for f in report["failed_evaluations"]:
+            print(f"  [{f['evaluator']}] {f['payment_id']}: {f['explanation']}")
+    print("=" * 60)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Revenue Recovery Agent")
     parser.add_argument(
         "command",
-        choices=["single", "batch", "webhook", "dashboard", "frontend", "retry-schedule", "communicate", "chaos-gym"],
+        choices=["single", "batch", "webhook", "dashboard", "frontend", "retry-schedule", "communicate", "chaos-gym", "phoenix-eval"],
         help="Command to run",
     )
     parser.add_argument("--cases", type=int, default=30, help="Number of cases for batch")
@@ -172,6 +202,8 @@ def main():
         run_communicate(args.failure_type, args.channel)
     elif args.command == "chaos-gym":
         run_chaos_gym(args.cases, args.seed, use_harness=args.harness)
+    elif args.command == "phoenix-eval":
+        run_phoenix_eval(args.payment_id if args.payment_id != "pay_test_001" else None)
 
 
 if __name__ == "__main__":

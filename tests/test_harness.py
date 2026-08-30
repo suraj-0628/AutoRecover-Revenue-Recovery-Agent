@@ -90,7 +90,7 @@ class TestToolSchemas:
     """Test MCP-style tool schema definitions."""
 
     def test_all_tools_registered(self):
-        assert len(TOOL_SCAPES) == 7
+        assert len(TOOL_SCAPES) == 8
 
     def test_each_tool_has_required_fields(self):
         for tool in TOOL_SCAPES:
@@ -105,7 +105,7 @@ class TestToolSchemas:
     def test_get_tool_schemas_for_llm(self):
         schemas = get_tool_schemas_for_llm()
         assert schemas == TOOL_SCAPES
-        assert len(schemas) == 7
+        assert len(schemas) == 8
 
     def test_tool_names_are_unique(self):
         names = [t["name"] for t in TOOL_SCAPES]

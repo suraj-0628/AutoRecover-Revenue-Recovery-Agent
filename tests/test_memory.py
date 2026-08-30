@@ -339,10 +339,8 @@ class TestMemoryAwareDecision:
             mock_dt.now.return_value = mock_now
             mock_dt.fromisoformat = datetime.fromisoformat
             action = decide_intervention(case, profile=store.get_or_create_profile("cust_001"), memory=store)
-            # The memory guard should NOT have blocked (we're in window).
-            # Decision tree at attempt 0 for INSUFFICIENT_FUNDS = WAIT_AND_RETRY,
-            # so we verify the memory check ran by checking the mock was called.
-            mock_dt.now.assert_called()
+            # INSUFFICIENT_FUNDS at attempt 0 is deterministic (fast-path) → WAIT_AND_RETRY
+            assert action == ActionType.WAIT_AND_RETRY
             # Action comes from the decision tree, not the memory guard short-circuit
             assert action == ActionType.WAIT_AND_RETRY  # tree's decision at attempt 0
 

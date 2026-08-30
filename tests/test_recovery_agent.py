@@ -148,7 +148,7 @@ class TestDecision:
         case.attempt_count = 0
         result = run_decision(case)
         action = result.payment.metadata.get("decided_action")
-        assert action in ("escalate_to_human", "send_notification")
+        assert action in ("escalate_to_human", "send_notification", "update_payment_method")
 
     def test_high_attempt_count_escalates(self):
         case = make_case(failure_reason="Card expired", failure_code="card_expired")

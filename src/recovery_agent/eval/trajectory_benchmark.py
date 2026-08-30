@@ -30,12 +30,13 @@ FRICTION_WEIGHTS: dict[str, float] = {
     "wait_and_retry": 0.0,      # No friction — passive wait
     "send_notification": 0.3,   # Moderate friction — customer contact
     "update_payment_method": 0.5,  # High friction — requires customer action
+    "voice_call": 0.6,          # High friction — AI voice call, customer interaction
     "escalate_to_human": 0.8,   # Very high friction — human intervention
     "abandon": 1.0,             # Maximum friction — case dropped
 }
 
 # Actions considered "invasive" (contacting the customer)
-INVASIVE_ACTIONS = {"send_notification", "update_payment_method"}
+INVASIVE_ACTIONS = {"send_notification", "update_payment_method", "voice_call"}
 
 # Minimum steps needed for a successful recovery (best case)
 MIN_STEPS_FOR_RECOVERY = 2  # diagnose + execute successfully

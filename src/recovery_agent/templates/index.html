@@ -502,6 +502,45 @@
       50% { opacity: 0.6; box-shadow: 0 0 3px #3b82f6, 0 0 6px rgba(59,130,246,0.2); }
     }
 
+    /* Voice Call Approval Panel */
+    #voice-approval-overlay {
+      display: none;
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 9999;
+      justify-content: center; align-items: center;
+    }
+    #voice-approval-overlay.active { display: flex; }
+    .voice-approval-card {
+      background: #1a1b26; border: 1px solid #f7768e; border-radius: 12px;
+      padding: 28px 32px; max-width: 420px; width: 90%;
+      box-shadow: 0 0 40px rgba(247,118,142,0.15);
+      animation: approvalSlideIn 0.3s ease-out;
+    }
+    .voice-approval-card h3 {
+      color: #f7768e; font-size: 15px; font-weight: 700;
+      margin: 0 0 16px 0; display: flex; align-items: center; gap: 8px;
+    }
+    .voice-approval-card h3::before { content: "\1F4DE"; font-size: 18px; }
+    .voice-approval-detail {
+      background: #24283b; border-radius: 8px; padding: 14px 16px;
+      margin-bottom: 18px; font-size: 13px; color: #a9b1d6; line-height: 1.6;
+    }
+    .voice-approval-detail .va-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .voice-approval-detail .va-label { color: #565f89; }
+    .voice-approval-detail .va-value { color: #e0e6ff; font-weight: 600; }
+    .voice-approval-btns { display: flex; gap: 10px; }
+    .voice-approval-btns button {
+      flex: 1; padding: 10px 0; border: none; border-radius: 8px;
+      font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.15s;
+    }
+    .va-approve { background: #9ece6a; color: #1a1b26; }
+    .va-approve:hover { background: #b9f27c; }
+    .va-deny { background: #f7768e; color: #1a1b26; }
+    .va-deny:hover { background: #ff9aa2; }
+    .va-timer { color: #565f89; font-size: 11px; text-align: center; margin-top: 10px; }
+    @keyframes approvalSlideIn { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
+
     /* Right Panel (Live Customer Canvas) */
     .canvas-container {
       background: #0d1117;
@@ -930,6 +969,24 @@
       </div>
     </div>
 
+  </div>
+
+  <!-- Voice Call Approval Overlay -->
+  <div id="voice-approval-overlay">
+    <div class="voice-approval-card">
+      <h3>Voice Call Approval Required</h3>
+      <div class="voice-approval-detail">
+        <div class="va-row"><span class="va-label">Payment</span><span class="va-value" id="va-payment-id">—</span></div>
+        <div class="va-row"><span class="va-label">Phone</span><span class="va-value" id="va-phone">—</span></div>
+        <div class="va-row"><span class="va-label">Amount</span><span class="va-value" id="va-amount">—</span></div>
+        <div class="va-row"><span class="va-label">Reason</span><span class="va-value" id="va-reason">—</span></div>
+      </div>
+      <div class="voice-approval-btns">
+        <button class="va-approve" id="va-btn-approve" onclick="voiceCallApprove(true)">Approve Call</button>
+        <button class="va-deny" id="va-btn-deny" onclick="voiceCallApprove(false)">Deny</button>
+      </div>
+      <div class="va-timer" id="va-timer">Waiting for merchant approval... (60s timeout)</div>
+    </div>
   </div>
 
   <script>
@@ -1445,7 +1502,10 @@
             </div>`;
           document.getElementById("p-recovered").className = "step-pill active-recovered";
           document.getElementById("progress-status-label").textContent = "RECOVERED";
-    fetchMetrics();
+          fetchMetrics();
+        }
+      }
+    });
 
     let silentBannerShown = false;
 
@@ -1469,9 +1529,45 @@
     }
 
     function resetSilentBanner() { silentBannerShown = false; }
+
+    // ── Voice Call Approval Gate ──
+    let _vaPaymentId = null;
+    let _vaTimer = null;
+    let _vaCountdown = 60;
+
+    socket.on("voice_call_approval_request", function(data) {
+      _vaPaymentId = data.payment_id;
+      document.getElementById("va-payment-id").textContent = data.payment_id || "—";
+      document.getElementById("va-phone").textContent = data.customer_phone || "—";
+      document.getElementById("va-amount").textContent = data.amount ? "INR " + Number(data.amount).toLocaleString("en-IN") : "—";
+      document.getElementById("va-reason").textContent = data.failure_reason || "—";
+      document.getElementById("voice-approval-overlay").classList.add("active");
+      _vaCountdown = 60;
+      document.getElementById("va-timer").textContent = "Waiting for merchant approval... (60s timeout)";
+      _vaTimer = setInterval(function() {
+        _vaCountdown--;
+        if (_vaCountdown <= 0) {
+          clearInterval(_vaTimer);
+          document.getElementById("va-timer").textContent = "Timed out — falling back to notification";
+          document.getElementById("voice-approval-overlay").classList.remove("active");
+        } else {
+          document.getElementById("va-timer").textContent = "Waiting for merchant approval... (" + _vaCountdown + "s timeout)";
         }
-      }
+      }, 1000);
     });
+
+    function voiceCallApprove(approved) {
+      if (!_vaPaymentId) return;
+      fetch("/api/voice-call-approval", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({payment_id: _vaPaymentId, approved: approved}),
+      }).then(function() {
+        document.getElementById("voice-approval-overlay").classList.remove("active");
+        if (_vaTimer) clearInterval(_vaTimer);
+        _vaPaymentId = null;
+      });
+    }
   </script>
 </body>
 </html>

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import sys
 import threading
@@ -22,6 +23,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from flask import Flask, request, jsonify
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -169,6 +172,39 @@ def health():
         "hmac_configured": bool(WEBHOOK_SECRET),
         "frontend_url": FRONTEND_URL,
     })
+
+
+@app.route("/superu/call-complete", methods=["POST"])
+def superu_call_complete():
+    """Webhook callback from SuperU when an AI voice call completes.
+
+    SuperU sends call outcome data (answered, voicemail, no-answer, etc.)
+    which we feed back into the agent's observation loop.
+    """
+    data = request.json or {}
+    logger.info("[SuperU Callback] Received: %s", data)
+
+    call_outcome = data.get("outcome", data.get("status", "unknown"))
+    payment_id = data.get("metadata", {}).get("payment_id", "")
+    transcript = data.get("transcript", "")
+    duration = data.get("duration_seconds", 0)
+
+    # Log the outcome for the agent to observe
+    if payment_id:
+        from recovery_agent.state_store import StateStore
+        store = StateStore()
+        trail = store.get_trail(payment_id)
+        trail.append({
+            "step": "superu_call_complete",
+            "msg": f"SuperU call completed: {call_outcome}",
+            "detail": f"Duration: {duration}s | Transcript preview: {transcript[:200] if transcript else 'N/A'}",
+            "outcome": call_outcome,
+            "duration_seconds": duration,
+        })
+        store.set_trail(payment_id, trail)
+        store.flush()
+
+    return jsonify({"status": "received", "payment_id": payment_id}), 200
 
 
 def process_webhook_payload(payload: dict) -> dict:
