@@ -233,15 +233,14 @@
     }
     .trace-header {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       gap: 7px;
       padding: 5px 8px;
       cursor: pointer;
       user-select: none;
       border-radius: 4px;
-      transition: background 0.12s;
-      border-left: 2px solid transparent;
       transition: background 0.12s, border-color 0.2s;
+      border-left: 2px solid transparent;
     }
     .trace-header:hover {
       background: #161b22;
@@ -261,24 +260,28 @@
       transform: rotate(90deg);
     }
     .trace-tag {
-      font-weight: 600;
-      font-size: 0.75rem;
+      font-weight: 700;
+      font-size: 0.68rem;
       flex-shrink: 0;
+      letter-spacing: 0.03em;
+      font-family: var(--font-mono);
     }
     .trace-title {
       color: var(--text-bright);
       font-weight: 500;
       font-size: 0.78rem;
       flex: 1;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      min-width: 0;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      line-height: 1.4;
     }
     .trace-time {
-      color: #484f58;
-      font-size: 0.7rem;
+      color: #3a3f47;
+      font-size: 0.65rem;
       flex-shrink: 0;
-      font-family: monospace;
+      font-family: var(--font-mono);
+      margin-left: auto;
     }
     .trace-tier {
       flex-shrink: 0;
@@ -302,7 +305,10 @@
       word-break: break-word;
       border-left: 2px solid #21262d;
       padding-left: 10px;
-      margin-top: 2px;
+      margin-top: 4px;
+      background: rgba(13,17,23,0.4);
+      border-radius: 0 4px 4px 0;
+      padding: 6px 10px;
     }
     .trace-detail strong {
       color: var(--text-main);
@@ -323,6 +329,19 @@
     .trace-chip.blue  { color: var(--accent-blue);  border-color: #1a2a3d; }
     .trace-chip.amber { color: var(--accent-amber); border-color: #3d2e1a; }
     .trace-chip.purple{ color: var(--accent-purple);border-color: #2d1a3d; }
+    .trace-chip-long {
+      display: block;
+      margin: 3px 0;
+      word-break: break-word;
+      line-height: 1.5;
+    }
+    .trace-detail-text {
+      display: block;
+      color: #8b949e;
+      font-size: 0.72rem;
+      line-height: 1.5;
+      margin: 2px 0;
+    }
 
     /* Legacy log-line fallback (used by system init) */
     .log-line {
@@ -344,21 +363,52 @@
     .tag-kg        { color: var(--accent-green);  font-weight: 600; }
     .tag-acting    { color: var(--accent-red);    font-weight: 600; }
     .tag-harness   { color: #3b82f6;             font-weight: 600; }
+    .tag-success   { color: #22c55e;             font-weight: 700; }
+    .tag-blocked   { color: #ef4444;             font-weight: 700; }
+    .tag-ui        { color: #ec4899;             font-weight: 600; }
+    .tag-memory    { color: #06b6d4;             font-weight: 600; }
 
     /* Tool Call Card */
     .tool-card {
       background: #0d1117;
-      border: 1px solid var(--border-color);
-      border-radius: 4px;
-      padding: 8px 12px;
+      border: 1px solid #21262d;
+      border-radius: 6px;
+      padding: 10px 14px;
       font-size: 0.75rem;
+      margin-top: 6px;
     }
     .tool-title {
       color: var(--accent-amber);
-      font-weight: 600;
-      margin-bottom: 6px;
+      font-weight: 700;
+      margin-bottom: 8px;
       display: flex;
       justify-content: space-between;
+      align-items: center;
+      font-size: 0.78rem;
+    }
+    .tool-title .tool-label {
+      background: rgba(245,158,11,0.1);
+      border: 1px solid rgba(245,158,11,0.2);
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 0.68rem;
+      color: var(--accent-amber);
+    }
+    .tool-kv {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 3px 10px;
+      font-size: 0.72rem;
+    }
+    .tool-kv .kv-key {
+      color: #565f89;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .tool-kv .kv-val {
+      color: var(--text-bright);
+      font-family: var(--font-mono);
+      word-break: break-all;
     }
     .tool-code {
       background: #161b22;
@@ -367,8 +417,11 @@
       color: var(--text-bright);
       overflow-x: auto;
       overflow-y: auto;
-      max-height: 160px;
+      max-height: 120px;
       border: 1px solid #21262d;
+      font-size: 0.7rem;
+      line-height: 1.5;
+      margin-top: 6px;
     }
 
     /* Tier Badge Styles */
@@ -840,9 +893,10 @@
         <div class="tool-card" id="tool-card" style="display:none;">
           <div class="tool-title">
             <span id="tool-name">RazorpaySDK.tool_call</span>
-            <span style="color:var(--text-muted); font-weight:normal;">JSON Payload</span>
+            <span class="tool-label" id="tool-status">EXECUTED</span>
           </div>
-          <pre class="tool-code" id="tool-args">{}</pre>
+          <div class="tool-kv" id="tool-kv"></div>
+          <pre class="tool-code" id="tool-args" style="display:none;">{}</pre>
         </div>
 
         <!-- Compact Status Bar -->
@@ -863,6 +917,21 @@
         <span class="panel-title">
           Live Customer View
         </span>
+
+        <!-- View Switcher -->
+        <div class="view-toggle-bar">
+          <button class="toggle-btn active" id="btn-view-canvas" onclick="switchRightPanelTab('canvas')">
+            Canvas View
+          </button>
+          <button class="toggle-btn" id="btn-view-store" onclick="switchRightPanelTab('store')">
+            Store Checkout (/pay)
+          </button>
+        </div>
+      </div>
+
+      <!-- Real Store View Mode (/pay embedded iframe) -->
+      <div id="store-view-mode" style="display:none; height:calc(100% - 40px); padding:8px; background:#0d1117;">
+        <iframe src="/pay" id="store-iframe" style="width:100%; height:100%; border:none; border-radius:4px; background:#ffffff;"></iframe>
       </div>
 
       <!-- Generative Canvas View Mode -->
@@ -916,8 +985,8 @@
 
           <!-- Morph Container -->
           <div id="morph-container">
-            <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas()">
-              Open Customer Checkout
+            <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504 (HDFC Netbanking drop)')">
+              Pay INR 4,999.00 Now
             </button>
           </div>
         </div>
@@ -981,11 +1050,34 @@
     const toolCard = document.getElementById("tool-card");
     const toolName = document.getElementById("tool-name");
     const toolArgs = document.getElementById("tool-args");
+    const toolKv = document.getElementById("tool-kv");
+    const toolStatus = document.getElementById("tool-status");
     const morphContainer = document.getElementById("morph-container");
     const voiceWidget = document.getElementById("voice-widget");
 
     let activePaymentId = "";
     let lastTier = "";
+
+    function switchRightPanelTab(mode) {
+      const btnCanvas = document.getElementById("btn-view-canvas");
+      const btnStore = document.getElementById("btn-view-store");
+      const canvasMode = document.getElementById("canvas-view-mode");
+      const storeMode = document.getElementById("store-view-mode");
+
+      if (mode === "canvas") {
+        btnCanvas.classList.add("active");
+        btnStore.classList.remove("active");
+        canvasMode.style.display = "flex";
+        storeMode.style.display = "none";
+      } else {
+        btnStore.classList.add("active");
+        btnCanvas.classList.remove("active");
+        storeMode.style.display = "block";
+        canvasMode.style.display = "none";
+        const iframe = document.getElementById("store-iframe");
+        if (iframe) iframe.src = "/pay";
+      }
+    }
 
     function resetProgressPills() {
       document.getElementById("p-detect").className = "step-pill";
@@ -1102,9 +1194,11 @@
                   : /fail|error|low|block/i.test(val) ? 'red'
                   : /attempt|retry/i.test(val) ? 'amber'
                   : /memory|history/i.test(val) ? 'purple' : 'blue';
-          html += '<span class="trace-chip ' + cls + '">' + key + ': ' + val + '</span> ';
+          // Long values get block display for readability
+          var displayCls = val.length > 60 ? 'trace-chip-long' : '';
+          html += '<span class="trace-chip ' + cls + ' ' + displayCls + '">' + key + ': ' + val + '</span> ';
         } else {
-          html += '<span style="color:#8b949e; font-size:0.72rem;">' + escapeHtml(line) + '</span> ';
+          html += '<span class="trace-detail-text">' + escapeHtml(line) + '</span> ';
         }
       }
       html += '</div>';
@@ -1138,7 +1232,17 @@
       var isReasoning = /THINK|PLAN|DIAGNOSE|GUARD|MEMORY|KG|ROOT CAUSE/i.test(tag);
       var openCls = isReasoning ? ' open' : '';
       var detailHtml = detail ? formatDetailChips(detail) : '';
-      var html = '<div class="trace-header" onclick="toggleStep(this)">'
+      // Colored left border per tag type
+      var borderColors = {
+        'DETECT': '#8b5cf6', 'DIAGNOSE': '#3b82f6', 'ROOT CAUSE': '#3b82f6',
+        'GUARDRAIL': '#f59e0b', 'STRATEGY': '#f59e0b', 'THINK': '#8b5cf6',
+        'ACT': '#ef4444', 'ACTION': '#ef4444', 'HARNESS': '#3b82f6',
+        'SUCCESS': '#22c55e', 'FAIL': '#ef4444', 'BLOCKED': '#ef4444',
+        'UI SPEC': '#ec4899', 'MEMORY': '#06b6d4', 'KG': '#22c55e',
+        'APPROVAL NEEDED': '#f97316', 'APPROVAL DENIED': '#ef4444'
+      };
+      var borderColor = borderColors[tag] || '#21262d';
+      var html = '<div class="trace-header" onclick="toggleStep(this)" style="border-left-color:' + borderColor + '">'
         + '<span class="trace-chevron">\u25b8</span>'
         + '<span class="trace-tag" style="color:' + tagColor + '">[' + escapeHtml(tag) + ']</span>'
         + '<span class="trace-title">' + escapeHtml(text) + '</span>'
@@ -1214,11 +1318,42 @@
       });
     }
 
-    function startPaymentFromCanvas() {
-      logThought("CHECKOUT", "tag-thinking", "Opening customer checkout page...");
-      // Pass payment_id so customer checkout uses the same ID as the merchant dashboard
-      const pid = activePaymentId || "";
-      window.location.href = "/pay" + (pid ? "?payment_id=" + encodeURIComponent(pid) : "");
+    function startPaymentFromCanvas(scenarioReason) {
+      const paymentId = "pay_sim_" + Math.floor(1000 + Math.random() * 9000);
+      const amount = 4999.0;
+      activePaymentId = paymentId;
+      
+      resetProgressPills();
+      document.getElementById("progress-status-label").textContent = "CREATING RAZORPAY ORDER...";
+      logThought("CHECKOUT", "tag-thinking", `Initiating Razorpay Checkout for ${paymentId}...`, `Amount: INR ${amount.toFixed(2)}`);
+
+      fetch("/api/create-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: amount, payment_id: paymentId })
+      })
+      .then(r => r.json())
+      .then(data => {
+        logThought("ORDER", "tag-kg", `Razorpay Order Created: ${data.order_id}`, `Paise: ${data.amount} | Currency: ${data.currency} | Key: ${data.key_id || 'rzp_test_demo'}`);
+        document.getElementById("progress-status-label").textContent = "PROCESSING PAYMENT...";
+        
+        setTimeout(() => {
+          logThought("GATEWAY", "tag-acting", `Razorpay Gateway Failure Event Fired!`, `Reason: ${scenarioReason || 'Gateway Timeout 504 (HDFC Netbanking drop)'}`);
+          fetch("/api/payment-failed", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              payment_id: paymentId,
+              amount: amount,
+              failure_code: "gateway_timeout",
+              failure_reason: scenarioReason || "Gateway Timeout 504 (HDFC Netbanking drop)",
+              error_source: "gateway",
+              error_step: "payment_authorization",
+              customer: { name: "Rahul Kumar", email: "rahul@example.com" }
+            })
+          });
+        }, 800);
+      });
     }
 
     function triggerScenario(name) {
@@ -1374,9 +1509,67 @@
       if (data.tool_call) {
         toolCard.style.display = "block";
         toolName.textContent = data.tool_call.tool || "RazorpayTool";
-        // Display raw_razorpay_response if available, else fallback to response
         const sdkPayload = data.tool_call.raw_razorpay_response || data.tool_call.response || data.tool_call;
-        toolArgs.textContent = JSON.stringify(sdkPayload, null, 2);
+        // Render structured key-value pairs
+        var kvHtml = '';
+        var displayKeys = {
+          'payment_id': 'Payment ID',
+          'amount': 'Amount',
+          'currency': 'Currency',
+          'status': 'Status',
+          'short_url': 'Link',
+          'link_url': 'Link',
+          'id': 'Order ID',
+          'phone': 'Phone',
+          'campaign_id': 'Campaign',
+          'action': 'Action',
+          'detail': 'Detail',
+          'what_happened': 'Outcome',
+          'observable': 'Observable'
+        };
+        if (typeof sdkPayload === 'object' && sdkPayload !== null) {
+          // Show key fields first, then raw JSON for the rest
+          var shownKeys = [];
+          for (var k in displayKeys) {
+            if (sdkPayload[k] !== undefined && sdkPayload[k] !== null && sdkPayload[k] !== '') {
+              var val = typeof sdkPayload[k] === 'object' ? JSON.stringify(sdkPayload[k]) : String(sdkPayload[k]);
+              kvHtml += '<span class="kv-key">' + displayKeys[k] + ':</span><span class="kv-val">' + escapeHtml(val) + '</span>';
+              shownKeys.push(k);
+            }
+          }
+          toolKv.innerHTML = kvHtml;
+          toolKv.style.display = kvHtml ? 'grid' : 'none';
+          // Show raw JSON for remaining keys only if small
+          var remaining = Object.keys(sdkPayload).filter(function(k) { return shownKeys.indexOf(k) === -1; });
+          if (remaining.length > 0 && remaining.length <= 8) {
+            var mini = {};
+            remaining.forEach(function(k) { mini[k] = sdkPayload[k]; });
+            toolArgs.textContent = JSON.stringify(mini, null, 2);
+            toolArgs.style.display = 'block';
+          } else {
+            toolArgs.style.display = 'none';
+          }
+        } else {
+          toolKv.style.display = 'none';
+          toolArgs.textContent = JSON.stringify(sdkPayload, null, 2);
+          toolArgs.style.display = 'block';
+        }
+        // Set status badge color
+        var statusText = sdkPayload.status || sdkPayload.what_happened || 'EXECUTED';
+        toolStatus.textContent = statusText.toUpperCase();
+        if (statusText.indexOf('fail') > -1 || statusText.indexOf('error') > -1) {
+          toolStatus.style.background = 'rgba(239,68,68,0.15)';
+          toolStatus.style.color = '#ef4444';
+          toolStatus.style.borderColor = 'rgba(239,68,68,0.3)';
+        } else if (statusText.indexOf('success') > -1 || statusText.indexOf('recovered') > -1 || statusText.indexOf('initiated') > -1) {
+          toolStatus.style.background = 'rgba(34,197,94,0.15)';
+          toolStatus.style.color = '#22c55e';
+          toolStatus.style.borderColor = 'rgba(34,197,94,0.3)';
+        } else {
+          toolStatus.style.background = 'rgba(245,158,11,0.1)';
+          toolStatus.style.color = '#f59e0b';
+          toolStatus.style.borderColor = 'rgba(245,158,11,0.2)';
+        }
       }
 
       // 3. Generative UI Morphing

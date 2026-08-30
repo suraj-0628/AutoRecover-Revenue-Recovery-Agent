@@ -87,38 +87,42 @@ class TestAsyncRazorpaySDK:
 class TestAsyncToolExecution:
     """Test execute_tool_async offloads to thread pool."""
 
-    @pytest.mark.asyncio
-    async def test_execute_tool_async_returns_same_as_sync(self):
+    def test_execute_tool_async_returns_same_as_sync(self):
         """execute_tool_async returns identical result to execute_tool."""
         from recovery_agent.agent.tools import execute_tool, execute_tool_async
 
-        args = {"bank_code": "HDFC"}
-        sync_result = execute_tool("check_bank_health", args)
-        async_result = await execute_tool_async("check_bank_health", args)
+        async def _run():
+            args = {"bank_code": "HDFC"}
+            sync_result = execute_tool("check_bank_health", args)
+            async_result = await execute_tool_async("check_bank_health", args)
+            assert sync_result == async_result
 
-        assert sync_result == async_result
+        asyncio.run(_run())
 
-    @pytest.mark.asyncio
-    async def test_execute_tool_async_unknown_tool(self):
+    def test_execute_tool_async_unknown_tool(self):
         from recovery_agent.agent.tools import execute_tool_async
 
-        result = await execute_tool_async("nonexistent_tool", {})
-        assert result["status"] == "error"
-        assert "Unknown tool" in result["message"]
+        async def _run():
+            result = await execute_tool_async("nonexistent_tool", {})
+            assert result["status"] == "error"
+            assert "Unknown tool" in result["message"]
 
-    @pytest.mark.asyncio
-    async def test_execute_tool_async_escalate(self):
+        asyncio.run(_run())
+
+    def test_execute_tool_async_escalate(self):
         from recovery_agent.agent.tools import execute_tool_async
 
-        result = await execute_tool_async("escalate_to_human_agent", {
-            "payment_id": "pay_test_async",
-            "reason": "Async test escalation",
-        })
-        assert result["status"] == "escalated"
-        assert "ESC-" in result["ticket_id"]
+        async def _run():
+            result = await execute_tool_async("escalate_to_human_agent", {
+                "payment_id": "pay_test_async",
+                "reason": "Async test escalation",
+            })
+            assert result["status"] == "escalated"
+            assert "ESC-" in result["ticket_id"]
 
-    @pytest.mark.asyncio
-    async def test_execute_tool_async_does_not_block(self):
+        asyncio.run(_run())
+
+    def test_execute_tool_async_does_not_block(self):
         """Async tool execution completes without blocking the event loop."""
         from recovery_agent.agent.tools import execute_tool_async
 
@@ -127,8 +131,9 @@ class TestAsyncToolExecution:
             await execute_tool_async("check_bank_health", {"bank_code": "SBI"})
             return time.monotonic() - start
 
-        elapsed = await timed()
+        elapsed = asyncio.run(timed())
         assert elapsed < 1.0
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -256,49 +261,50 @@ class TestWebhookAsyncForwarding:
 class TestEventLoopNonBlocking:
     """Verify async operations do not block the event loop."""
 
-    @pytest.mark.asyncio
-    async def test_concurrent_async_tool_calls(self):
+    def test_concurrent_async_tool_calls(self):
         """Multiple async tool calls run concurrently, not sequentially."""
         from recovery_agent.agent.tools import execute_tool_async
 
-        async def timed_call(bank):
+        async def _run():
+            async def timed_call(bank):
+                start = time.monotonic()
+                await execute_tool_async("check_bank_health", {"bank_code": bank})
+                return time.monotonic() - start
+
             start = time.monotonic()
-            await execute_tool_async("check_bank_health", {"bank_code": bank})
-            return time.monotonic() - start
+            results = await asyncio.gather(
+                timed_call("HDFC"),
+                timed_call("ICICI"),
+                timed_call("SBI"),
+            )
+            total_elapsed = time.monotonic() - start
+            assert total_elapsed < 2.0
+            assert all(r < 1.0 for r in results)
 
-        # Run 3 calls concurrently
-        start = time.monotonic()
-        results = await asyncio.gather(
-            timed_call("HDFC"),
-            timed_call("ICICI"),
-            timed_call("SBI"),
-        )
-        total_elapsed = time.monotonic() - start
+        asyncio.run(_run())
 
-        # Concurrent execution: total time should be close to single call time
-        # (not 3x single call time)
-        assert total_elapsed < 2.0  # Well under 3x sequential
-        assert all(r < 1.0 for r in results)
-
-    @pytest.mark.asyncio
-    async def test_async_harness_yields_to_event_loop(self):
+    def test_async_harness_yields_to_event_loop(self):
         """Async harness yields control between LLM calls."""
         from recovery_agent.agent.harness import AgentHarness
         from tests.test_harness import make_case
 
-        call_count = 0
+        async def _run():
+            call_count = 0
 
-        async def counting_llm(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 2:
-                return {"reasoning": "Done.", "tool_calls": [], "is_final": True, "status": "action_dispatched"}
-            return {"reasoning": "Check.", "tool_calls": [{"tool": "check_bank_health", "arguments": {"bank_code": "HDFC"}}], "is_final": False, "status": "in_progress"}
+            async def counting_llm(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count >= 2:
+                    return {"reasoning": "Done.", "tool_calls": [], "is_final": True, "status": "action_dispatched"}
+                return {"reasoning": "Check.", "tool_calls": [{"tool": "check_bank_health", "arguments": {"bank_code": "HDFC"}}], "is_final": False, "status": "in_progress"}
 
-        with patch("recovery_agent.agent.harness.invoke_llm_json_async", side_effect=counting_llm):
-            harness = AgentHarness()
-            case = make_case()
-            result = await harness.run_recovery_case_async(case)
+            with patch("recovery_agent.agent.harness.invoke_llm_json_async", side_effect=counting_llm):
+                harness = AgentHarness()
+                case = make_case()
+                result = await harness.run_recovery_case_async(case)
 
-        assert result.final_status == "action_dispatched"
-        assert call_count == 2
+            assert result.final_status == "action_dispatched"
+            assert call_count == 2
+
+        asyncio.run(_run())
+

@@ -29,50 +29,12 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-SUPERU_WEBHOOK_SECRET = os.getenv("SUPERU_WEBHOOK_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5002")
 
-# --- Idempotency: persisted event_id dedup with TTL expiry ---
+# --- Idempotency: in-memory event_id dedup with TTL expiry ---
 _processed_events: dict[str, datetime] = {}
 _event_lock = threading.Lock()
 _IDEMPOTENCY_TTL_SECONDS = 86400  # 24 hours
-_IDEMPOTENCY_FILE = os.path.join(os.getenv("STATE_DIR", "data"), "processed_webhook_events.json")
-
-
-def _load_idempotency_cache() -> None:
-    """Load persisted event IDs from disk."""
-    import json
-    if os.path.exists(_IDEMPOTENCY_FILE):
-        try:
-            with open(_IDEMPOTENCY_FILE) as f:
-                data = json.load(f)
-            now = datetime.now(timezone.utc)
-            for event_id, ts_str in data.items():
-                try:
-                    ts = datetime.fromisoformat(ts_str)
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
-                    if (now - ts).total_seconds() <= _IDEMPOTENCY_TTL_SECONDS:
-                        _processed_events[event_id] = ts
-                except (ValueError, KeyError):
-                    continue
-        except (json.JSONDecodeError, OSError):
-            pass
-
-
-def _save_idempotency_cache() -> None:
-    """Persist event IDs to disk."""
-    import json
-    try:
-        os.makedirs(os.path.dirname(_IDEMPOTENCY_FILE), exist_ok=True)
-        data = {k: v.isoformat() for k, v in _processed_events.items()}
-        with open(_IDEMPOTENCY_FILE, "w") as f:
-            json.dump(data, f)
-    except OSError as e:
-        print(f"[webhook] WARNING: Could not persist idempotency cache: {e}", file=sys.stderr)
-
-
-_load_idempotency_cache()
 
 
 def _is_duplicate_event(event_id: str) -> bool:
@@ -94,7 +56,6 @@ def _is_duplicate_event(event_id: str) -> bool:
 
         # Record this event as processed
         _processed_events[event_id] = now
-        _save_idempotency_cache()
         return False
 
 
@@ -111,21 +72,6 @@ def verify_signature(payload: bytes, signature: str) -> bool:
         print("[webhook] CRITICAL: No X-Razorpay-Signature header. Rejecting request.", file=sys.stderr)
         return False
     expected = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-
-def verify_superu_signature(payload: bytes, signature: str) -> bool:
-    """Verify SuperU webhook HMAC SHA256 signature.
-
-    If SUPERU_WEBHOOK_SECRET is not configured, REJECT all requests.
-    """
-    if not SUPERU_WEBHOOK_SECRET:
-        print("[webhook] WARNING: SUPERU_WEBHOOK_SECRET not configured. Rejecting SuperU callback.", file=sys.stderr)
-        return False
-    if not signature:
-        print("[webhook] CRITICAL: No signature header on SuperU callback. Rejecting.", file=sys.stderr)
-        return False
-    expected = hmac.new(SUPERU_WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
 
 
@@ -166,90 +112,17 @@ def _forward_to_frontend_async(event_type: str, payload: dict) -> None:
     """Fire-and-forget background forwarding via thread pool.
 
     Non-blocking: spawns a daemon thread for the HTTP POST so the
-    webhook handler returns 200 immediately. On failure, persists the
-    event to a retry queue for later delivery.
+    webhook handler returns 200 immediately. Under load, this prevents
+    Flask worker thread starvation from slow frontend responses.
     """
     def _do_forward():
         try:
-            result = forward_to_frontend(event_type, payload)
-            if result.get("status") == "error":
-                _enqueue_pending_forward(event_type, payload)
+            forward_to_frontend(event_type, payload)
         except Exception as e:
             print(f"[webhook] ERROR: Background forward failed: {e}", file=sys.stderr)
-            _enqueue_pending_forward(event_type, payload)
 
     t = threading.Thread(target=_do_forward, daemon=True, name=f"fwd-{event_type[:32]}")
     t.start()
-
-
-# --- Pending forward retry queue ---
-
-_pending_forwards: list[dict] = []
-_pending_lock = threading.Lock()
-_PENDING_FILE = os.path.join(os.getenv("STATE_DIR", "data"), "pending_webhook_forwards.json")
-
-
-def _load_pending_forwards() -> None:
-    """Load pending forwards from disk on startup."""
-    import json
-    if os.path.exists(_PENDING_FILE):
-        try:
-            with open(_PENDING_FILE) as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                _pending_forwards.extend(data)
-        except (json.JSONDecodeError, OSError):
-            pass
-
-
-def _save_pending_forwards() -> None:
-    """Persist pending forwards to disk."""
-    import json
-    try:
-        os.makedirs(os.path.dirname(_PENDING_FILE), exist_ok=True)
-        with open(_PENDING_FILE, "w") as f:
-            json.dump(_pending_forwards, f)
-    except OSError as e:
-        print(f"[webhook] WARNING: Could not persist pending forwards: {e}", file=sys.stderr)
-
-
-def _enqueue_pending_forward(event_type: str, payload: dict) -> None:
-    """Save a failed forward to the retry queue."""
-    with _pending_lock:
-        _pending_forwards.append({"event_type": event_type, "payload": payload})
-        _save_pending_forwards()
-
-
-def _retry_pending_forwards() -> None:
-    """Background thread: retry pending forwards every 30 seconds."""
-    import time
-    import json
-    while True:
-        time.sleep(30)
-        with _pending_lock:
-            if not _pending_forwards:
-                continue
-            batch = list(_pending_forwards)
-            _pending_forwards.clear()
-
-        still_pending = []
-        for item in batch:
-            try:
-                result = forward_to_frontend(item["event_type"], item["payload"])
-                if result.get("status") == "error":
-                    still_pending.append(item)
-            except Exception:
-                still_pending.append(item)
-
-        if still_pending:
-            with _pending_lock:
-                _pending_forwards.extend(still_pending)
-                _save_pending_forwards()
-
-
-_load_pending_forwards()
-_retry_thread = threading.Thread(target=_retry_pending_forwards, daemon=True, name="webhook-retry")
-_retry_thread.start()
 
 
 @app.route("/webhook", methods=["POST"])
@@ -308,11 +181,6 @@ def superu_call_complete():
     SuperU sends call outcome data (answered, voicemail, no-answer, etc.)
     which we feed back into the agent's observation loop.
     """
-    # Verify SuperU HMAC signature
-    sig = request.headers.get("X-SuperU-Signature", "")
-    if not verify_superu_signature(request.data, sig):
-        return jsonify({"error": "invalid or missing SuperU signature"}), 403
-
     data = request.json or {}
     logger.info("[SuperU Callback] Received: %s", data)
 
@@ -325,13 +193,15 @@ def superu_call_complete():
     if payment_id:
         from recovery_agent.state_store import StateStore
         store = StateStore()
-        store.append_trail(payment_id, {
+        trail = store.get_trail(payment_id)
+        trail.append({
             "step": "superu_call_complete",
             "msg": f"SuperU call completed: {call_outcome}",
             "detail": f"Duration: {duration}s | Transcript preview: {transcript[:200] if transcript else 'N/A'}",
             "outcome": call_outcome,
             "duration_seconds": duration,
         })
+        store.set_trail(payment_id, trail)
         store.flush()
 
     return jsonify({"status": "received", "payment_id": payment_id}), 200

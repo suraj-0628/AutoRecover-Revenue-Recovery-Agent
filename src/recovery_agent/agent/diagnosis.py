@@ -1,13 +1,10 @@
-"""Diagnosis engine — multi-layer diagnostic cascade with LLM as last resort.
+"""Diagnosis engine — real-time LLM diagnostic reflection with LlamaIndex RAG.
 
-Cascade (return immediately on first high-confidence match):
-  Fast Path 1: Razorpay API error data (instant, real API data)
-  Fast Path 2: Rule-based heuristic / DB mapping (instant, zero I/O)
-  Fast Path 3: Pure vector semantic search (<50ms, ChromaDB only)
-  Slow Path:  LLM diagnostic reflection (last resort, 60s+ timeout)
+Uses LLM (Nemotron via OmniRoute) as the PRIMARY diagnosis method.
+The LLM performs structured reflection over raw payment failure payloads,
+customer history, bank health signals, AND RAG-retrieved knowledge base context.
 
-The LLM is an ABSOLUTE LAST RESORT — only invoked when all 3 fast paths
-return UNKNOWN or fail. This eliminates 60s+ latency for 90%+ of cases.
+Cascade: LLM + RAG grounded context → Razorpay API data → Rule-based fallback
 
 Source: Reflection pattern from Agentic AI (Andrew Ng), Module 2
         Router decomposition from Evaluating AI Agents

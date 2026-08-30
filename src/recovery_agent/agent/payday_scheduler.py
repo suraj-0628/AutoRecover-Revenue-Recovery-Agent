@@ -78,8 +78,8 @@ class PaydayScheduler:
 
     Usage:
         scheduler = PaydayScheduler()
-        target = scheduler.calculate_next_payday("IN", current_time=datetime.now(timezone.utc))
-        is_window = scheduler.is_in_payday_window("IN", current_time=datetime.now(timezone.utc))
+        target = scheduler.calculate_next_payday("IN", current_time=datetime.now())
+        is_window = scheduler.is_in_payday_window("IN", current_time=datetime.now())
     """
 
     def __init__(self) -> None:

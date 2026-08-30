@@ -345,19 +345,21 @@ class TestABTestFramework:
         for i in range(20):
             v = framework.assign_variant(f"case_{i}", "test_exp")
             if v == "control":
+                # Control gets 20% recovery
                 framework.record_outcome(
-                    f"case_{i}", "test_exp", ActionType.RETRY_PAYMENT, i < 6  # 30% recovery
+                    f"case_{i}", "test_exp", ActionType.RETRY_PAYMENT, i % 5 == 0
                 )
             else:
+                # Treatment gets 80% recovery
                 framework.record_outcome(
-                    f"case_{i}", "test_exp", ActionType.SEND_NOTIFICATION, i < 14  # 70% recovery
+                    f"case_{i}", "test_exp", ActionType.SEND_NOTIFICATION, i % 5 != 0
                 )
 
         result = framework.compute_result("test_exp")
         assert result.control_attempts > 0
         assert result.treatment_attempts > 0
-        # Treatment should have higher rate
         assert result.treatment_rate > result.control_rate
+
 
     def test_lift_calculation(self):
         result = ABTestResult(

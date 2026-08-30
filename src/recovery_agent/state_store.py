@@ -71,11 +71,6 @@ class StateStore:
             self._atomic_write(self._dir / "live_pending.json", self._pending)
             self._atomic_write(self._dir / "live_jobs.json", self._jobs)
 
-    def reload(self) -> None:
-        """Re-read all state from disk. Call before critical reads."""
-        with self._lock:
-            self._load()
-
     # ── payments ─────────────────────────────────────────────────
 
     def get_payment(self, payment_id: str) -> dict | None:
@@ -106,17 +101,11 @@ class StateStore:
     # ── trails ───────────────────────────────────────────────────
 
     def get_trail(self, payment_id: str) -> list[dict]:
-        """Return a copy of the trail. Use append_trail() for safe mutation."""
-        return list(self._trails.setdefault(payment_id, []))
+        return self._trails.setdefault(payment_id, [])
 
     def set_trail(self, payment_id: str, trail: list[dict]) -> None:
         with self._lock:
             self._trails[payment_id] = trail
-
-    def append_trail(self, payment_id: str, entry: dict) -> None:
-        """Append a single entry to a trail under the lock."""
-        with self._lock:
-            self._trails.setdefault(payment_id, []).append(entry)
 
     # ── pending actions ──────────────────────────────────────────
 

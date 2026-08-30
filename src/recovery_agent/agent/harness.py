@@ -361,13 +361,11 @@ class AgentHarness:
         guardrail_engine: GuardrailEngine | None = None,
         vector_memory: VectorMemoryStore | None = None,
         strategy_metrics: StrategyMetricsStore | None = None,
-        bandit: "ThompsonBandit | None" = None,
     ):
         self.memory = memory_store or CustomerMemoryStore()
         self.guardrails = guardrail_engine or GuardrailEngine()
         self.vector_memory = vector_memory or VectorMemoryStore()
         self.strategy_metrics = strategy_metrics or StrategyMetricsStore()
-        self.bandit = bandit
 
     def _guardrail_intercept(
         self, case: Case, tool_name: str, arguments: dict[str, Any]
@@ -526,10 +524,11 @@ class AgentHarness:
                     tool_calls: list[ToolCall] = []
 
                     for tc in tool_calls_raw:
-                        call_signature, arguments, is_duplicate = self._prepare_tool_arguments(case, tc, tools_called_history)
                         tool_name = tc.get("tool", "")
+                        arguments = tc.get("arguments", {})
 
-                        if is_duplicate:
+                        call_signature = f"{tool_name}({json.dumps(arguments, sort_keys=True)})"
+                        if call_signature in tools_called_history:
                             tool_calls.append(ToolCall(
                                 tool=tool_name,
                                 arguments=arguments,
@@ -539,14 +538,32 @@ class AgentHarness:
                             error_count += 1
                             continue
 
+                        cached_metadata = {
+                            "method": case.payment.metadata.get("method", ""),
+                            "provider": case.payment.metadata.get("provider", ""),
+                            "error_code": case.payment.metadata.get("error_code", case.payment.failure_code),
+                            "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
+                            "error_source": case.payment.metadata.get("error_source", ""),
+                            "error_step": case.payment.metadata.get("error_step", ""),
+                            "failure_reason": case.payment.failure_reason,
+                            "amount": case.payment.amount,
+                            "bank": case.payment.metadata.get("bank", ""),
+                            "card_network": case.payment.metadata.get("card_network", ""),
+                        }
+                        if cached_metadata["method"] or cached_metadata["error_code"]:
+                            arguments["cached_metadata"] = cached_metadata
+
                         tool_span = tracer.start_span(
                             f"tool.{tool_name}",
                             attributes={"tool.name": tool_name, "payment_id": case.payment.payment_id},
                         ) if tracer else None
                         try:
-                            block_reason = self._check_tool_allowed(case, tool_name, arguments)
-                            if block_reason:
-                                exec_result = {"status": "blocked", "message": block_reason}
+                            decided_action = case.payment.metadata.get("decided_action", "")
+                            if tool_name == "escalate_to_human_agent" and decided_action != "escalate_to_human":
+                                exec_result = {"status": "blocked", "message": f"Escalation blocked: strategy planner decided '{decided_action}', not escalate_to_human"}
+                                is_error = True
+                            elif guardrail_result := self._guardrail_intercept(case, tool_name, arguments):
+                                exec_result = guardrail_result
                                 is_error = True
                             else:
                                 exec_result = execute_tool(tool_name, arguments)
@@ -753,10 +770,11 @@ class AgentHarness:
                     tool_calls: list[ToolCall] = []
 
                     for tc in tool_calls_raw:
-                        call_signature, arguments, is_duplicate = self._prepare_tool_arguments(case, tc, tools_called_history)
                         tool_name = tc.get("tool", "")
+                        arguments = tc.get("arguments", {})
 
-                        if is_duplicate:
+                        call_signature = f"{tool_name}({json.dumps(arguments, sort_keys=True)})"
+                        if call_signature in tools_called_history:
                             tool_calls.append(ToolCall(
                                 tool=tool_name,
                                 arguments=arguments,
@@ -766,14 +784,29 @@ class AgentHarness:
                             error_count += 1
                             continue
 
+                        cached_metadata = {
+                            "method": case.payment.metadata.get("method", ""),
+                            "provider": case.payment.metadata.get("provider", ""),
+                            "error_code": case.payment.metadata.get("error_code", case.payment.failure_code),
+                            "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
+                            "error_source": case.payment.metadata.get("error_source", ""),
+                            "error_step": case.payment.metadata.get("error_step", ""),
+                            "failure_reason": case.payment.failure_reason,
+                            "amount": case.payment.amount,
+                            "bank": case.payment.metadata.get("bank", ""),
+                            "card_network": case.payment.metadata.get("card_network", ""),
+                        }
+                        if cached_metadata["method"] or cached_metadata["error_code"]:
+                            arguments["cached_metadata"] = cached_metadata
+
                         tool_span = tracer.start_span(
                             f"tool.{tool_name}",
                             attributes={"tool.name": tool_name, "payment_id": case.payment.payment_id},
                         ) if tracer else None
                         try:
-                            block_reason = self._check_tool_allowed(case, tool_name, arguments)
-                            if block_reason:
-                                exec_result = {"status": "blocked", "message": block_reason}
+                            guardrail_result = self._guardrail_intercept(case, tool_name, arguments)
+                            if guardrail_result is not None:
+                                exec_result = guardrail_result
                                 is_error = True
                             else:
                                 exec_result = await execute_tool_async(tool_name, arguments)
@@ -889,47 +922,6 @@ class AgentHarness:
             if ctx:
                 ctx.end()
 
-    # ── Shared helper methods (used by both sync and async loops) ──
-
-    def _prepare_tool_arguments(self, case: Case, tc: dict, tools_called_history: list[str]) -> tuple[str, dict, bool]:
-        """Prepare tool arguments: dedup check + cached metadata injection.
-
-        Returns (call_signature, arguments, is_duplicate).
-        """
-        tool_name = tc.get("tool", "")
-        arguments = tc.get("arguments", {})
-
-        call_signature = f"{tool_name}({json.dumps(arguments, sort_keys=True)})"
-        if call_signature in tools_called_history:
-            return call_signature, arguments, True
-
-        cached_metadata = {
-            "method": case.payment.metadata.get("method", ""),
-            "provider": case.payment.metadata.get("provider", ""),
-            "error_code": case.payment.metadata.get("error_code", case.payment.failure_code),
-            "error_description": case.payment.metadata.get("error_description", case.payment.failure_reason),
-            "error_source": case.payment.metadata.get("error_source", ""),
-            "error_step": case.payment.metadata.get("error_step", ""),
-            "failure_reason": case.payment.failure_reason,
-            "amount": case.payment.amount,
-            "bank": case.payment.metadata.get("bank", ""),
-            "card_network": case.payment.metadata.get("card_network", ""),
-        }
-        if cached_metadata["method"] or cached_metadata["error_code"]:
-            arguments["cached_metadata"] = cached_metadata
-
-        return call_signature, arguments, False
-
-    def _check_tool_allowed(self, case: Case, tool_name: str, arguments: dict) -> str | None:
-        """Check if tool execution is allowed. Returns error message or None."""
-        decided_action = case.payment.metadata.get("decided_action", "")
-        if tool_name == "escalate_to_human_agent" and decided_action != "escalate_to_human":
-            return f"Escalation blocked: strategy planner decided '{decided_action}', not escalate_to_human"
-        guardrail_result = self._guardrail_intercept(case, tool_name, arguments)
-        if guardrail_result is not None:
-            return guardrail_result.get("message", "Blocked by guardrail")
-        return None
-
     def _ingest_outcome(self, case: Case) -> None:
         """Ingest completed case outcome into vector memory and strategy metrics."""
         try:
@@ -963,11 +955,13 @@ class AgentHarness:
 
         elif tool_name == "generate_smart_recovery_link" and status == "ok":
             case.payment.metadata["recovery_link"] = result.get("link_url", "")
+            case.attempt_count += 1
 
         elif tool_name == "schedule_payday_retry" and status == "scheduled":
             case.payment.metadata["scheduled_retry"] = result.get("target_time", "")
-            # BUG FIX: Don't increment here — it's incremented below in the catch-all
-            # to prevent double-counting
+            # If scheduling a retry on a silent tier, track it
+            if case.recovery_tier == RecoveryTier.SILENT:
+                case.silent_attempts += 1
 
         elif tool_name == "check_bank_health":
             case.payment.metadata["bank_health"] = result.get("health_score", 0)
@@ -987,17 +981,13 @@ class AgentHarness:
                 case.payment.metadata["card_network"] = result.get("card_network", "")
                 case.payment.metadata["bank_name"] = result.get("bank", "")
 
-        # Increment attempt count for action tools ONLY if not blocked
-        # BUG FIX: Guardrail-blocked actions should not count against attempt budget
+        # Increment attempt count for action tools
         if tool_name in ("generate_smart_recovery_link", "schedule_payday_retry", "escalate_to_human_agent"):
-            if status not in ("blocked", "error"):
-                case.attempt_count += 1
+            case.attempt_count += 1
 
         # Track silent attempts and escalate on failure
-        # BUG FIX: Only escalate for ACTION tools, not diagnostic/query tools
-        ACTION_TOOLS = ("generate_smart_recovery_link", "schedule_payday_retry", "escalate_to_human_agent", "initiate_voice_call")
         if case.recovery_tier == RecoveryTier.SILENT:
-            if status in ("error", "unavailable", "blocked") and tool_name in ACTION_TOOLS:
+            if status in ("error", "unavailable", "blocked"):
                 # Silent retry failed → escalate to Active immediately
                 case.recovery_tier = RecoveryTier.ACTIVE
                 case.payment.metadata["tier_transition"] = "silent_to_active"

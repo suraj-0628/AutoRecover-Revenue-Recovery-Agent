@@ -5,13 +5,15 @@ If a policy is violated, the action is vetoed or modified to a compliant fallbac
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from recovery_agent.models import ActionType, Case, CustomerProfile, HARD_DECLINES
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 class GuardrailVerdict(str, Enum):
@@ -32,15 +34,11 @@ class GuardrailCheckResult(BaseModel):
 # --- Individual Guardrail Evaluators ---
 
 class QuietHourGuardrail:
-    """Restricts customer communications during quiet hours (9 PM – 8 AM IST).
+    """Restricts customer communications during quiet hours (9 PM – 8 AM)."""
 
-    Converted to UTC equivalents: IST 21:00 = UTC 15:30, IST 08:00 = UTC 02:30.
-    Using integer hour boundaries for simplicity.
-    """
-
-    def __init__(self, quiet_start: int = 16, quiet_end: int = 3):
-        self.quiet_start = quiet_start  # UTC 16:00 ≈ IST 21:30
-        self.quiet_end = quiet_end      # UTC 03:00 ≈ IST 08:30
+    def __init__(self, quiet_start: int = 21, quiet_end: int = 8):
+        self.quiet_start = quiet_start
+        self.quiet_end = quiet_end
 
     def check(
         self,
@@ -48,7 +46,7 @@ class QuietHourGuardrail:
         profile: CustomerProfile | None = None,
         now: datetime | None = None,
     ) -> GuardrailCheckResult:
-        current = now or datetime.now(timezone.utc)
+        current = now or datetime.now(IST)
         hour = current.hour
 
         is_quiet = hour >= self.quiet_start or hour < self.quiet_end
@@ -366,7 +364,7 @@ POLICY RULES:
 2. Do NOT exceed 3 communications per 24 hours
 3. Do NOT retry a payment that has already been captured
 4. Do NOT execute high-value retries (>INR 1,00,000) without human review
-5. Do NOT send notifications during quiet hours (9 PM - 8 AM IST, stored as UTC 15:30-02:30)
+5. Do NOT send notifications during quiet hours (9 PM - 8 AM IST)
 6. If the customer has complained or the case is disputed, escalate to human
 7. NEVER authorize a silent `retry_payment` or `wait_and_retry` if the Diagnosed Root Cause is `user_dropoff`. These are behavioral drop-offs where the customer intentionally cancelled or abandoned checkout. The correct action is `send_notification` or `update_payment_method` to re-engage the customer. Do NOT re-analyze the raw failure code — trust the Diagnosed Root Cause.
 
@@ -378,9 +376,8 @@ Output JSON:
   "suggested_action": "If unsafe, suggest the correct action"
 }}"""
 
-    def __init__(self, memory_store=None):
+    def __init__(self):
         self._use_llm = True
-        self._memory_store = memory_store
 
     def check(
         self,
@@ -408,10 +405,8 @@ Output JSON:
 
             comm_count = 0
             if profile:
-                store = self._memory_store
-                if store is None:
-                    from recovery_agent.agent.memory import CustomerMemoryStore
-                    store = CustomerMemoryStore()
+                from recovery_agent.agent.memory import CustomerMemoryStore
+                store = CustomerMemoryStore()
                 comm_count = store.get_communication_count_24h(profile.customer_id)
 
             prompt = self.SEMANTIC_EVAL_PROMPT.format(
@@ -535,14 +530,14 @@ class GuardrailEngine:
     7. Semantic — LLM-based safety evaluation for complex cases
     """
 
-    def __init__(self, memory_store=None) -> None:
+    def __init__(self) -> None:
         self.quiet_hours = QuietHourGuardrail()
         self.frequency_cap = FrequencyCapGuardrail()
         self.double_debit = DoubleDebitLockGuardrail()
         self.opt_out = OptOutGuardrail()
         self.monetary_cap = MonetaryCapGuardrail()
         self.hard_decline = HardDeclineGuardrail()
-        self.semantic = SemanticGuardrail(memory_store=memory_store)
+        self.semantic = SemanticGuardrail()
 
     def validate_action(
         self,

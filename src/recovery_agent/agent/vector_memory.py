@@ -221,11 +221,9 @@ class VectorMemoryStore:
         query_text = ". ".join(query_parts)
 
         # Build ChromaDB where filter
-        # NOTE: We do NOT filter on failure_type equality here.
-        # Embedding similarity handles semantic matching across related failure types.
-        # Filtering on failure_type equality would prevent finding related cases
-        # (e.g., searching for "insufficient_funds" wouldn't find "network_timeout").
         chroma_where = where or {}
+        if failure_type and failure_type != "unknown":
+            chroma_where["failure_type"] = failure_type
 
         try:
             with self._lock:

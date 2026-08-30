@@ -39,9 +39,6 @@ class NotificationDispatcher:
         (self._outbox / "emails").mkdir(exist_ok=True)
         (self._outbox / "sms").mkdir(exist_ok=True)
 
-        # In-memory dispatch log for tracking (survives within process)
-        self.dispatch_history: list[dict[str, Any]] = []
-
         # SMTP config from env (optional — falls back to .eml file emission)
         self._smtp_host = os.getenv("SMTP_HOST", "")
         self._smtp_port = int(os.getenv("SMTP_PORT", "587"))
@@ -156,24 +153,17 @@ class NotificationDispatcher:
         failure_reason: str = "",
         amount: float = 0.0,
         attempt_count: int = 0,
-        subject: str | None = None,
-        body: str | None = None,
     ) -> dict[str, Any]:
         """Route to appropriate channel based on action type.
-
-        If subject/body are provided (from LLM generation), use them directly.
-        Otherwise, fall back to hardcoded templates.
 
         Returns a dict with dispatched channels and their results.
         """
         results: list[dict[str, Any]] = []
 
-        # Use LLM-generated content if provided, otherwise generate templates
-        if subject is not None and body is not None:
-            pass  # Use provided subject/body as-is
-        elif action == "update_payment_method":
-            subject = subject or "Action Required: Update Your Payment Method"
-            body = body or (
+        # Generate message content based on action
+        if action == "update_payment_method":
+            subject = "Action Required: Update Your Payment Method"
+            body = (
                 f"Hi,\n\n"
                 f"We noticed your payment of INR {amount:,.2f} could not be processed.\n"
                 f"Reason: {failure_reason or 'Payment method needs updating'}\n\n"
@@ -183,8 +173,8 @@ class NotificationDispatcher:
                 body += f"\nUpdate now: {recovery_link}\n"
         else:
             # Default: send_notification
-            subject = subject or "Payment Recovery: Complete Your Pending Payment"
-            body = body or (
+            subject = "Payment Recovery: Complete Your Pending Payment"
+            body = (
                 f"Hi,\n\n"
                 f"We noticed you didn't complete your payment of INR {amount:,.2f}.\n"
             )
@@ -238,9 +228,6 @@ class NotificationDispatcher:
         manifest_path = self._outbox / "dispatch_log.jsonl"
         with open(manifest_path, "a") as f:
             f.write(json.dumps(manifest_entry, default=str) + "\n")
-
-        # Track in-memory for frequency cap and audit
-        self.dispatch_history.append(manifest_entry)
 
         return {
             "status": "dispatched",

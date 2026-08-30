@@ -58,31 +58,16 @@ class RecoveryAgent:
         self.vector_memory = vector_memory or VectorMemoryStore()
         self.use_squad = use_squad
         self.use_harness = use_harness
-
-        # BUG FIX: Initialize bandit and strategy_metrics for empirical learning
-        try:
-            from recovery_agent.agent.strategy_metrics import StrategyMetricsStore, ThompsonBandit
-            self.strategy_metrics = StrategyMetricsStore()
-            self.bandit = ThompsonBandit(self.strategy_metrics)
-        except Exception:
-            self.strategy_metrics = None
-            self.bandit = None
-
         if use_squad:
             self.squad = SquadOrchestrator(
                 memory_store=self.memory,
                 guardrail_engine=self.guardrails,
-                vector_memory=self.vector_memory,
-                strategy_metrics=self.strategy_metrics,
-                bandit=self.bandit,
             )
         if use_harness:
             self.harness = AgentHarness(
                 memory_store=self.memory,
                 guardrail_engine=self.guardrails,
                 vector_memory=self.vector_memory,
-                strategy_metrics=self.strategy_metrics,
-                bandit=self.bandit,
             )
         self.graph = self._build_graph()
 
@@ -123,29 +108,20 @@ class RecoveryAgent:
         start = time.time()
         case = state.case
 
-        try:
-            self.logger.log_step(
-                case=case,
-                step=AuditStep.DETECT,
-                input_data={
-                    "payment_id": case.payment.payment_id,
-                    "amount": case.payment.amount,
-                    "failure_reason": case.payment.failure_reason,
-                },
-                reasoning=f"Payment {case.payment.payment_id} failed: {case.payment.failure_reason}. "
-                          f"Amount: {case.payment.currency} {case.payment.amount}. "
-                          f"Opening recovery case.",
-                output_data={"case_id": case.id, "status": "open"},
-                duration_ms=int((time.time() - start) * 1000),
-            )
-        except Exception as e:
-            self.logger.log_step(
-                case=case, step=AuditStep.DETECT,
-                input_data={"error": str(e)},
-                reasoning=f"Detect step error (non-fatal): {e}",
-                output_data={"case_id": case.id, "status": "open"},
-                duration_ms=int((time.time() - start) * 1000),
-            )
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.DETECT,
+            input_data={
+                "payment_id": case.payment.payment_id,
+                "amount": case.payment.amount,
+                "failure_reason": case.payment.failure_reason,
+            },
+            reasoning=f"Payment {case.payment.payment_id} failed: {case.payment.failure_reason}. "
+                      f"Amount: {case.payment.currency} {case.payment.amount}. "
+                      f"Opening recovery case.",
+            output_data={"case_id": case.id, "status": "open"},
+            duration_ms=int((time.time() - start) * 1000),
+        )
 
         return {"case": case, "current_step": AuditStep.DETECT}
 
@@ -154,17 +130,7 @@ class RecoveryAgent:
         start = time.time()
         case = state.case
 
-        try:
-            case = run_diagnosis(case)
-        except Exception as e:
-            self.logger.log_step(
-                case=case, step=AuditStep.DIAGNOSE,
-                input_data={"error": str(e)},
-                reasoning=f"Diagnosis failed (non-fatal): {e}. Falling back to unknown root cause.",
-                output_data={"root_cause": "unknown", "confidence": 0},
-                duration_ms=int((time.time() - start) * 1000),
-            )
-            return {"case": case, "current_step": AuditStep.DIAGNOSE}
+        case = run_diagnosis(case)
 
         self.logger.log_step(
             case=case,
@@ -190,61 +156,46 @@ class RecoveryAgent:
         start = time.time()
         case = state.case
 
-        try:
-            # Load customer profile from memory
-            profile = self.memory.get_or_create_profile(case.payment.customer_id)
+        # Load customer profile from memory
+        profile = self.memory.get_or_create_profile(case.payment.customer_id)
 
-            case = run_decision(
-                case, profile=profile, memory=self.memory, vector_memory=self.vector_memory,
-                strategy_metrics=self.strategy_metrics, bandit=self.bandit,
-            )
-            action = case.payment.metadata.get("decided_action", "unknown")
-            tier = case.recovery_tier.value
+        case = run_decision(case, profile=profile, memory=self.memory, vector_memory=self.vector_memory)
+        action = case.payment.metadata.get("decided_action", "unknown")
+        tier = case.recovery_tier.value
 
-            # Log tier assignment
-            tier_reasoning = case.payment.metadata.get("strategy_reasoning", "")
-            tier_enforced = case.payment.metadata.get("tier_enforced", False)
-            hard_decline_blocked = case.payment.metadata.get("hard_decline_blocked", False)
+        # Log tier assignment
+        tier_reasoning = case.payment.metadata.get("strategy_reasoning", "")
+        tier_enforced = case.payment.metadata.get("tier_enforced", False)
+        hard_decline_blocked = case.payment.metadata.get("hard_decline_blocked", False)
 
-            self.logger.log_step(
-                case=case,
-                step=AuditStep.DECIDE,
-                input_data={
-                    "root_cause": case.diagnosis.root_cause.value if case.diagnosis else "unknown",
-                    "attempt_count": case.attempt_count,
-                    "memory_enhanced": True,
-                    "preferred_channel": profile.preferred_channel,
-                    "recovery_tier": tier,
-                    "silent_attempts": case.silent_attempts,
-                    "penalties_prevented": case.penalties_prevented,
-                },
-                reasoning=f"Attempt #{case.attempt_count + 1}. "
-                          f"Cause: {case.diagnosis.root_cause.value if case.diagnosis else 'unknown'}. "
-                          f"Tier: {tier.upper()}. "
-                          f"Channel: {profile.preferred_channel or 'default'}. "
-                          f"Chosen action: {action}"
-                          f"{' [TIER ENFORCED]' if tier_enforced else ''}"
-                          f"{' [HARD DECLINE BLOCKED]' if hard_decline_blocked else ''}",
-                output_data={
-                    "action": action,
-                    "recovery_tier": tier,
-                    "tier_enforced": tier_enforced,
-                    "hard_decline_blocked": hard_decline_blocked,
-                    "penalties_prevented": case.penalties_prevented,
-                },
-                duration_ms=int((time.time() - start) * 1000),
-            )
-        except Exception as e:
-            # On decision failure, default to escalate
-            case.payment.metadata["decided_action"] = "escalate_to_human"
-            case.payment.metadata["strategy_source"] = "error_fallback"
-            self.logger.log_step(
-                case=case, step=AuditStep.DECIDE,
-                input_data={"error": str(e)},
-                reasoning=f"Decision failed (non-fatal): {e}. Falling back to ESCALATE_TO_HUMAN.",
-                output_data={"action": "escalate_to_human", "error_fallback": True},
-                duration_ms=int((time.time() - start) * 1000),
-            )
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.DECIDE,
+            input_data={
+                "root_cause": case.diagnosis.root_cause.value if case.diagnosis else "unknown",
+                "attempt_count": case.attempt_count,
+                "memory_enhanced": True,
+                "preferred_channel": profile.preferred_channel,
+                "recovery_tier": tier,
+                "silent_attempts": case.silent_attempts,
+                "penalties_prevented": case.penalties_prevented,
+            },
+            reasoning=f"Attempt #{case.attempt_count + 1}. "
+                      f"Cause: {case.diagnosis.root_cause.value if case.diagnosis else 'unknown'}. "
+                      f"Tier: {tier.upper()}. "
+                      f"Channel: {profile.preferred_channel or 'default'}. "
+                      f"Chosen action: {action}"
+                      f"{' [TIER ENFORCED]' if tier_enforced else ''}"
+                      f"{' [HARD DECLINE BLOCKED]' if hard_decline_blocked else ''}",
+            output_data={
+                "action": action,
+                "recovery_tier": tier,
+                "tier_enforced": tier_enforced,
+                "hard_decline_blocked": hard_decline_blocked,
+                "penalties_prevented": case.penalties_prevented,
+            },
+            duration_ms=int((time.time() - start) * 1000),
+        )
 
         return {"case": case, "current_step": AuditStep.DECIDE}
 
@@ -257,81 +208,70 @@ class RecoveryAgent:
         start = time.time()
         case = state.case
 
-        try:
-            # Load customer profile for guardrail checks
-            profile = self.memory.get_or_create_profile(case.payment.customer_id)
+        # Load customer profile for guardrail checks
+        profile = self.memory.get_or_create_profile(case.payment.customer_id)
 
-            if self.use_squad:
-                # Squad mode: run full Diagnose → Plan → Guard → Execute pipeline
-                result = self.squad.run_step(case, profile=profile)
-                case = result.next_case
-                last_attempt = case.attempts[-1] if case.attempts else None
+        if self.use_squad:
+            # Squad mode: run full Diagnose → Plan → Guard → Execute pipeline
+            result = self.squad.run_step(case, profile=profile)
+            case = result.next_case
+            last_attempt = case.attempts[-1] if case.attempts else None
 
-                self.logger.log_step(
-                    case=case,
-                    step=AuditStep.ACT,
-                    input_data={
-                        "action": result.action_taken,
-                        "attempt_number": case.attempt_count,
-                        "verdict": result.verdict,
-                        "squad_mode": True,
-                        "recovery_tier": case.recovery_tier.value,
-                        "silent_attempts": case.silent_attempts,
-                        "penalties_prevented": case.penalties_prevented,
-                    },
-                    reasoning=f"Squad executed: {result.action_taken}. "
-                              f"Verdict: {result.verdict}. "
-                              f"Tier: {case.recovery_tier.value.upper()}. "
-                              f"{last_attempt.action_details.get('detail', '') if last_attempt else ''}",
-                    output_data={
-                        "action": result.action_taken,
-                        "verdict": result.verdict,
-                        "squad_mode": True,
-                        "recovery_tier": case.recovery_tier.value,
-                    },
-                    duration_ms=int((time.time() - start) * 1000),
-                )
-            else:
-                # Monolithic mode: original flow
-                case = run_execution(case, guardrail_engine=self.guardrails, profile=profile)
-                last_attempt = case.attempts[-1] if case.attempts else None
-
-                guardrail_checks = case.payment.metadata.get("guardrail_checks", [])
-                guardrail_final = case.payment.metadata.get("guardrail_final_action", "")
-
-                self.logger.log_step(
-                    case=case,
-                    step=AuditStep.ACT,
-                    input_data={
-                        "action": last_attempt.action_type.value if last_attempt else "none",
-                        "attempt_number": case.attempt_count,
-                        "guardrail_checks": len(guardrail_checks),
-                        "guardrail_final_action": guardrail_final,
-                        "recovery_tier": case.recovery_tier.value,
-                        "silent_attempts": case.silent_attempts,
-                        "penalties_prevented": case.penalties_prevented,
-                    },
-                    reasoning=f"Executed: {last_attempt.action_type.value}. "
-                              f"Result: {last_attempt.result}. "
-                              f"Tier: {case.recovery_tier.value.upper()}. "
-                              f"Guardrail: {guardrail_final or 'none'}. "
-                              f"{last_attempt.action_details.get('detail', '')}",
-                    output_data={
-                        "action": last_attempt.action_type.value if last_attempt else "none",
-                        "result": last_attempt.result if last_attempt else "none",
-                        "guardrail_final_action": guardrail_final,
-                        "recovery_tier": case.recovery_tier.value,
-                    },
-                    duration_ms=int((time.time() - start) * 1000),
-                )
-        except Exception as e:
-            # On execution failure, record error and continue to observe
-            case.payment.metadata["execution_error"] = str(e)
             self.logger.log_step(
-                case=case, step=AuditStep.ACT,
-                input_data={"error": str(e)},
-                reasoning=f"Execution failed (non-fatal): {e}. Case will be observed as-is.",
-                output_data={"execution_error": True},
+                case=case,
+                step=AuditStep.ACT,
+                input_data={
+                    "action": result.action_taken,
+                    "attempt_number": case.attempt_count,
+                    "verdict": result.verdict,
+                    "squad_mode": True,
+                    "recovery_tier": case.recovery_tier.value,
+                    "silent_attempts": case.silent_attempts,
+                    "penalties_prevented": case.penalties_prevented,
+                },
+                reasoning=f"Squad executed: {result.action_taken}. "
+                          f"Verdict: {result.verdict}. "
+                          f"Tier: {case.recovery_tier.value.upper()}. "
+                          f"{last_attempt.action_details.get('detail', '') if last_attempt else ''}",
+                output_data={
+                    "action": result.action_taken,
+                    "verdict": result.verdict,
+                    "squad_mode": True,
+                    "recovery_tier": case.recovery_tier.value,
+                },
+                duration_ms=int((time.time() - start) * 1000),
+            )
+        else:
+            # Monolithic mode: original flow
+            case = run_execution(case, guardrail_engine=self.guardrails, profile=profile)
+            last_attempt = case.attempts[-1] if case.attempts else None
+
+            guardrail_checks = case.payment.metadata.get("guardrail_checks", [])
+            guardrail_final = case.payment.metadata.get("guardrail_final_action", "")
+
+            self.logger.log_step(
+                case=case,
+                step=AuditStep.ACT,
+                input_data={
+                    "action": last_attempt.action_type.value if last_attempt else "none",
+                    "attempt_number": case.attempt_count,
+                    "guardrail_checks": len(guardrail_checks),
+                    "guardrail_final_action": guardrail_final,
+                    "recovery_tier": case.recovery_tier.value,
+                    "silent_attempts": case.silent_attempts,
+                    "penalties_prevented": case.penalties_prevented,
+                },
+                reasoning=f"Executed: {last_attempt.action_type.value}. "
+                          f"Result: {last_attempt.result}. "
+                          f"Tier: {case.recovery_tier.value.upper()}. "
+                          f"Guardrail: {guardrail_final or 'none'}. "
+                          f"{last_attempt.action_details.get('detail', '')}",
+                output_data={
+                    "action": last_attempt.action_type.value if last_attempt else "none",
+                    "result": last_attempt.result if last_attempt else "none",
+                    "guardrail_final_action": guardrail_final,
+                    "recovery_tier": case.recovery_tier.value,
+                },
                 duration_ms=int((time.time() - start) * 1000),
             )
 
@@ -342,119 +282,81 @@ class RecoveryAgent:
         start = time.time()
         case = state.case
 
-        try:
-            # Record tier before stopping check (may transition)
-            previous_tier = case.recovery_tier
+        # Record tier before stopping check (may transition)
+        previous_tier = case.recovery_tier
 
-            # BUG FIX: Check if payment was actually captured via Razorpay API
-            # This is the ONLY way to confirm recovery — not via action type or logs
-            if not case.recovered and case.attempts:
-                last_attempt = case.attempts[-1]
-                observable = last_attempt.action_details.get("observable", "")
-                if observable in ("order_created", "link_sent"):
-                    # Attempt to verify via Razorpay API
-                    try:
-                        from recovery_agent.razorpay_client import RazorpayClient
-                        client = RazorpayClient()
-                        if client.is_configured:
-                            payment_data = client.fetch_payment(case.payment.payment_id)
-                            if payment_data.get("status") == "captured":
-                                case.recovered = True
-                                case.recovered_amount = case.payment.amount / 100.0
-                                case.status = CaseStatus.RECOVERED
-                    except Exception:
-                        pass  # Non-fatal — don't block observe on verification failure
+        case = run_stopping_check(case)
+        should_stop, stop_reason = check_stopping_rules(case)
 
-            case = run_stopping_check(case)
-            should_stop, stop_reason = check_stopping_rules(case)
+        # Check for tier transition
+        tier_transitioned = case.recovery_tier != previous_tier
 
-            # Check for tier transition
-            tier_transitioned = case.recovery_tier != previous_tier
-
-            # Update customer memory with this attempt's outcome
-            if case.attempts:
-                last_attempt = case.attempts[-1]
-                channel = case.payment.metadata.get("decided_action", "")
-                self.memory.update_profile_after_attempt(
-                    customer_id=case.payment.customer_id,
-                    attempt={
-                        "payment_id": case.payment.payment_id,
-                        "amount": case.payment.amount,
-                        "failure_type": case.diagnosis.root_cause.value if case.diagnosis else "",
-                    },
-                    success=case.recovered,
-                    channel=channel,
-                )
-
-            # Ingest outcome into vector memory for future similarity search
-            try:
-                self.vector_memory.ingest_outcome(case)
-            except Exception as e:
-                logger.warning(f"Vector memory ingestion failed: {e}")
-
-            self.logger.log_step(
-                case=case,
-                step=AuditStep.OBSERVE,
-                input_data={
-                    "recovered": case.recovered,
-                    "attempt_count": case.attempt_count,
-                    "status": case.status.value,
-                    "recovery_tier": case.recovery_tier.value,
-                    "silent_attempts": case.silent_attempts,
-                    "tier_transitioned": tier_transitioned,
-                    "penalties_prevented": case.penalties_prevented,
+        # Update customer memory with this attempt's outcome
+        if case.attempts:
+            last_attempt = case.attempts[-1]
+            channel = case.payment.metadata.get("decided_action", "")
+            self.memory.update_profile_after_attempt(
+                customer_id=case.payment.customer_id,
+                attempt={
+                    "payment_id": case.payment.payment_id,
+                    "amount": case.payment.amount,
+                    "failure_type": case.diagnosis.root_cause.value if case.diagnosis else "",
                 },
-                reasoning=f"After attempt #{case.attempt_count}: "
-                          f"recovered={case.recovered}, "
-                          f"status={case.status.value}, "
-                          f"tier={case.recovery_tier.value.upper()}, "
-                          f"silent_attempts={case.silent_attempts}, "
-                          f"penalties_prevented={case.penalties_prevented}. "
-                          f"{'TIER TRANSITION: ' + case.recovery_tier.value.upper() if tier_transitioned else ''} "
-                          f"{'STOP: ' + stop_reason if should_stop else 'CONTINUE'}",
-                output_data={
-                    "should_stop": should_stop,
-                    "stop_reason": stop_reason,
-                    "status": case.status.value,
-                    "recovery_tier": case.recovery_tier.value,
-                    "tier_transitioned": tier_transitioned,
-                    "penalties_prevented": case.penalties_prevented,
-                },
-                duration_ms=int((time.time() - start) * 1000),
+                success=case.recovered,
+                channel=channel,
             )
 
-            if should_stop:
-                self.logger.log_step(
-                    case=case,
-                    step=AuditStep.STOP,
-                    input_data={"status": case.status.value},
-                    reasoning=f"Agent stopped. Reason: {stop_reason}. "
-                              f"Total attempts: {case.attempt_count}. "
-                              f"Recovered: {case.recovered}. "
-                              f"Recovered amount: {case.recovered_amount}. "
-                              f"Penalties prevented: {case.penalties_prevented}. "
-                              f"Final tier: {case.recovery_tier.value.upper()}",
-                    output_data={
-                        "final_status": case.status.value,
-                        "total_attempts": case.attempt_count,
-                        "recovered": case.recovered,
-                        "recovered_amount": case.recovered_amount,
-                        "penalties_prevented": case.penalties_prevented,
-                        "final_tier": case.recovery_tier.value,
-                    },
-                    duration_ms=0,
-                )
-        except Exception as e:
-            # On observe failure, log error and stop the agent
-            should_stop = True
-            stop_reason = f"observe_error: {e}"
-            case.payment.metadata["observe_error"] = str(e)
+        self.logger.log_step(
+            case=case,
+            step=AuditStep.OBSERVE,
+            input_data={
+                "recovered": case.recovered,
+                "attempt_count": case.attempt_count,
+                "status": case.status.value,
+                "recovery_tier": case.recovery_tier.value,
+                "silent_attempts": case.silent_attempts,
+                "tier_transitioned": tier_transitioned,
+                "penalties_prevented": case.penalties_prevented,
+            },
+            reasoning=f"After attempt #{case.attempt_count}: "
+                      f"recovered={case.recovered}, "
+                      f"status={case.status.value}, "
+                      f"tier={case.recovery_tier.value.upper()}, "
+                      f"silent_attempts={case.silent_attempts}, "
+                      f"penalties_prevented={case.penalties_prevented}. "
+                      f"{'TIER TRANSITION: ' + case.recovery_tier.value.upper() if tier_transitioned else ''} "
+                      f"{'STOP: ' + stop_reason if should_stop else 'CONTINUE'}",
+            output_data={
+                "should_stop": should_stop,
+                "stop_reason": stop_reason,
+                "status": case.status.value,
+                "recovery_tier": case.recovery_tier.value,
+                "tier_transitioned": tier_transitioned,
+                "penalties_prevented": case.penalties_prevented,
+            },
+            duration_ms=int((time.time() - start) * 1000),
+        )
+
+        if should_stop:
             self.logger.log_step(
-                case=case, step=AuditStep.OBSERVE,
-                input_data={"error": str(e)},
-                reasoning=f"Observe failed (non-fatal): {e}. Stopping agent.",
-                output_data={"should_stop": True, "stop_reason": stop_reason},
-                duration_ms=int((time.time() - start) * 1000),
+                case=case,
+                step=AuditStep.STOP,
+                input_data={"status": case.status.value},
+                reasoning=f"Agent stopped. Reason: {stop_reason}. "
+                          f"Total attempts: {case.attempt_count}. "
+                          f"Recovered: {case.recovered}. "
+                          f"Recovered amount: {case.recovered_amount}. "
+                          f"Penalties prevented: {case.penalties_prevented}. "
+                          f"Final tier: {case.recovery_tier.value.upper()}",
+                output_data={
+                    "final_status": case.status.value,
+                    "total_attempts": case.attempt_count,
+                    "recovered": case.recovered,
+                    "recovered_amount": case.recovered_amount,
+                    "penalties_prevented": case.penalties_prevented,
+                    "final_tier": case.recovery_tier.value,
+                },
+                duration_ms=0,
             )
 
         return {
@@ -618,37 +520,7 @@ class RecoveryAgent:
         )
 
         # Step 5: Stop — log final status
-        # BUG FIX: Verify payment capture via Razorpay API
-        if not case.recovered and case.attempts:
-            last_attempt = case.attempts[-1]
-            observable = last_attempt.action_details.get("observable", "")
-            if observable in ("order_created", "link_sent"):
-                try:
-                    from recovery_agent.razorpay_client import RazorpayClient
-                    client = RazorpayClient()
-                    if client.is_configured:
-                        payment_data = client.fetch_payment(case.payment.payment_id)
-                        if payment_data.get("status") == "captured":
-                            case.recovered = True
-                            case.recovered_amount = case.payment.amount / 100.0
-                            case.status = CaseStatus.RECOVERED
-                except Exception:
-                    pass
-
         case = run_stopping_check(case)
-
-        # BUG FIX: Update customer memory (fast path was skipping this)
-        if case.attempts:
-            self.memory.update_profile_after_attempt(
-                customer_id=case.payment.customer_id,
-                attempt={
-                    "payment_id": case.payment.payment_id,
-                    "amount": case.payment.amount,
-                    "failure_type": case.diagnosis.root_cause.value if case.diagnosis else "",
-                },
-                success=case.recovered,
-                channel=case.payment.metadata.get("decided_action", ""),
-            )
 
         self.logger.log_step(
             case=case,
@@ -736,36 +608,6 @@ class RecoveryAgent:
         # Step 3: Run the multi-turn harness loop
         harness_result = self.harness.run_recovery_case(case)
 
-        # BUG FIX: Verify payment capture via Razorpay API
-        if not case.recovered and case.attempts:
-            last_attempt = case.attempts[-1]
-            observable = last_attempt.action_details.get("observable", "")
-            if observable in ("order_created", "link_sent"):
-                try:
-                    from recovery_agent.razorpay_client import RazorpayClient
-                    client = RazorpayClient()
-                    if client.is_configured:
-                        payment_data = client.fetch_payment(case.payment.payment_id)
-                        if payment_data.get("status") == "captured":
-                            case.recovered = True
-                            case.recovered_amount = case.payment.amount / 100.0
-                            case.status = CaseStatus.RECOVERED
-                except Exception:
-                    pass
-
-        # BUG FIX: Update customer memory (harness path was skipping this)
-        if case.attempts:
-            self.memory.update_profile_after_attempt(
-                customer_id=case.payment.customer_id,
-                attempt={
-                    "payment_id": case.payment.payment_id,
-                    "amount": case.payment.amount,
-                    "failure_type": case.diagnosis.root_cause.value if case.diagnosis else "",
-                },
-                success=case.recovered,
-                channel=case.payment.metadata.get("decided_action", ""),
-            )
-
         # Step 4: Log harness results
         self._log_harness_result(case, harness_result, start)
 
@@ -820,36 +662,6 @@ class RecoveryAgent:
 
         # Step 3: Run the multi-turn harness loop (async — non-blocking)
         harness_result = await self.harness.run_recovery_case_async(case)
-
-        # BUG FIX: Verify payment capture via Razorpay API
-        if not case.recovered and case.attempts:
-            last_attempt = case.attempts[-1]
-            observable = last_attempt.action_details.get("observable", "")
-            if observable in ("order_created", "link_sent"):
-                try:
-                    from recovery_agent.razorpay_client import RazorpayClient
-                    client = RazorpayClient()
-                    if client.is_configured:
-                        payment_data = client.fetch_payment(case.payment.payment_id)
-                        if payment_data.get("status") == "captured":
-                            case.recovered = True
-                            case.recovered_amount = case.payment.amount / 100.0
-                            case.status = CaseStatus.RECOVERED
-                except Exception:
-                    pass
-
-        # BUG FIX: Update customer memory (async harness path was skipping this)
-        if case.attempts:
-            self.memory.update_profile_after_attempt(
-                customer_id=case.payment.customer_id,
-                attempt={
-                    "payment_id": case.payment.payment_id,
-                    "amount": case.payment.amount,
-                    "failure_type": case.diagnosis.root_cause.value if case.diagnosis else "",
-                },
-                success=case.recovered,
-                channel=case.payment.metadata.get("decided_action", ""),
-            )
 
         # Step 4: Log harness results
         self._log_harness_result(case, harness_result, start)

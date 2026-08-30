@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from recovery_agent.models import ActionType, Case, FailureType, RecoveryTier
+from recovery_agent.models import ActionType, Case, RecoveryTier
 
 logger = logging.getLogger(__name__)
 
@@ -55,25 +55,6 @@ def execute_action(
                 })
                 recovery_link = link_result.get("short_url") or link_result.get("link_url") or ""
 
-            # Generate LLM personalized message (FLAW-30: connects communication → notifications)
-            llm_subject = None
-            llm_body = None
-            try:
-                from recovery_agent.communication import generate_recovery_message
-                msg = generate_recovery_message(
-                    failure_type=FailureType(cause_value) if cause_value else FailureType.NETWORK_ERROR,
-                    channel="email",
-                    amount=amount,
-                    attempt_count=attempt_count,
-                    failure_reason=failure_reason,
-                )
-                if msg:
-                    llm_subject = msg.subject
-                    llm_body = msg.body
-            except Exception:
-                import logging
-                logging.getLogger(__name__).debug("LLM message generation failed, using fallback templates")
-
             from recovery_agent.notifications import NotificationDispatcher
             dispatcher = NotificationDispatcher()
             result = dispatcher.dispatch(
@@ -85,8 +66,6 @@ def execute_action(
                 failure_reason=failure_reason,
                 amount=amount,
                 attempt_count=attempt_count,
-                subject=llm_subject,
-                body=llm_body,
             )
             channels = result.get("channels", [])
             return {
@@ -155,25 +134,6 @@ def execute_action(
 
     elif action == ActionType.UPDATE_PAYMENT_METHOD:
         try:
-            # Generate LLM personalized message (FLAW-30: connects communication → notifications)
-            llm_subject = None
-            llm_body = None
-            try:
-                from recovery_agent.communication import generate_recovery_message
-                msg = generate_recovery_message(
-                    failure_type=FailureType(cause_value) if cause_value else FailureType.CARD_EXPIRED,
-                    channel="email",
-                    amount=amount,
-                    attempt_count=attempt_count,
-                    failure_reason=failure_reason or "Payment method needs updating",
-                )
-                if msg:
-                    llm_subject = msg.subject
-                    llm_body = msg.body
-            except Exception:
-                import logging
-                logging.getLogger(__name__).debug("LLM message generation failed, using fallback templates")
-
             from recovery_agent.notifications import NotificationDispatcher
             dispatcher = NotificationDispatcher()
             result = dispatcher.dispatch(
@@ -185,8 +145,6 @@ def execute_action(
                 failure_reason=failure_reason or "Payment method needs updating",
                 amount=amount,
                 attempt_count=attempt_count,
-                subject=llm_subject,
-                body=llm_body,
             )
             channels = result.get("channels", [])
             return {
@@ -222,52 +180,10 @@ def execute_action(
             logger.warning("[Execution] BLOCKED: Test environment — voice_call skipped for %s", payment_id)
             return {
                 "action": "voice_call",
-                "detail": "Voice calls blocked during tests. No notification sent.",
+                "detail": "Voice calls blocked during tests. Falling back to notification.",
                 "what_happened": "voice_call_test_blocked",
-                "observable": "voice_call_test_blocked",
+                "observable": "fallback_to_notification",
             }
-
-        # FLAW-32: Guardrail check before voice call (quiet hours, frequency, opt-out)
-        try:
-            from recovery_agent.agent.guardrails import GuardrailEngine
-            from recovery_agent.models import Case, PaymentEvent, CustomerProfile
-            guardrails = GuardrailEngine()
-            # Build a minimal case for guardrail check
-            _event = PaymentEvent(
-                payment_id=payment_id or "",
-                customer_id=customer_phone or "",
-                amount=amount,
-                status="failed",
-                failure_reason=failure_reason,
-            )
-            _case = Case(payment=_event)
-            _profile = CustomerProfile(customer_id=customer_phone or "")
-            approved_action, checks = guardrails.validate_action(
-                case=_case,
-                action=ActionType.VOICE_CALL,
-                profile=_profile,
-            )
-            if approved_action != ActionType.VOICE_CALL:
-                blocked_reason = next(
-                    (c.reason for c in checks if c.verdict.value == "blocked"),
-                    "Guardrail blocked voice call",
-                )
-                logger.warning("[Execution] BLOCKED by guardrail: %s", blocked_reason)
-                # Fall back to notification instead of voice call
-                return execute_action(
-                    ActionType.SEND_NOTIFICATION,
-                    cause_value=cause_value,
-                    amount=amount,
-                    payment_id=payment_id,
-                    customer_email=customer_email,
-                    customer_phone=customer_phone,
-                    recovery_link=recovery_link,
-                    failure_reason=failure_reason,
-                    attempt_count=attempt_count,
-                    **kwargs,
-                )
-        except Exception as guard_err:
-            logger.warning("[Execution] Guardrail check failed: %s — proceeding with voice call", guard_err)
         try:
             from recovery_agent.integrations.superu_client import get_superu_client
             client = get_superu_client()
@@ -314,16 +230,16 @@ def execute_action(
             else:
                 return {
                     "action": "voice_call",
-                    "detail": f"Voice call failed: {result.get('error', 'unknown error')}. No notification sent.",
+                    "detail": f"Voice call failed: {result.get('error', 'unknown error')}. Falling back to notification.",
                     "what_happened": "voice_call_error",
-                    "observable": "voice_call_failed",
+                    "observable": "fallback_to_notification",
                 }
         except Exception as e:
             return {
                 "action": "voice_call",
-                "detail": f"Voice call error: {e}. No notification sent.",
+                "detail": f"Voice call error: {e}. Falling back to notification.",
                 "what_happened": "voice_call_exception",
-                "observable": "voice_call_failed",
+                "observable": "fallback_to_notification",
             }
 
     elif action == ActionType.ESCALATE_TO_HUMAN:
@@ -492,10 +408,9 @@ def run_execution(case: Case, guardrail_engine=None, profile=None) -> Case:
     case.attempts.append(attempt)
     case.attempt_count += 1
 
-    # Track silent attempts separately — only for tools that consume silent budget
+    # Track silent attempts separately
     if case.recovery_tier == RecoveryTier.SILENT:
-        if action in (ActionType.RETRY_PAYMENT, ActionType.UPDATE_PAYMENT_METHOD):
-            case.silent_attempts += 1
+        case.silent_attempts += 1
 
     if success and action == ActionType.ESCALATE_TO_HUMAN:
         case.status = CaseStatus.ESCALATED

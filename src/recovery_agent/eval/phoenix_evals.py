@@ -165,12 +165,10 @@ class ToolCorrectnessEvaluator:
     4. User dropoff routes to notification/payment link, not retry
     """
 
-    # FLAW-46: Renamed to avoid confusion with models.HARD_DECLINES (numeric codes)
-    # This set is for failure_type text values, not Razorpay error codes
-    HARD_DECLINE_TYPES = {
+    HARD_DECLINES = {
         "do_not_honor", "expired_card", "lost_card",
         "stolen_card", "fraud_suspected", "card_blocked",
-        "issuer_unavailable",
+        "issuer_unavailable", "declined_per心意",
     }
 
     ACTION_ROUTING = {
@@ -204,7 +202,7 @@ class ToolCorrectnessEvaluator:
 
         # Check 2: Hard decline should never trigger retry_payment
         failure_code = _safe_str(span_attributes.get("attributes.failure_code", ""))
-        if failure_code in self.HARD_DECLINE_TYPES and decided_action == "retry_payment":
+        if failure_code in self.HARD_DECLINES and decided_action == "retry_payment":
             issues.append(
                 f"Hard decline '{failure_code}' should not trigger retry_payment"
             )
