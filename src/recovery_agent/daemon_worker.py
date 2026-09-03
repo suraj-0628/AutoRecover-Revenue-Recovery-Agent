@@ -35,6 +35,7 @@ def register_retry_job(
     customer: dict[str, Any] | None = None,
     reason: str = "",
     confidence: float = 0.5,
+    job_id: str = "",
 ) -> dict[str, Any]:
     """Queue a scheduled retry for this worker to execute.
 
@@ -50,7 +51,13 @@ def register_retry_job(
     from recovery_agent.state_store import StateStore
 
     store = StateStore()
-    job_id = f"job_{payment_id}_{int(time.time())}"
+    # Adopt the job the tool already created rather than minting a second one.
+    #
+    # `retry_in_hours` schedules a job and returns its id; this then created
+    # ANOTHER with its own id, so one retry left two pending jobs and the daemon
+    # would execute it twice — two retry orders, two notifications, for a single
+    # decision the agent made once.
+    job_id = job_id or f"job_{payment_id}_{int(time.time())}"
     metadata = {
         "amount": float(amount or 0),
         "method": method,

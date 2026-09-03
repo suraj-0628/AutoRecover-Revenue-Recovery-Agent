@@ -343,8 +343,27 @@ def _link_original_order_to_recovery(payment_id: str, recovery_payment_id: str) 
         print(f"[Frontend] could not annotate {original_order}: {exc}", flush=True)
 
 
+#: How the money actually arrived, said plainly. The agent writes the lesson
+#: that goes into permanent memory, so it has to be told the truth about what
+#: worked — not left to infer it from whatever action happened to be last.
+_ARRIVAL_PHRASES = (
+    ("link", "the customer paid the recovery payment link you sent"),
+    ("checkout page", "the customer paid on the checkout page itself"),
+    ("order", "the customer paid the original checkout order"),
+    ("original payment", "the original payment was captured after all"),
+)
+
+
+def _how_it_arrived(how: str) -> str:
+    low = (how or "").lower()
+    for needle, phrase in _ARRIVAL_PHRASES:
+        if needle in low:
+            return phrase
+    return "the payment was captured"
+
+
 def _notify_agent_of_recovery(payment_id: str, amount: float, recovery_payment_id: str,
-                              seconds: int) -> None:
+                              seconds: int, how: str = "") -> None:
     """Tell the agent it worked.
 
     The poller was updating the store and returning, so the case read
@@ -365,14 +384,32 @@ def _notify_agent_of_recovery(payment_id: str, amount: float, recovery_payment_i
 
     _link_original_order_to_recovery(payment_id, recovery_payment_id)
 
+    # Say WHICH channel the money came through, because the agent writes a
+    # lesson from this and that lesson is permanent.
+    #
+    # This used to say "paid {seconds}s after {last_action}", and last_action is
+    # merely the last thing recorded. Live: the customer paid the recovery LINK,
+    # while a 24-hour retry sat scheduled for the following day and had not
+    # fired. The agent read "65s after wait_and_retry", concluded the retry had
+    # worked, and stored "CONFIRMED WINNING STRATEGY: silent 24h background
+    # retry" — a false lesson, in memory that now survives restarts, that would
+    # push it toward waiting a day instead of sending the link that actually
+    # worked.
+    arrival = _how_it_arrived(how)
+    pending_retry = ""
+    if (p.get("scheduled_job") or {}).get("target_timestamp") and "link" in (how or ""):
+        pending_retry = (" A background retry was scheduled and has NOT fired; it "
+                         "is not what recovered this.")
+
     _handoff_to_agent(
         payment_id,
-        f"RECOVERED. The customer paid INR {amount:,.2f} "
-        f"({recovery_payment_id or 'payment id unavailable'}) {seconds}s after "
-        f"{what}{offer_note}. The money is back — do NOT attempt any further "
-        f"recovery, do NOT contact the customer again. Record with manage_memory "
-        f"what worked and why, so the next case for this customer starts from it, "
-        f"then stop.",
+        f"RECOVERED. INR {amount:,.2f} is in "
+        f"({recovery_payment_id or 'payment id unavailable'}), {seconds}s after "
+        f"{what}{offer_note}. HOW IT ARRIVED: {arrival}.{pending_retry} "
+        f"Attribute the win to that channel and nothing else — the lesson you "
+        f"store here is permanent, and a wrong one will send the next recovery "
+        f"down the wrong path. Close the case with close_case, outcome "
+        f"'recovered'. Do NOT contact the customer again.",
         scenario="recovered",
     )
 
@@ -412,7 +449,7 @@ def _mark_recovered(payment_id: str, amount: float, rzp_payment_id: str,
     })
     socketio.emit("agent_event", {"payment_id": payment_id, "event": "complete",
                                   "status": "recovered"})
-    _notify_agent_of_recovery(payment_id, amount, rzp_payment_id, seconds)
+    _notify_agent_of_recovery(payment_id, amount, rzp_payment_id, seconds, how)
     return True
 
 
@@ -1165,10 +1202,18 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                 payment_id=payment_id,
                 amount=amount,
                 target_timestamp=target_ts,
+                # The tool already scheduled it; enrich that job, do not add one.
+                job_id=sdk_res.get("job_id", ""),
                 action="retry_payment",
                 method=case.payment.metadata.get("method", "card"),
                 customer={"name": customer.get("name", ""), "email": customer_email},
-                reason=best_window.reason if best_window else "Scheduled retry",
+                # The scheduler's canned reason ("Immediate retry — network
+                # issues are transient") was attached to a 24-hour job the agent
+                # had chosen deliberately, so the record contradicted itself.
+                reason=(f"agent scheduled a retry in "
+                        f"{sdk_res.get('delay_hours', '?')}h"
+                        if sdk_res.get("delay_hours") is not None
+                        else (best_window.reason if best_window else "Scheduled retry")),
                 confidence=best_window.confidence if best_window else 0.5,
             )
             sdk_res = registered_job
