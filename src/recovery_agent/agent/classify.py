@@ -69,10 +69,6 @@ BATCHES: list[dict[str, str]] = [
     {"key": "escalated", "title": "With a human",
      "what": "The ladder was exhausted and a person has the case.",
      "icon": "&#9755;"},
-    {"key": "unreachable", "title": "No way to reach them",
-     "what": "No email and no phone on file, so no rung past the checkout page "
-             "is even possible.",
-     "icon": "&#9888;"},
     {"key": "risk", "title": "Risk / dispute",
      "what": "Fraud, risk or a dispute. These are not chased — they go straight "
              "to a person.",
@@ -108,10 +104,20 @@ def classify(record: dict) -> str | None:
     if status == "escalated":
         return "escalated"
 
+    # A case with no contact details is not a batch, it is an artifact.
+    #
+    # The checkout will not start a payment until name, a valid email and a
+    # ten-digit phone are all present (`validateCustomerForm`), so no real
+    # customer journey can produce a record without them. The ones that existed
+    # were leftovers from before the customer dict was persisted at ingress.
+    #
+    # Counting them inflated revenue-at-risk with money nobody ever tried to
+    # pay: 138 of 186 cases, INR 9,72,527, none of it workable and none of it
+    # real.
     customer = record.get("customer") or {}
     if not (customer.get("email") or record.get("customer_email")
             or customer.get("contact") or record.get("customer_phone")):
-        return "unreachable"
+        return None
 
     job = record.get("scheduled_job") or {}
     if status == "scheduled" or (job and job.get("status") != "cancelled"):

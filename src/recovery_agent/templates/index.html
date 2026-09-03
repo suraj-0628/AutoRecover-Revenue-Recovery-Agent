@@ -2130,8 +2130,7 @@ function loadBatches() {
       /* An empty batch is kept and dimmed: it says that class of failure is not
          happening, and hiding it makes the page rearrange on every refresh. */
       const runnable = b.count > 0 && b.key !== "awaiting_retry" &&
-                       b.key !== "escalated" && b.key !== "unreachable" &&
-                       b.key !== "risk";
+                       b.key !== "escalated" && b.key !== "risk";
       const cases = b.payments.slice(0, 30).map(function (p) {
         return '<div class="batch-case"><b>' + esc(p.payment_id) + '</b><span>' +
                inr(p.amount) + '</span></div>';
