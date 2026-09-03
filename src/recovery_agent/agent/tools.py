@@ -625,6 +625,27 @@ def close_case(
                         "ladder or close it with a different outcome.",
         })
 
+    # Symmetry with "recovered": the agent may not claim a person has the case
+    # unless a person actually does. Escalation used to end implicitly — the
+    # ticket was filed and the run simply stopped — which is the same ambiguity
+    # a successful recovery had, with the same consequence: no record that the
+    # agent decided anything.
+    if outcome == "escalated":
+        try:
+            from recovery_agent.escalation_queue import list_tickets
+            has_ticket = any(t.get("payment_id") == payment_id
+                             for t in list_tickets(status=None))
+        except Exception:
+            has_ticket = True           # never block a closure on a queue read
+        if not has_ticket:
+            return json.dumps({
+                "status": "blocked",
+                "reason": "no escalation ticket exists for this payment, so it "
+                          "is not with a human",
+                "guidance": "Call escalate_to_human first — that is what puts it "
+                            "in front of a person — then close the case.",
+            })
+
     if outcome == "unrecoverable":
         from recovery_agent.agent import ladder as _lad
         try:
@@ -1140,6 +1161,9 @@ def escalate_to_human(
         "payment_id": payment_id,
         "reason": reason,
         "queued_for_human": True,
+        "next": "The case is with a person now, but it is not finished until you "
+                "say so. Call close_case with outcome='escalated', what happened, "
+                "and the lesson worth carrying forward.",
     })
 
 

@@ -203,11 +203,15 @@ YOUR TOOLS (these are the only ones that exist — never invent a name):
              retry_in_hours                  (silent background retry, no contact)
              escalate_to_human               (hand off to a person)
   Learn:     manage_memory                   (store a lesson for next time)
-  Finish:    close_case                      (THE ending: outcome + lesson, and
-                                              the case is closed for good. Use
-                                              outcome="recovered" only when the
-                                              money is actually in — the tool
-                                              checks)
+  Finish:    close_case                      (THE ending, every time: outcome +
+                                              lesson, and the case is closed for
+                                              good. "recovered" needs the money
+                                              actually in; "escalated" needs a
+                                              ticket to exist; "unrecoverable"
+                                              needs the ladder exhausted. The
+                                              tool checks all three — it is a
+                                              record of a decision, not a
+                                              formality)
 
 HOW TO WORK — follow this order:
 
@@ -238,7 +242,10 @@ HOW TO WORK — follow this order:
                            you have not already done counts as it. A repeat of
                            something that already failed does not.
      6. escalate_to_human  ONLY when every rung above has been tried and the
-                           money is still not back.
+                           money is still not back. Filing the ticket is not the
+                           end of your work — follow it with close_case
+                           (outcome="escalated"). A case handed to a person and
+                           never closed looks abandoned, not delegated.
 
    escalate_to_human refuses while any rung remains, and tells you which one is
    next. It is the last resort, never the answer to a blocked tool. If a tool

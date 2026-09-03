@@ -138,3 +138,55 @@ def test_the_prompt_says_not_to_end_by_falling_silent():
     i = GRAPH.index("call close_case. That is the ending")
     body = GRAPH[i - 400:i + 700]
     assert "indistinguishable from running out of ideas" in body
+
+
+# ── escalation is an ending too ─────────────────────────────────────────
+
+def test_it_refuses_to_close_as_escalated_with_no_ticket(monkeypatch):
+    """Symmetry with "recovered": the agent may not claim a person has the case
+    unless a person actually does."""
+    _case(customer={}, customer_email="", ladder={"page_push": {"at": "x"}})
+    monkeypatch.setattr("recovery_agent.escalation_queue.list_tickets",
+                        lambda status=None, limit=200: [])
+    r = _close(outcome="escalated", what_happened="handed over")
+    assert r["status"] == "blocked"
+    assert "not with a human" in r["reason"]
+
+
+def test_it_closes_as_escalated_once_a_ticket_exists(monkeypatch):
+    _case(customer={}, customer_email="", ladder={"page_push": {"at": "x"}})
+    monkeypatch.setattr("recovery_agent.escalation_queue.list_tickets",
+                        lambda status=None, limit=200: [{"payment_id": "p"}])
+    r = _close(outcome="escalated", what_happened="Ladder exhausted; ticket raised.")
+    assert r["status"] == "closed"
+    assert StateStore().get_payment("p")["status"] == "escalated"
+
+
+def test_a_queue_read_failure_never_blocks_a_closure(monkeypatch):
+    """Bookkeeping must not be able to strand a case."""
+    def boom(*a, **k):
+        raise RuntimeError("queue unavailable")
+    _case(customer={}, customer_email="", ladder={"page_push": {"at": "x"}})
+    monkeypatch.setattr("recovery_agent.escalation_queue.list_tickets", boom)
+    assert _close(outcome="escalated", what_happened="x")["status"] == "closed"
+
+
+def test_escalating_tells_the_agent_the_case_is_not_finished_yet():
+    """Filing the ticket used to be where the run stopped — the same implicit
+    ending a successful recovery had, with the same consequence: nothing showed
+    the agent had decided anything."""
+    TOOLS = (Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "tools.py").read_text()
+    i = TOOLS.index('"queued_for_human": True')
+    body = TOOLS[i:i + 500]
+    assert "close_case" in body
+    assert "not finished until you" in body, (
+        "the tool must say the case is not over merely because a ticket exists"
+    )
+
+
+def test_the_prompt_pairs_escalation_with_the_ending():
+    i = GRAPH.index("6. escalate_to_human")
+    body = GRAPH[i:i + 700]
+    assert "close_case" in body
+    assert "abandoned, not delegated" in body
