@@ -274,12 +274,18 @@ def test_a_due_scheduled_case_returns_to_the_queue(ledger):
     d = decider(ledger, llm=fake_llm(action="schedule_retry", wake_in_hours=1,
                                      reason="wait"))
     step(d, ledger, case)
-    assert d.work_queue() == []                       # not due yet
+    # Ask the queue what it holds at the agent's own clock, not the wall's.
+    # Reading the real time here made this pass only while the machine's clock
+    # was earlier than NOON + 1h — it went green all morning and failed at 13:00.
+    assert d.work_queue(now=NOON) == []               # not due yet
     from datetime import timedelta
     ledger.record_transition(case.case_id, CaseStatus.ACTING, reason="force")
+    # Past relative to the SAME clock the queue is asked about. Deriving this
+    # from the wall clock while querying at NOON is what made the two lines
+    # disagree about which hour it was.
     ledger.record_transition(case.case_id, CaseStatus.SCHEDULED,
-                             wake_at=datetime.now(timezone.utc) - timedelta(hours=1))
-    assert {c.case_id for c in d.work_queue()} == {case.case_id}
+                             wake_at=NOON - timedelta(hours=1))
+    assert {c.case_id for c in d.work_queue(now=NOON)} == {case.case_id}
 
 
 # ══ Full loop: agent decides, customer pays, sensor closes ═════════════════

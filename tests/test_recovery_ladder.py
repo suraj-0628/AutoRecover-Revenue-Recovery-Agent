@@ -311,3 +311,39 @@ def test_the_timeout_handoff_tells_the_agent_where_it_stands():
         "an exhausted ladder must say so; otherwise the agent reasons about a "
         "next channel that does not exist"
     )
+
+
+# ── a blocked channel must not become a stuck case ──────────────────────
+
+def test_a_spent_link_quota_makes_the_offer_rung_impossible():
+    """A test account allows 30 payment links, ever. Once spent, every case
+    jams at rung 2: no link can be made, no email may be sent without one, and
+    escalation is refused because the ladder is not exhausted."""
+    rec = case(links_unavailable=True)
+    possible, why = ladder.rung_possible("offer", rec)
+    assert not possible
+    assert "30 payment links" in why
+
+
+def test_the_ladder_can_still_finish_when_links_are_gone(monkeypatch):
+    monkeypatch.delenv("VOICE_CALLS_ENABLED", raising=False)
+    rec = climb(case(links_unavailable=True), "page_push", "alternate_path")
+    assert ladder.exhausted(rec), (
+        "with the offer impossible and voice off, an alternate route must be "
+        "enough to reach escalation"
+    )
+
+
+def test_the_quota_failure_tells_the_agent_not_to_retry():
+    TOOLS = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+             / "recovery_agent" / "agent" / "tools.py").read_text()
+    i = TOOLS.index("allowance of 30 payment links")
+    # Join the source's line wraps before matching: the guidance is written as
+    # `"... — do "` / `"not retry, and ..."`, so the sentence the agent actually
+    # reads never appears contiguously in the file.
+    import re
+    body = re.sub(r'"\s*\n\s*"', "", TOOLS[i - 1200:i + 2000])
+    assert '"status": "unavailable"' in body
+    assert "do not retry" in body
+    assert "promising a link that does not exist" in body
+    assert "links_unavailable=True" in body

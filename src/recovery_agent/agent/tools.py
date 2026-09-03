@@ -446,7 +446,38 @@ def generate_recovery_payment_link(
             },
         )
         if "error" in link:
-            return json.dumps({"status": "error", "message": link["error"]})
+            msg = str(link["error"])
+            # A test account allows 30 payment links, ever — cancelling one does
+            # not give it back. Once that is spent, every case jams at rung 2:
+            # no link can be made, no email may be sent without one, and
+            # escalation is refused because the ladder is not exhausted.
+            #
+            # So say plainly that this is the environment, not the request, and
+            # mark the case so the ladder treats the offer rung as impossible
+            # here — exactly as it treats a voice call when calling is switched
+            # off. A blocked channel must not become a stuck case.
+            if "limit" in msg.lower() and "payment_link" in msg.lower():
+                try:
+                    from recovery_agent.state_store import StateStore
+                    st = StateStore()
+                    if st.get_payment(payment_id) is not None:
+                        st.update_payment(payment_id, links_unavailable=True)
+                        st.flush()
+                except Exception:
+                    pass
+                return json.dumps({
+                    "status": "unavailable",
+                    "reason": "this Razorpay test account has spent its lifetime "
+                              "allowance of 30 payment links, so no link can be "
+                              "created for any case here",
+                    "detail": msg,
+                    "guidance": "Nothing you do differently will fix this — do "
+                                "not retry, and do not send a message promising "
+                                "a link that does not exist. The offer rung is "
+                                "unavailable in this environment; take a route "
+                                "that needs no link, or escalate.",
+                })
+            return json.dumps({"status": "error", "message": msg})
         link_url = link.get("short_url", "")
         link_id = link.get("id", "")
         # Stash it so the notification tool can still find it if the model

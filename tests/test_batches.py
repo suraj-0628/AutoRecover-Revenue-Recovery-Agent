@@ -245,3 +245,25 @@ def test_the_push_card_no_longer_renders_an_offer_or_opens_a_link():
     body = PAY_PAGE_SRC[i:i + 2600]
     assert "d.offer_text" not in body
     assert "window.open(d.payment_link" not in body
+
+
+# ── one message on the page at a time ───────────────────────────────────
+
+def test_the_generative_overlay_yields_to_the_agents_own_notification():
+    """It fired on every action, so a page push produced BOTH the card the agent
+    wrote and a second panel reading "Payment of INR 2,499.00 needs attention —
+    Recovery strategy: Page Push", with its own Complete Payment button. Two
+    messages about one nudge, one of them naming the mechanism rather than
+    speaking to the customer."""
+    i = FRONTEND.index('socket.on("ui_spec_overlay"')
+    body = FRONTEND[i:i + 1400]
+    assert 'document.getElementById("agent-push")' in body
+    assert 'document.getElementById("agent-offer-banner")' in body
+
+
+def test_waiting_is_not_reported_to_the_customer_as_failure():
+    """A run ending is not the case ending. The customer was told "Could not
+    recover automatically" while a live offer sat on screen above it."""
+    i = FRONTEND.index('if (data.event === "complete")')
+    body = FRONTEND[i:i + 1200]
+    assert "settled.indexOf(data.status) === -1) return" in body

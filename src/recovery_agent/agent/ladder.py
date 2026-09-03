@@ -51,6 +51,12 @@ def rung_possible(key: str, record: dict) -> tuple[bool, str]:
 
     if key in ("offer", "post_call_email", "alternate_path") and not (email or phone):
         return False, "no email or phone on file for this customer"
+    if key == "offer" and record.get("links_unavailable"):
+        # The offer rung needs a payment link, and this account cannot create
+        # one. Treating it as merely un-climbed would stall every case here
+        # short of escalation forever.
+        return False, ("this Razorpay test account has spent its 30 payment "
+                       "links, so no offer can be made")
     if key == "voice_call":
         if not voice_available():
             return False, "voice calling is switched off for this deployment"

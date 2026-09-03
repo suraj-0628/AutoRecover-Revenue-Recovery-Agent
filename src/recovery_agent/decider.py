@@ -234,16 +234,24 @@ class RecoveryDecider:
             )
             return self.ledger.require_case(case.case_id)
 
-    def work_queue(self, limit: int = 200) -> list[CaseRecord]:
-        """Cases waiting on the agent: never those parked on a person or a clock."""
+    def work_queue(self, limit: int = 200,
+                   now: datetime | None = None) -> list[CaseRecord]:
+        """Cases waiting on the agent: never those parked on a person or a clock.
+
+        `now` is threaded through to `due_cases` so the queue can be asked what
+        it holds at a given moment. Without it the scheduler read the wall clock
+        while everything around it worked from a supplied time, which is not
+        testable and, on a machine whose clock drifts or a run that spans
+        midnight, not predictable either.
+        """
         queue = [c for c in self.ledger.open_cases(limit=limit) if not is_waiting(c.status)]
-        queue += self.ledger.due_cases(limit=limit)
+        queue += self.ledger.due_cases(now=now, limit=limit)
         seen: set[str] = set()
         return [c for c in queue if not (c.case_id in seen or seen.add(c.case_id))]
 
     def run_once(self, limit: int = 200, **kw: Any) -> int:
         n = 0
-        for case in self.work_queue(limit=limit):
+        for case in self.work_queue(limit=limit, now=kw.get("now")):
             self.step(case, **kw)
             n += 1
         return n

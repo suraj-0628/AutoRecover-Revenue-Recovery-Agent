@@ -2263,6 +2263,12 @@ socket.on("agent_event", function(data) {
   if (data.event === "acting" && data.ui_spec) { applyGenerativeUISpec(data.ui_spec); }
   if (data.event === "complete") {
     const s = document.getElementById("status");
+    /* A run ending is not the case ending. The agent finishes a turn and waits
+       — for this notification, for an email, for a retry — and the customer was
+       being told "Could not recover automatically" while a live offer sat on
+       screen above it. Only a settled case gets a verdict. */
+    const settled = ["recovered", "escalated", "unrecoverable", "failed"];
+    if (settled.indexOf(data.status) === -1) return;
     document.getElementById("action-box").classList.remove("visible");
     document.getElementById("decline-wall").classList.remove("visible");
     if (data.status === "recovered") { s.className = "status-bar active s-success"; s.innerHTML = "Payment recovered! Thank you."; }
@@ -2274,6 +2280,15 @@ socket.on("ui_spec_overlay", function(data) {
   if (data.payment_id !== paymentId) return;
   const overlay = document.getElementById("ui-overlay");
   if (!overlay) return;
+
+  /* The agent's own notification is the notification.
+     This overlay fired on every action, so a page push produced BOTH the card
+     the agent wrote and a second panel reading "Payment of INR 2,499.00 needs
+     attention — Recovery strategy: Page Push", with its own Complete Payment
+     button. Two messages about one nudge, one of them describing the mechanism
+     rather than speaking to the customer. */
+  if (document.getElementById("agent-push") ||
+      document.getElementById("agent-offer-banner")) return;
   if (data.headline) document.getElementById("overlay-headline").textContent = data.headline;
   if (data.subtext) document.getElementById("overlay-subtext").textContent = data.subtext;
   if (data.primary_cta_text) {
