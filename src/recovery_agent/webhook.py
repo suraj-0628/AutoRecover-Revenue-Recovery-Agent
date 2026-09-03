@@ -9,7 +9,7 @@ Stripped of all agent logic. This module:
 The frontend is the SINGLE SOURCE OF TRUTH for agent execution and UI broadcasting.
 
 Usage:
-    python -m recovery_agent.main webhook
+    python -m recovery_agent.webhook
 """
 from __future__ import annotations
 

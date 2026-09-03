@@ -257,7 +257,6 @@ src/recovery_agent/
 │   ├── planner.py               # pydantic-ai structured planning
 │   ├── llm_client.py            # ChatOpenAI → OmniRoute, fallback chain
 │   ├── stopping.py              # Tier transition logic (silent → active)
-│   └── test_generator.py        # Synthetic failure scenarios
 ```
 
 ---
