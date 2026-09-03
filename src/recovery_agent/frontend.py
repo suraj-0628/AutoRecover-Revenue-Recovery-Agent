@@ -1352,12 +1352,6 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             },
         )
 
-        socketio.emit("ui_spec_overlay", {
-            "payment_id": payment_id,
-            **ui_spec_dict.model_dump(),
-            "recovery_tier": recovery_tier,
-            "decline_strategy": cause,
-        })
 
         # ── OBSERVE & RECOVER ──
         if action_val == "wait_and_retry":
@@ -1704,8 +1698,6 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .alt-rail-btn{background:rgba(255,255,255,0.8);backdrop-filter:blur(8px);border:1.5px solid #e2e8f0;border-radius:10px;padding:10px 16px;font-size:13px;font-weight:500;color:#475569;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:6px;font-family:inherit}
 .alt-rail-btn:hover{border-color:var(--accent);color:var(--accent);background:rgba(59,130,246,0.06);transform:translateY(-1px)}
 .alt-rail-btn.active{border-color:var(--accent);color:var(--accent);background:rgba(59,130,246,0.08)}
-.discount-banner{background:linear-gradient(135deg,rgba(16,185,129,0.08),rgba(16,185,129,0.04));border:1px solid rgba(16,185,129,0.15);border-radius:10px;padding:12px;margin-bottom:16px;font-size:13px;color:#059669;font-weight:600;text-align:center;display:none;animation:fadeIn .3s}
-.discount-banner.visible{display:block}
 .action-box{background:linear-gradient(135deg,rgba(59,130,246,0.06),rgba(59,130,246,0.02));border:1px solid rgba(59,130,246,0.12);border-radius:14px;padding:20px;margin-top:16px;display:none}
 .action-box.visible{display:block;animation:slideUp .3s ease-out}
 .action-box h4{color:var(--accent);font-size:14px;margin-bottom:6px;font-weight:600}
@@ -1713,16 +1705,6 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 .btn-respond{background:linear-gradient(135deg,var(--amber),#d97706);color:#fff;border:none;padding:12px 20px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;width:100%;font-family:inherit}
 .btn-respond:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(245,158,11,0.3)}
 
-.ui-overlay{position:fixed;top:20px;right:20px;max-width:380px;background:rgba(255,255,255,0.95);backdrop-filter:blur(20px);border:1px solid rgba(0,0,0,0.08);border-radius:16px;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,0.15);z-index:2147483647;display:none;animation:slideUp .4s ease-out;font-family:'Inter',sans-serif}
-.ui-overlay.visible{display:block}
-.ui-overlay-headline{font-size:18px;font-weight:700;color:var(--text);margin-bottom:8px;letter-spacing:-0.02em}
-.ui-overlay-subtext{font-size:13px;color:var(--muted);line-height:1.6;margin-bottom:16px}
-.ui-overlay-cta{display:inline-block;background:linear-gradient(135deg,var(--accent),var(--accent-hover));color:#fff;padding:10px 20px;border-radius:10px;font-size:14px;font-weight:600;text-decoration:none;transition:all .2s}
-.ui-overlay-cta:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(37,99,235,0.3)}
-.ui-overlay-discount{background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.15);border-radius:8px;padding:8px 12px;margin-top:12px;font-size:12px;color:#059669;font-weight:600}
-.ui-overlay-tier{display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:600;margin-top:8px}
-.ui-overlay-tier.silent{background:rgba(59,130,246,0.1);color:#2563eb}
-.ui-overlay-tier.active{background:rgba(245,158,11,0.1);color:#d97706}
 
 @media(max-width:768px){.product-grid{grid-template-columns:repeat(2,1fr);gap:12px}.header{padding:0 16px}.nav-links{display:none}.search-box{width:160px}.store-banner{padding:28px 24px}.store-banner h1{font-size:22px}}
 @media(max-width:480px){.product-grid{grid-template-columns:1fr}.cart-sidebar{width:100%}}
@@ -1730,12 +1712,6 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
 </head>
 <body>
 
-<div class="ui-overlay" id="ui-overlay">
-  <div class="ui-overlay-headline" id="overlay-headline"></div>
-  <div class="ui-overlay-subtext" id="overlay-subtext"></div>
-  <div id="overlay-cta-wrap"><a class="ui-overlay-cta" id="overlay-cta" href="#">Complete Payment</a></div>
-  <div class="ui-overlay-discount" id="overlay-discount" style="display:none"></div>
-  <div class="ui-overlay-tier" id="overlay-tier" style="display:none"></div>
 </div>
 
 <!-- Header -->
@@ -1796,7 +1772,6 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
     <div class="checkout-row"><span>Subtotal</span><span id="co-subtotal">INR 0</span></div>
     <div class="checkout-row"><span>Shipping</span><span style="color:var(--green);font-weight:600">FREE</span></div>
     <div class="checkout-row total"><span>Total</span><span id="co-total">INR 0</span></div>
-    <div class="discount-banner" id="discount-banner"></div>
     <button class="pay-btn" id="pay-btn" onclick="startPayment()">Pay Now</button>
     <div class="status-bar" id="status"></div>
     <div class="decline-wall" id="decline-wall">
@@ -2260,7 +2235,6 @@ socket.on("agent_event", function(data) {
     document.getElementById("action-detail").textContent = data.detail || "Please respond to continue recovery.";
     showStatus("waiting", "Agent is waiting for your response...");
   }
-  if (data.event === "acting" && data.ui_spec) { applyGenerativeUISpec(data.ui_spec); }
   if (data.event === "complete") {
     const s = document.getElementById("status");
     /* A run ending is not the case ending. The agent finishes a turn and waits
@@ -2276,43 +2250,17 @@ socket.on("agent_event", function(data) {
   }
 });
 
-socket.on("ui_spec_overlay", function(data) {
-  if (data.payment_id !== paymentId) return;
-  const overlay = document.getElementById("ui-overlay");
-  if (!overlay) return;
 
-  /* The agent's own notification is the notification.
-     This overlay fired on every action, so a page push produced BOTH the card
-     the agent wrote and a second panel reading "Payment of INR 2,499.00 needs
-     attention — Recovery strategy: Page Push", with its own Complete Payment
-     button. Two messages about one nudge, one of them describing the mechanism
-     rather than speaking to the customer. */
-  if (document.getElementById("agent-push") ||
-      document.getElementById("agent-offer-banner")) return;
-  if (data.headline) document.getElementById("overlay-headline").textContent = data.headline;
-  if (data.subtext) document.getElementById("overlay-subtext").textContent = data.subtext;
-  if (data.primary_cta_text) {
-    const cta = document.getElementById("overlay-cta");
-    cta.textContent = data.primary_cta_text;
-    cta.onclick = function(e) { e.preventDefault(); overlay.classList.remove("visible"); startPayment(); };
-  }
-  if (data.discount_incentive) { const d = document.getElementById("overlay-discount"); d.textContent = data.discount_incentive; d.style.display = "block"; }
-  if (data.recovery_tier) { const t = document.getElementById("overlay-tier"); t.textContent = data.recovery_tier.toUpperCase(); t.className = "ui-overlay-tier " + data.recovery_tier; t.style.display = "inline-block"; }
-  overlay.classList.add("visible");
-  setTimeout(function() { overlay.classList.remove("visible"); }, 8000);
-});
 
-function applyGenerativeUISpec(spec) {
-  if (!spec) return;
-  if (spec.headline) { document.querySelector(".checkout-title").textContent = spec.headline; }
-  if (spec.subtext) { document.querySelector(".checkout-subtitle").textContent = spec.subtext; }
-  if (spec.primary_cta_text) { const btn = document.getElementById("pay-btn"); if (btn) { btn.textContent = spec.primary_cta_text; } }
-  if (spec.discount_incentive) { const inc = document.getElementById("discount-banner"); inc.textContent = spec.discount_incentive; inc.classList.add("visible"); }
-  if (spec.recovery_tier) {
-    const tierLabel = spec.recovery_tier === "silent" ? "Background Retry Active" : "Recovery in Progress";
-    showStatus("recovering", tierLabel + " — " + (spec.decline_strategy || "Agent working on it"));
-  }
-}
+/* The agent no longer rewrites this page.
+   `applyGenerativeUISpec` pasted the agent's own spec into the checkout —
+   `spec.headline` into the title (which has held the agent's markdown summary
+   verbatim), a second discount banner, and a status line reading
+   "Background Retry Active — customer_cancelled": internal labels, shown to
+   the customer. Together with the `ui_spec_overlay` panel that is now gone,
+   the agent had three ways to write on a page it should only ever speak to
+   through its one notification and the offer banner.
+   The spec itself is unchanged and still drives the merchant HUD. */
 
 /* ── Init ── */
 renderProducts();
