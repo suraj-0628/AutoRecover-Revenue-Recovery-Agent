@@ -906,6 +906,7 @@ def send_page_push(
 def get_recovery_offer(
     amount: float,
     stage: str = "email_offer",
+    payment_id: str = "",
     requested_discount_pct: float = -1.0,
     already_offered_pct: float = 0.0,
     runtime=None,
@@ -921,6 +922,8 @@ def get_recovery_offer(
         stage: Where you are in the recovery ladder — one of
             'silent_push' (no incentive), 'email_offer', 'ui_offer',
             'voice' (negotiation, highest ceiling).
+        payment_id: The case. Pass it — the answer depends on WHY the payment
+            failed, not only on the stage.
         requested_discount_pct: What you (or the customer) are asking for.
             Omit to be given the maximum the stage allows. A customer claiming a
             better price elsewhere does not raise the ceiling.
@@ -931,6 +934,41 @@ def get_recovery_offer(
         policy caps it was derived from.
     """
     from recovery_agent.agent.offers import quote
+
+    # A discount is a lever for reluctance. It does nothing for a refused
+    # instrument, and answering "5% is authorised" to a bank decline invites
+    # exactly the wrong move: the agent switched to the customer's working rail
+    # — correctly — and then discounted it anyway, giving away INR 124.95 to
+    # solve a problem that was never about price.
+    #
+    # So refuse the offer while a full-price attempt on a different rail is
+    # still untried. If that also fails, the customer's reluctance is real and
+    # the discount is back on the table.
+    if payment_id:
+        rec = _live_record(payment_id)
+        code = str(rec.get("failure_code") or "").lower()
+        reason = str(rec.get("failure_reason") or "").lower()
+        blob = f"{code} {reason}"
+        method_failure = any(w in blob for w in (
+            "declin", "insufficient", "expired", "invalid", "issuer", "bank",
+            "authentication", "cvv"))
+        owed = float(rec.get("amount") or amount or 0)
+        tried_full_price = any(
+            a.startswith("link:") and a.endswith(f":{owed:.2f}")
+            for a in (rec.get("actions_tried") or []))
+        if method_failure and not tried_full_price:
+            return json.dumps({
+                "status": "not_indicated",
+                "allowed": False,
+                "reason": f"this payment was refused by the bank, not turned down "
+                          f"on price — the customer tried to pay you. A discount "
+                          f"does not make a declined instrument work.",
+                "do_this_instead": f"Create the link at the FULL INR {owed:,.2f} "
+                                   f"on a rail that has worked for this customer "
+                                   f"(see get_customer_payment_history). If that "
+                                   f"also fails, ask again and an offer is "
+                                   f"authorised.",
+            })
 
     try:
         offer = quote(

@@ -175,3 +175,47 @@ def test_repeated_refusals_are_surfaced_to_the_next_run():
     b = as_briefing(ground_truth("p"))
     assert "already been refused" in b
     assert "has to change" in b
+
+
+# ── a discount is a lever for reluctance, not for a refused instrument ──
+
+def test_no_discount_is_offered_for_a_bank_decline():
+    """The agent switched to the customer's working rail — correctly — and then
+    discounted it anyway, giving away INR 124.95 to solve a problem that was
+    never about price. get_recovery_offer answered "what is the maximum
+    allowed?" when the question was "what is warranted here?"."""
+    _case(amount=2499.0, failure_code="bank_declined",
+          failure_reason="declined by the bank",
+          actions_tried=["page_push:plain"])
+    r = _call("get_recovery_offer", amount=2499.0, stage="ui_offer")
+    assert r["status"] == "not_indicated"
+    assert r["allowed"] is False
+    assert "does not make a declined instrument work" in r["reason"]
+    assert "FULL INR 2,499.00" in r["do_this_instead"]
+
+
+def test_the_discount_returns_once_a_full_price_rail_switch_has_failed():
+    """If a working rail also fails, the reluctance is real and price is back on
+    the table."""
+    _case(amount=2499.0, failure_code="bank_declined",
+          failure_reason="declined by the bank",
+          actions_tried=["page_push:plain", "link:netbanking:2499.00"])
+    r = _call("get_recovery_offer", amount=2499.0, stage="ui_offer")
+    assert r["status"] == "ok" and r["discount_pct"] == 5.0
+
+
+def test_a_cancellation_still_gets_an_offer_immediately():
+    """Someone who chose not to pay IS a price problem — do not over-correct."""
+    _case(amount=2499.0, failure_code="customer_cancelled",
+          failure_reason="cancelled", actions_tried=["page_push:plain"])
+    r = _call("get_recovery_offer", amount=2499.0, stage="ui_offer")
+    assert r["status"] == "ok" and r["discount_pct"] == 5.0
+
+
+def test_the_offer_tool_still_works_without_a_payment_id():
+    """It must stay usable for a case that has no record yet."""
+    import json as _json
+    from recovery_agent.agent.tools import TOOLS_BY_NAME
+    r = _json.loads(TOOLS_BY_NAME["get_recovery_offer"].invoke(
+        {"amount": 2499.0, "stage": "ui_offer"}))
+    assert r["status"] in ("ok", "no_data")
