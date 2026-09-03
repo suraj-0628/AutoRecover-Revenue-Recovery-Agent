@@ -2176,9 +2176,29 @@ socket.on("agent_push", function(d) {
       (o.original_rupees ? '<span style="opacity:.75;text-decoration:line-through">' +
         money(o.original_rupees) + '</span>' : '') +
       '<span style="font-weight:700;font-size:16px">' + money(o.payable_rupees) + '</span>' +
-      '<span id="offer-countdown" style="opacity:.85;font-size:12px"></span>';
+      '<span id="offer-countdown" style="opacity:.85;font-size:12px"></span>' +
+      '<button id="offer-cta" style="margin-left:6px;background:#fff;color:#065f46;' +
+        'border:0;border-radius:7px;padding:6px 14px;font-size:13px;font-weight:700;' +
+        'cursor:pointer">' + esc(d.cta_text || "Pay now") + '</button>' +
+      '<button id="offer-x" aria-label="Dismiss" style="background:none;border:0;' +
+        'color:rgba(255,255,255,.75);font-size:18px;cursor:pointer;line-height:1;' +
+        'padding:0 2px">&times;</button>';
     document.body.appendChild(bar);
     document.body.style.paddingTop = "44px";
+
+    /* The banner carries the offer on its own now, so it needs its own way to
+       act on it and its own way to be turned down — both are signals the agent
+       reads. */
+    _pushShownAt = Date.now(); _pushReported = false;
+    document.getElementById("offer-cta").onclick = function () {
+      reportPush("acted", "Customer clicked the offer banner.");
+      if (d.payment_link) window.open(d.payment_link, "_blank");
+      else startPayment();
+    };
+    document.getElementById("offer-x").onclick = function () {
+      reportPush("dismissed", "Customer closed the offer banner.");
+      bar.remove(); document.body.style.paddingTop = "";
+    };
 
     let osec = Math.max(1, o.expires_in_minutes || 15) * 60;
     const oc = document.getElementById("offer-countdown");
@@ -2195,6 +2215,12 @@ socket.on("agent_push", function(d) {
         String(osec % 60).padStart(2, "0");
     }, 1000);
   }
+
+  /* An offer is a banner, not a second notification.
+     Both were drawn from this one event, so the discount arrived as a bar
+     across the top AND another card in the corner, moments after the plain
+     one — two notifications for a customer who had already seen the first. */
+  if (d.offer && d.offer.payable_rupees) return;
 
   const wrap = document.createElement("div");
   wrap.id = "agent-push";

@@ -18,6 +18,7 @@ FRONTEND = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agen
             / "frontend.py").read_text()
 INDEX = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
          / "templates" / "index.html").read_text()
+PAY_PAGE_SRC = FRONTEND
 
 
 def rec(**over):
@@ -184,3 +185,32 @@ def test_recovered_reports_what_arrived_not_what_was_owed():
     i = FRONTEND.index("def api_payments")
     body = FRONTEND[i:i + 1800]
     assert 'p.get("recovered_amount") or p.get("amount")' in body
+
+
+# ── one notification per customer ───────────────────────────────────────
+
+def test_an_offer_renders_as_a_banner_not_a_second_notification():
+    """Both were drawn from the one `agent_push` event, so a discount arrived as
+    a bar across the top AND another card in the corner moments after the plain
+    one — two notifications for a customer who had already read the first."""
+    i = PAY_PAGE_SRC.index('socket.on("agent_push"')
+    body = PAY_PAGE_SRC[i:i + 6000]
+    assert "if (d.offer && d.offer.payable_rupees) return;" in body
+
+
+def test_the_banner_can_be_acted_on_and_turned_down():
+    """It carries the offer alone now, so it needs its own button — and its own
+    dismissal, because both are signals the agent reads."""
+    i = PAY_PAGE_SRC.index('bar.id = "agent-offer-banner"')
+    body = PAY_PAGE_SRC[i:i + 3000]
+    assert 'id="offer-cta"' in body and 'id="offer-x"' in body
+    assert 'reportPush("acted"' in body and 'reportPush("dismissed"' in body
+
+
+def test_no_push_once_an_offer_is_on_the_page():
+    TOOLS = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "tools.py").read_text()
+    i = TOOLS.index("def send_page_push")
+    body = TOOLS[i:i + 4000]
+    assert 'ladder.climbed(live, "offer")' in body
+    assert "noise, not another chance" in body

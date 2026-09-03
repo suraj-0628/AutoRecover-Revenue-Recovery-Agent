@@ -853,6 +853,7 @@ def send_page_push(
     # plain push to a customer who had already dismissed one, because the
     # snapshot said there had been no outcome.
     prior = meta.get("push_outcome") or {}
+    live: dict = {}
     try:
         from recovery_agent.state_store import StateStore
         live = StateStore().get_payment(payment_id) or {}
@@ -867,6 +868,23 @@ def send_page_push(
                       f"on this page; repeating it will not work",
             "guidance": "Use show_page_offer with an authorised discount, or reach "
                         "them on another channel.",
+        })
+
+    # One notification per customer, and this is it.
+    #
+    # Once the offer rung is reached the on-page channel belongs to the discount
+    # banner, which carries its own price, countdown and button. A push as well
+    # means two things stacked on one checkout for someone who has already read
+    # the first — and the second is a worse version of the banner sitting right
+    # above it.
+    if ladder.climbed(live, "offer"):
+        return json.dumps({
+            "status": "blocked",
+            "reason": "an offer is already on this page; a second notification "
+                      "on top of it is noise, not another chance",
+            "guidance": "The banner carries the offer, the price and the button. "
+                        "If the customer has not taken it, change channel — do "
+                        "not add to the page.",
         })
 
     link = payment_link or _last_recovery_link(runtime, payment_id)
