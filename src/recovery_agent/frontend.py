@@ -483,6 +483,12 @@ def _handoff_to_agent(payment_id: str, observation: str, scenario: str) -> None:
     # The agent said this case was over. A closure it declared explicitly is a
     # decision, not a side effect of running out of tools, and a late timer or a
     # stray push outcome must not restart it.
+    # A control case is never worked, whatever wakes it up — a push outcome, a
+    # timeout, a daemon retry. One entry point guarding this would not be
+    # enough; there are four.
+    from recovery_agent.experiment import CONTROL
+    if p.get("arm") == CONTROL:
+        return
     if p.get("closed"):
         push_event(payment_id, "handoff_blocked", {
             "detail": f"case closed as {(p['closed'] or {}).get('outcome')} — "
@@ -537,6 +543,13 @@ from recovery_agent import push_bus as _push_bus
 _push_bus.register_delivery(deliver_page_push)
 
 
+@app.route("/api/experiment", methods=["GET"])
+def api_experiment():
+    """Recovery rate with a control arm — the only number that claims causation."""
+    from recovery_agent.experiment import results
+    return jsonify(results(store.payment_values()))
+
+
 @app.route("/api/batches", methods=["GET"])
 def api_batches():
     """Revenue still at risk, sorted into batches that share a fix."""
@@ -582,6 +595,9 @@ def api_run_batch(key: str):
         # session model rests on.
         if pid in active_agent_payments:
             skipped.append({"payment_id": pid, "why": "already being worked"})
+            continue
+        if rec.get("arm") == "control":
+            skipped.append({"payment_id": pid, "why": "control arm — held back"})
             continue
         customer = {k: v for k, v in (rec.get("customer") or {}).items() if v} or {
             k: v for k, v in {"email": rec.get("customer_email", ""),
@@ -775,6 +791,18 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
     # because the hand-off was discarded and its `handoff_` flag stayed set, so
     # nothing would ever retry it. Dismiss the same notification two minutes
     # later and the ladder worked. The bug was a race, not a rung.
+    # A control case is never worked, by any route.
+    #
+    # There are five callers of this function — ingress, hand-offs, the batch
+    # runner, the demo simulator and the webhook — and guarding them one by one
+    # would mean the experiment quietly breaks the first time a sixth is added.
+    # The arm is checked where the work would actually start.
+    from recovery_agent.experiment import CONTROL
+    if (store.get_payment(payment_id) or {}).get("arm") == CONTROL:
+        print(f"[Frontend] {payment_id} is in the control arm — not worked.",
+              flush=True)
+        return
+
     if payment_id in active_agent_payments:
         if not queue_if_busy:
             print(f"[Frontend] Agent thread already active for {payment_id}. Skipping duplicate trigger.")
@@ -2839,6 +2867,12 @@ def simulate_scenario(scenario: str):
         "last_action": "",
         "last_detail": "",
         "trail": [],
+        # Simulated cases are excluded from the experiment entirely — neither
+        # treated nor control. They are not real revenue, and counting a demo
+        # click in either arm would corrupt the only number that claims the
+        # agent caused something.
+        "arm": "excluded",
+        
         "recovery_tier": "silent",
         "decline_strategy": "",
         "penalties_prevented": 0,
@@ -2982,6 +3016,35 @@ def payment_failed():
     store.update_payment(payment_id, status="recovering", push_outcome=None,
                          failure_code=failure_code or "",
                          failure_reason=failure_reason or "")
+
+    # THE HOLDOUT.
+    #
+    # A share of cases is deliberately not worked, so what they recover on their
+    # own becomes the baseline the agent is measured against. Without it,
+    # "INR 3,70,305 recovered" counts every case where money arrived after the
+    # agent acted and cannot separate that from money that was coming anyway —
+    # and on pay_9frnh6kjb the customer paid in full while the agent sat blocked,
+    # which still counted as a win.
+    #
+    # The arm is written once and never recomputed: a case is re-entered every
+    # time the customer acts, and re-drawing would move it between arms.
+    from recovery_agent.experiment import assign, CONTROL
+    rec = store.get_payment(payment_id) or {}
+    arm = rec.get("arm") or assign(payment_id)
+    if not rec.get("arm"):
+        store.update_payment(payment_id, arm=arm)
+    store.flush()
+
+    if arm == CONTROL:
+        # Recorded, classified and watched like any other case — just never
+        # worked. It still needs a watcher, because a control case that recovers
+        # on its own IS the measurement.
+        push_event(payment_id, "holdout", {
+            "detail": "Held back from the agent — this case is the control arm.",
+        })
+        socketio.start_background_task(_watch_for_recovery, payment_id, 900)
+        return jsonify({"status": "control", "payment_id": payment_id,
+                        "detail": "held back from the agent"})
 
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)
     return jsonify({"status": "recovery_started"})
