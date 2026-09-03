@@ -97,3 +97,67 @@ def test_the_agents_chosen_retry_time_is_used():
     i = FRONTEND.index("target_ts = (sdk_res.get(")
     body = FRONTEND[i:i + 400]
     assert 'sdk_res.get("target_time")' in body
+
+
+# ── money in the bank cannot be written over ────────────────────────────
+
+def test_recovered_is_absorbing(tmp_path):
+    """Twice now a real recovery has been rewritten as a loss: an LLM 404 on a
+    bookkeeping run turned a captured INR 2,374.05 into `failed`, and a run that
+    only scheduled a retry wrote `failed` over a live case. Money received is a
+    fact, not a status."""
+    s = StateStore(tmp_path)
+    s.save_payment("r", {"payment_id": "r", "status": "recovered",
+                         "recovered_amount": 2374.05})
+    s.update_payment("r", status="failed", tier="ERROR")
+    assert s.get_payment("r")["status"] == "recovered"
+    assert s.get_payment("r")["tier"] == "ERROR", "other fields still apply"
+
+
+def test_an_explicit_force_can_still_correct_the_record(tmp_path):
+    s = StateStore(tmp_path / "f")
+    s.save_payment("r", {"payment_id": "r", "status": "recovered"})
+    s.update_payment("r", status="failed", force=True)
+    assert s.get_payment("r")["status"] == "failed"
+
+
+def test_a_non_recovered_case_moves_freely(tmp_path):
+    s = StateStore(tmp_path / "n")
+    s.save_payment("r", {"payment_id": "r", "status": "escalated"})
+    s.update_payment("r", status="recovered")
+    assert s.get_payment("r")["status"] == "recovered", (
+        "a customer paying after escalation is a legitimate transition"
+    )
+
+
+# ── the stop control cannot be defeated by a rebuilt Case ───────────────
+
+def test_the_tool_lockdown_consults_the_durable_record():
+    """The Case object is rebuilt from scratch every run, so its status is only
+    as good as whatever the caller put there. Money actually received must be
+    decisive regardless of any status string."""
+    GRAPH = (Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "graph.py").read_text()
+    i = GRAPH.index("A finished case gets bookkeeping tools ONLY")
+    body = GRAPH[i:i + 2600]
+    assert "StateStore().get_payment" in body
+    assert 'recovered_amount' in body
+
+
+# ── memory survives a restart ───────────────────────────────────────────
+
+def test_long_term_memory_is_not_process_local():
+    GRAPH = (Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "graph.py").read_text()
+    i = GRAPH.index("def _build_memory_store")
+    body = GRAPH[i:i + 2200]
+    assert "SqliteStore" in body
+    assert "InMemoryStore" in body, "in-memory remains the fallback, not the default"
+
+
+def test_sessions_are_not_process_local():
+    GRAPH = (Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "graph.py").read_text()
+    i = GRAPH.index("# Working memory — the message history")
+    body = GRAPH[i:i + 1200]
+    assert "SqliteSaver" in body

@@ -61,13 +61,49 @@ class RecoveryState(MessagesState):
 # ═══════════════════════════════════════════════════════════════
 
 def _build_memory_store():
-    """Build the LangGraph InMemoryStore for agent memory.
+    """Long-term memory for customer facts, recovery episodes and lessons.
 
-    Uses langmem memory tools for semantic search over customer facts,
-    recovery episodes, and learned lessons.
+    This was an `InMemoryStore`, which lives and dies with the process. Every
+    restart — every deploy — wiped everything the agent had ever learned about
+    every customer. Nothing showed it, because a lesson written and recalled
+    inside one process run looks identical to one that survives; the loss is
+    only visible across a restart, and nobody was looking there.
+
+    That is a real gap and worth naming precisely: it is NOT what caused the
+    "recovered but kept going" behaviour. Those were state-ownership bugs
+    inside a single process. This is the opposite problem — genuine amnesia,
+    silent, and only between runs of the server.
+
+    SQLite-backed now, so a lesson learned on one payment is still there for the
+    next one after a restart. Falls back to in-memory rather than refusing to
+    start, because losing memory is bad and refusing to recover payments is
+    worse.
     """
-    from langgraph.store.memory import InMemoryStore
-    return InMemoryStore()
+    import os
+    from pathlib import Path
+
+    path = Path(os.getenv("STATE_DIR", "data")) / "agent_memory.db"
+    try:
+        from langgraph.store.sqlite import SqliteStore
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cm = SqliteStore.from_conn_string(str(path))
+        store = cm.__enter__()
+        _KEEP_ALIVE.append(cm)          # the context manager owns the connection
+        try:
+            store.setup()
+        except Exception:
+            pass
+        print(f"[Agent] long-term memory: sqlite at {path}", flush=True)
+        return store
+    except Exception as exc:
+        from langgraph.store.memory import InMemoryStore
+        print(f"[Agent] long-term memory: IN-MEMORY ONLY, lost on restart ({exc})",
+              flush=True)
+        return InMemoryStore()
+
+
+#: Context managers whose connections must outlive this function.
+_KEEP_ALIVE: list = []
 
 
 # Module-level store singleton
@@ -501,8 +537,22 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
     # older task: it pushed a fresh notification and re-offered 5% to a customer
     # who had already paid INR 37,990.50. Instruction alone is not a control;
     # withholding the tools is.
-    if ctx is not None and getattr(case, "status", None) in (
-            CaseStatus.RECOVERED, CaseStatus.ESCALATED, CaseStatus.STOPPED):
+    # The Case object is rebuilt from scratch on every run, so its status is
+    # only as good as whatever the caller put there. The durable record is the
+    # one thing that cannot be forgotten between runs, so ask it too — and treat
+    # money actually received as decisive regardless of any status string.
+    _settled = getattr(case, "status", None) in (
+        CaseStatus.RECOVERED, CaseStatus.ESCALATED, CaseStatus.STOPPED)
+    if not _settled and case is not None:
+        try:
+            from recovery_agent.state_store import StateStore
+            _rec = StateStore().get_payment(getattr(case.payment, "payment_id", "")) or {}
+            _settled = (_rec.get("status") in ("recovered", "escalated")
+                        or float(_rec.get("recovered_amount") or 0) > 0)
+        except Exception:
+            pass
+
+    if ctx is not None and _settled:
         # wait_for_customer stays: it contacts nobody and moves no money, it
         # only ends the turn. Withholding it meant the closing run had no clean
         # way to stop — live, the agent called it and got
@@ -1523,7 +1573,26 @@ def build_graph():
     })
     builder.add_edge("critique_tools", END)
 
-    checkpointer = MemorySaver()
+    # Working memory — the message history of each case's session.
+    #
+    # `MemorySaver` is LangGraph's dev checkpointer and keeps everything in the
+    # process. A restart mid-recovery therefore lost the entire conversation for
+    # every in-flight case: the customer's dismissal, what had been offered, the
+    # lot. The case would carry on from the durable record and repeat itself.
+    import os
+    from pathlib import Path
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        cpath = Path(os.getenv("STATE_DIR", "data")) / "agent_sessions.db"
+        cpath.parent.mkdir(parents=True, exist_ok=True)
+        cm = SqliteSaver.from_conn_string(str(cpath))
+        checkpointer = cm.__enter__()
+        _KEEP_ALIVE.append(cm)
+        print(f"[Agent] sessions: sqlite at {cpath}", flush=True)
+    except Exception as exc:
+        checkpointer = MemorySaver()
+        print(f"[Agent] sessions: IN-MEMORY ONLY, lost on restart ({exc})", flush=True)
+
     store = get_memory_store()
     return builder.compile(checkpointer=checkpointer, store=store)
 

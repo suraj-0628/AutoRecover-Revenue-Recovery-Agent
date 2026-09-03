@@ -162,6 +162,6 @@ def test_a_finished_case_keeps_the_tool_that_ends_its_turn():
     GRAPH = (Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
              / "agent" / "graph.py").read_text()
     i = GRAPH.index("A finished case gets bookkeeping tools ONLY")
-    body = GRAPH[i:i + 1400]
+    body = GRAPH[i:i + 2600]
     assert '"wait_for_customer"' in body
     assert "send_recovery_notification" not in body, "recovery tools stay withheld"

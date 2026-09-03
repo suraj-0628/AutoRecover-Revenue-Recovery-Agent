@@ -284,3 +284,30 @@ def test_the_nets_ticket_carries_the_ladder_too():
     body = FRONTEND[i - 1400:i]
     assert "ladder climbed:" in body
     assert "never tried —" in body
+
+
+# ── the case must reach a conclusion, never silence ─────────────────────
+
+def test_a_daemon_retry_is_watched_to_a_conclusion():
+    """The retry is the last rung most cases reach, and it was where they
+    stopped: the daemon created the order, said so, and nothing watched it. A
+    customer who paid was never noticed; one who did not left the case at
+    `scheduled` for good — never recovered, never escalated, never seen."""
+    FRONTEND = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+                / "recovery_agent" / "frontend.py").read_text()
+    i = FRONTEND.index("def daemon_retry_complete")
+    body = FRONTEND[i:i + 2600]
+    assert "_watch_for_recovery" in body
+    assert '"retry_created", "link_created"' in body
+
+
+def test_the_timeout_handoff_tells_the_agent_where_it_stands():
+    FRONTEND = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+                / "recovery_agent" / "frontend.py").read_text()
+    i = FRONTEND.index("No payment after {minutes} minute(s)")
+    body = FRONTEND[i - 900:i + 900]
+    assert "Already climbed" in body and "Already tried" in body
+    assert "escalate_to_human exists for" in body, (
+        "an exhausted ladder must say so; otherwise the agent reasons about a "
+        "next channel that does not exist"
+    )

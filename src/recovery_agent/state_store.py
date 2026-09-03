@@ -125,10 +125,25 @@ class StateStore:
         with self._lock:
             self._payments[payment_id] = data
 
-    def update_payment(self, payment_id: str, **fields: Any) -> None:
+    #: Money in the bank is a fact, not a status. Once a case is `recovered`
+    #: nothing may write over it — not a failed closing run, not a stale
+    #: in-flight write, not a tool-name fallback. A recovery that reads as a
+    #: loss is worse than no record at all, and it has happened twice: an LLM
+    #: 404 on a bookkeeping run rewrote a captured INR 2,374.05 to `failed`,
+    #: and a run that only scheduled a retry wrote `failed` over a live case.
+    _ABSORBING = "recovered"
+
+    def update_payment(self, payment_id: str, force: bool = False,
+                       **fields: Any) -> None:
         with self._lock:
-            if payment_id in self._payments:
-                self._payments[payment_id].update(fields)
+            rec = self._payments.get(payment_id)
+            if rec is None:
+                return
+            if (not force and rec.get("status") == self._ABSORBING
+                    and "status" in fields
+                    and fields["status"] != self._ABSORBING):
+                fields = {k: v for k, v in fields.items() if k != "status"}
+            rec.update(fields)
 
     def remove_payment(self, payment_id: str) -> None:
         with self._lock:

@@ -188,11 +188,23 @@ def _watch_for_recovery(payment_id: str, max_wait_seconds: int = 300):
     p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
     prior = p.get("last_action", "a recovery message")
     minutes = max(1, max_wait_seconds // 60)
+    # Tell it where it stands. Without this the agent reasons about "the next
+    # channel" with no idea whether one is left, and a case whose ladder is
+    # finished can look to it like a case with more to try.
+    from recovery_agent.agent import ladder as _lad
+    st = _lad.state(p)
+    nxt = st["remaining"][0] if st["remaining"] else None
+    where = (f"Next rung: {nxt['rung']} — {nxt['what']}." if nxt else
+             "Every rung of the ladder has now been tried and the money is "
+             "still out. This is the point escalate_to_human exists for; it "
+             "will accept the case now. Escalate and stop.")
     _handoff_to_agent(
         payment_id,
         f"No payment after {minutes} minute(s). A previous recovery attempt "
-        f"({prior}) was delivered and the customer has not paid. Reason about why, "
-        f"then choose the next channel — do not repeat one that already failed.",
+        f"({prior}) was delivered and the customer has not paid. "
+        f"Already climbed: {', '.join(st['climbed']) or 'nothing'}. "
+        f"Already tried: {', '.join(_lad.actions_tried(p)) or 'nothing'}. "
+        f"Reason about why, then act. Do not repeat anything above. {where}",
         scenario="followup",
     )
 
@@ -3007,6 +3019,21 @@ def daemon_retry_complete():
         "source": source,
     })
     store.flush()
+
+    # The retry is the LAST rung most cases reach, and this was where they
+    # stopped. The daemon created the order, said so, and nothing watched it:
+    # a customer who paid the retry order was never noticed, and one who did not
+    # left the case sitting at `scheduled` for good — never recovered, never
+    # escalated, never seen by anyone.
+    #
+    # Watching it closes both ends. If the money arrives, `_watch_for_recovery`
+    # records it and tells the agent to stop. If it does not, the same watcher
+    # hands the case back — and by this point the ladder is exhausted, so the
+    # agent's escalate_to_human is finally permitted and the case reaches a
+    # person instead of silence.
+    if result.get("status") in ("retry_created", "link_created"):
+        window = int(os.getenv("RETRY_WATCH_MINUTES", "30")) * 60
+        socketio.start_background_task(_watch_for_recovery, payment_id, window)
 
     return jsonify({"status": "received", "payment_id": payment_id})
 
