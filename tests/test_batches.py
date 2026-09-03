@@ -383,3 +383,33 @@ def test_the_offer_policy_shares_one_taxonomy():
     body = TOOLS[i:i + 4000]
     assert "from recovery_agent.agent.classify import failure_kind" in body
     assert "method_failure = any(" not in body
+
+
+# ── the link quota is a control, not a promise ──────────────────────────
+
+def test_only_a_service_can_spend_a_payment_link():
+    """Twenty-eight of one account's thirty links were spent by verification
+    scripts that redirected the state store to a temp directory and left the
+    Razorpay client pointed at the live key — against an explicit instruction
+    not to. A promise is not a control."""
+    import os
+    from recovery_agent.razorpay_client import RazorpayClient, _writes_allowed
+    was = os.environ.pop("RAZORPAY_WRITES_OK", None)
+    try:
+        assert _writes_allowed() is False
+        with pytest.raises(RuntimeError, match="RAZORPAY_WRITES_OK"):
+            RazorpayClient().create_payment_link(amount=100)
+    finally:
+        if was is not None:
+            os.environ["RAZORPAY_WRITES_OK"] = was
+
+
+def test_a_service_is_still_allowed_to(monkeypatch):
+    from recovery_agent.razorpay_client import _writes_allowed
+    monkeypatch.setenv("RAZORPAY_WRITES_OK", "1")
+    assert _writes_allowed() is True
+
+
+def test_start_sh_grants_it():
+    start = (pathlib.Path(__file__).resolve().parents[1] / "start.sh").read_text()
+    assert "export RAZORPAY_WRITES_OK=1" in start

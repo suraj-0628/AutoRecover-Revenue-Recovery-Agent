@@ -1,4 +1,8 @@
 #!/bin/bash
+# Only a service may spend the account's 30-link lifetime quota.
+# An ad-hoc script does not inherit this and therefore cannot.
+export RAZORPAY_WRITES_OK=1
+
 # Start all recovery agent services
 # Usage: ./start.sh
 

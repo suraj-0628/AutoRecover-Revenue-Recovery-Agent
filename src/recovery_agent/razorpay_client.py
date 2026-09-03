@@ -56,6 +56,27 @@ ERROR_STEP_MAP: dict[str, str] = {
 }
 
 
+#: Creating a payment link spends one of an account's thirty, for its lifetime.
+#: Cancelling does not give it back and rotating the API key does not reset it,
+#: so the only way to get more is a new signup.
+#:
+#: A promise not to create them during development is not a control. Twenty-eight
+#: of one account's thirty were spent by verification scripts that redirected the
+#: state store to a temp directory but left the Razorpay client pointed at the
+#: live key — every one of them a real link on the user's real account, against
+#: an explicit instruction not to.
+#:
+#: So writes are refused unless the process was started as a service. `start.sh`
+#: exports RAZORPAY_WRITES_OK=1; an ad-hoc script does not have it and therefore
+#: cannot spend the quota, whatever it calls.
+def _writes_allowed() -> bool:
+    return os.getenv("RAZORPAY_WRITES_OK", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class _WritesDisabled(RuntimeError):
+    pass
+
+
 class RazorpayClient:
     """Wrapper around Razorpay SDK for payment operations.
 
@@ -158,6 +179,13 @@ class RazorpayClient:
         pre-convert. Passing paise here bills the customer 100x the debt, which
         shipped and reached the live account before it was caught.
         """
+        if not _writes_allowed():
+            raise _WritesDisabled(
+                "refusing to create a payment link: RAZORPAY_WRITES_OK is not set, "
+                "so this process was not started as a service. Each link is one of "
+                "thirty for the account's lifetime and cannot be reclaimed."
+            )
+
         if not self.is_configured:
             import time
             ref_id = f"plink_rzp_{os.urandom(4).hex()}"
