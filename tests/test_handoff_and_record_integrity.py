@@ -26,8 +26,9 @@ def test_a_handoff_queues_behind_an_inflight_run_instead_of_being_dropped():
 def test_a_dropped_handoff_releases_its_flag_for_retry():
     i = FRONTEND.index("def run_agent_for_payment(")
     body = FRONTEND[i:FRONTEND.index("\ndef _parse_tool_result", i)]
-    assert 'f"handoff_{scenario_type}": False' in body, (
-        "giving up must clear the flag, or the case is stuck forever"
+    assert 'startswith(f"handoff_{scenario_type}")' in body and "False" in body, (
+        "giving up must clear the flag — including the per-occurrence key — "
+        "or the case is stuck forever"
     )
 
 
@@ -137,3 +138,30 @@ def test_tool_events_are_deduped_across_runs_not_just_within_one():
     assert 'sig = f"thinking:{tc.get(\'id\') or tc[\'name\']}"' in body, (
         "dedup by tool_call id, so a genuine repeat still shows"
     )
+
+
+def test_each_dismissal_gets_its_own_handoff(tmp_path, monkeypatch):
+    """Keyed on the scenario alone, a customer could only be listened to once
+    per kind of event. Live: they dismissed the first push, the agent sent the
+    offer, they dismissed the discount banner too — and that produced nothing,
+    because handoff_push_followup was already set. The ladder stalled at rung 2
+    waiting for a customer who had already answered."""
+    i = FRONTEND.index("def _handoff_to_agent(")
+    body = FRONTEND[i:i + 2200]
+    assert "occurrence" in body, "the key must distinguish separate events"
+    assert 'push_outcome' in body and '"at"' in body, (
+        "two dismissals differ by when they happened"
+    )
+
+
+def test_a_finished_case_keeps_the_tool_that_ends_its_turn():
+    """The lockdown withholds recovery tools from a settled case, which is
+    right. It also withheld wait_for_customer, which contacts nobody and moves
+    no money — so the closing run got "wait_for_customer is not a valid tool"
+    for doing exactly the right thing."""
+    GRAPH = (Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "graph.py").read_text()
+    i = GRAPH.index("A finished case gets bookkeeping tools ONLY")
+    body = GRAPH[i:i + 1400]
+    assert '"wait_for_customer"' in body
+    assert "send_recovery_notification" not in body, "recovery tools stay withheld"

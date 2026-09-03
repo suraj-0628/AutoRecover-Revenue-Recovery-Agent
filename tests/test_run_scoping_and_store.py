@@ -76,3 +76,24 @@ def test_a_failure_to_read_the_checkpoint_does_not_break_the_run():
     i = FRONTEND.index("prior_ids: set[str] = set()")
     body = FRONTEND[i:i + 500]
     assert "except Exception:" in body and "pass" in body
+
+
+# ── a scheduled retry is live work, not a loss ──────────────────────────
+
+def test_a_scheduled_retry_is_not_recorded_as_a_failure():
+    """The agent picked a 24h silent retry as its alternate path, the daemon
+    registered the job — and the case was written as `failed`, because the run
+    had ended. A pending recovery counted as a loss on the dashboard."""
+    i = FRONTEND.index("elif case_status == CaseStatus.STOPPED:")
+    body = FRONTEND[i:i + 700]
+    assert 'action_val == "wait_and_retry"' in body
+    assert '"scheduled" if' in body
+
+
+def test_the_agents_chosen_retry_time_is_used():
+    """`retry_in_hours` returns `target_time`; only `target_timestamp` was read,
+    so the key was always missing and the scheduler substituted its own guess —
+    the agent asked for 24 hours and the daemon registered a job 3 minutes out."""
+    i = FRONTEND.index("target_ts = (sdk_res.get(")
+    body = FRONTEND[i:i + 400]
+    assert 'sdk_res.get("target_time")' in body

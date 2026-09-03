@@ -407,9 +407,24 @@ def _handoff_to_agent(payment_id: str, observation: str, scenario: str) -> None:
     # point of telling the agent it worked.
     if scenario != "recovered" and p.get("status") in ("recovered", "escalated"):
         return
-    if p.get(f"handoff_{scenario}"):
-        return                          # one hand-off per kind, never a loop
-    store.update_payment(payment_id, **{f"handoff_{scenario}": True})
+    # One hand-off per OCCURRENCE, not per kind.
+    #
+    # Keyed on the scenario alone, a customer could only ever be listened to
+    # once per kind of event. Live: they dismissed the first push (hand-off,
+    # rung 2 sent), then dismissed the discount banner too — and that second
+    # dismissal produced nothing, because `handoff_push_followup` was already
+    # set. The ladder stalled at rung 2 with the agent waiting for a customer
+    # who had already answered. The loop guard is still there; it is the
+    # occurrence key that stops a single event firing twice.
+    key = f"handoff_{scenario}"
+    occurrence = ""
+    if scenario == "push_followup":
+        occurrence = str((p.get("push_outcome") or {}).get("at") or "")
+    if occurrence:
+        key = f"{key}:{occurrence}"
+    if p.get(key):
+        return
+    store.update_payment(payment_id, **{key: True})
     store.flush()
 
     customer = {k: v for k, v in (p.get("customer") or {}).items() if v} or {
@@ -614,7 +629,9 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
         if payment_id in active_agent_payments:
             # Never silently swallow it: clear the flag so a later signal — the
             # push timeout, a payment, the next hand-off — can still act.
-            store.update_payment(payment_id, **{f"handoff_{scenario_type}": False})
+            for k in [k for k in (store.get_payment(payment_id) or {})
+                      if k.startswith(f"handoff_{scenario_type}")]:
+                store.update_payment(payment_id, **{k: False})
             store.flush()
             push_event(payment_id, "handoff_dropped", {
                 "detail": f"Previous run still active after {waited}s; "
@@ -1087,7 +1104,15 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             next_time = get_next_retry_time(ft, case.attempt_count)
             best_window = windows[0] if windows else None
 
-            target_ts = sdk_res.get("target_timestamp") or (next_time or datetime.now(timezone.utc)).isoformat()
+            # `retry_in_hours` returns `target_time`. Reading only
+            # `target_timestamp` meant that key was always missing, so the
+            # agent's decision was silently replaced by the scheduler's own
+            # guess: it asked for 24 hours and the daemon registered a job three
+            # minutes out. Honour what the agent chose; fall back only if it
+            # gave no time at all.
+            target_ts = (sdk_res.get("target_timestamp")
+                         or sdk_res.get("target_time")
+                         or (next_time or datetime.now(timezone.utc)).isoformat())
             registered_job = register_retry_job(
                 payment_id=payment_id,
                 amount=amount,
@@ -1209,7 +1234,11 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         elif case_status == CaseStatus.ESCALATED:
             final_status = "escalated"
         elif case_status == CaseStatus.STOPPED:
-            final_status = "failed"
+            # STOPPED means this RUN is over, not that the case is lost. When the
+            # agent's last act was to schedule a retry, the money is still being
+            # worked on — reading that as `failed` wrote off a live case, and
+            # made the dashboard count a pending recovery as a loss.
+            final_status = "scheduled" if action_val == "wait_and_retry" else "failed"
         elif case_status == CaseStatus.AWAITING_CUSTOMER:
             final_status = "awaiting_customer"
         else:
@@ -1272,7 +1301,35 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         # firing both produced two tickets for one payment 29 seconds apart.
         agent_already_escalated = bool(escalate_res)
 
+        # The net must obey the same rule the agent does: escalation is the LAST
+        # rung. This fired on any run that ended `failed` or `stopped`,
+        # whichever rung the case was on — so it filed a ticket for a case whose
+        # agent had just scheduled a 24h retry, walking straight around the gate
+        # that exists to stop exactly that.
+        #
+        # When rungs remain, the case has not run out of road; it has run out of
+        # THIS RUN. Hand it back to the agent to climb the next one, because
+        # nothing else will restart it and the alternative is silence.
+        from recovery_agent.agent import ladder as _ladder_mod
+        _rec = store.get_payment(payment_id) or {}
+        _rungs_left = (not _ladder_mod.exhausted(_rec)
+                       and not _ladder_mod.pursuit_barred(_rec))
+
         if (final_status in ("escalated", "failed", "stopped")
+                and not already_recovered and not agent_already_escalated
+                and _rungs_left):
+            nxt = _ladder_mod.next_rung(_rec)
+            _handoff_to_agent(
+                payment_id,
+                f"That run ended without the money coming back, and the recovery "
+                f"ladder is not finished — {nxt['rung']} has not been tried. "
+                f"Already climbed: {', '.join(_ladder_mod.state(_rec)['climbed']) or 'nothing'}. "
+                f"Already tried: {', '.join(_ladder_mod.actions_tried(_rec)) or 'nothing'}. "
+                f"Do this next: {nxt['what']}. Do not repeat anything above.",
+                scenario=f"ladder_{nxt['rung']}",
+            )
+
+        elif (final_status in ("escalated", "failed", "stopped")
                 and not already_recovered and not agent_already_escalated):
             try:
                 from recovery_agent.escalation_queue import enqueue
@@ -1290,6 +1347,12 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                         f"in-page notification {o['action']} after {o.get('seconds_shown','?')}s"
                         for o in [(store.get_payment(payment_id) or {}).get("push_outcome") or {}]
                         if o.get("action")
+                    ] + [
+                        f"ladder climbed: "
+                        f"{', '.join(_ladder_mod.state(_rec)['climbed']) or 'none'}"
+                    ] + [
+                        f"never tried — {r['rung']}: {r.get('why_not', 'n/a')}"
+                        for r in _ladder_mod.state(_rec)["unavailable"]
                     ],
                     offer=case.payment.metadata.get("page_offer") or {},
                     recovery_link=case.payment.metadata.get("recovery_link", ""),

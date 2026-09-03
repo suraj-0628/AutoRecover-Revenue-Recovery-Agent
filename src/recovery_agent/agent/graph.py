@@ -503,8 +503,14 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
     # withholding the tools is.
     if ctx is not None and getattr(case, "status", None) in (
             CaseStatus.RECOVERED, CaseStatus.ESCALATED, CaseStatus.STOPPED):
+        # wait_for_customer stays: it contacts nobody and moves no money, it
+        # only ends the turn. Withholding it meant the closing run had no clean
+        # way to stop — live, the agent called it and got
+        # "wait_for_customer is not a valid tool", which is the graph telling
+        # the agent off for doing exactly the right thing.
         allowed_names = [n for n in allowed_names
-                         if n in ("manage_memory", "search_memory")]
+                         if n in ("manage_memory", "search_memory",
+                                  "wait_for_customer")]
 
     allowed_tools = [TOOLS_BY_NAME[n] for n in allowed_names if n in TOOLS_BY_NAME]
 
@@ -681,10 +687,31 @@ def should_continue(state: RecoveryState) -> Literal["tool_repetition_guard", "s
     messages = state["messages"]
     last_message = messages[-1]
 
-    # Hard turn limit — forces final response to avoid exceeding proxy payload limits
-    ai_msgs = [m for m in messages if isinstance(m, AIMessage) and m.tool_calls]
+    # Turns are counted PER RUN, not per session.
+    #
+    # A session is now one continuous thread per payment, so this used to count
+    # every turn the case had ever taken. A case climbing the ladder spends a
+    # couple of turns per rung, so the cap tripped part-way up and the graph
+    # forced a final response mid-rung: live, `retry_in_hours` was called and
+    # never executed, the next call came back "not a valid tool", and a INR
+    # 2,499 case went quiet at rung 2 without recovering or escalating. The
+    # ladder could not be finished by any case that needed more than about
+    # three rungs.
+    #
+    # Each run begins with a fresh HumanMessage carrying the new facts, so
+    # everything after the last one is this run's work. Context size is a
+    # separate concern and is handled by the MAX_MESSAGES truncation in
+    # agent_node; this cap is only here to stop one run looping.
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            start = i
+            break
+    ai_msgs = [m for m in messages[start:]
+               if isinstance(m, AIMessage) and m.tool_calls]
     if len(ai_msgs) >= MAX_TURNS:
-        print(f"[Agent] MAX_TURNS={MAX_TURNS} reached, forcing final response", flush=True)
+        print(f"[Agent] MAX_TURNS={MAX_TURNS} reached this run, forcing final response",
+              flush=True)
         return "stopping_check"
 
     # Check if we're cycling through the same tools repeatedly

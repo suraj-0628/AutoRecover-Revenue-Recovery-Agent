@@ -196,3 +196,91 @@ def test_the_followup_context_no_longer_points_straight_at_escalation():
     body = GRAPH[i:i + 900]
     assert "next rung of the" in body
     assert "Otherwise retry_in_hours, or " not in body
+
+
+# ── the turn cap must not eat the ladder ────────────────────────────────
+
+def test_turns_are_counted_per_run_not_per_session():
+    """A session is one continuous thread per payment, so counting every turn
+    the case had ever taken meant the cap tripped part-way up the ladder. Live,
+    `retry_in_hours` was called and never executed, the next call came back
+    "not a valid tool", and a INR 2,499 case went quiet at rung 2 — neither
+    recovered nor escalated."""
+    from langchain_core.messages import AIMessage, HumanMessage
+    from recovery_agent.agent.graph import should_continue
+
+    names = ["search_memory", "diagnose_payment_failure", "query_knowledge_base",
+             "get_customer_payment_history", "check_payment_status",
+             "discover_recovery_rail", "get_recovery_offer"]
+
+    def turn(n):
+        # Distinct tools, or the repetition detector stops the run for a
+        # different reason and the test proves nothing about the turn cap.
+        return AIMessage(content="", tool_calls=[
+            {"name": names[n % len(names)], "args": {"i": n}, "id": f"c{n}"}])
+
+    # Six turns spent on earlier rungs, then a fresh run begins.
+    history = [HumanMessage(content="failed")] + [turn(i) for i in range(6)]
+    state = {"messages": history + [HumanMessage(content="dismissed"), turn(99)],
+             "tool_call_history": [], "blocked_rounds": 0}
+    assert should_continue(state) != "stopping_check", (
+        "a new run starts with a fresh budget; the case's past turns are not its own"
+    )
+
+
+def test_one_run_that_loops_is_still_capped():
+    from langchain_core.messages import AIMessage, HumanMessage
+    from recovery_agent.agent.graph import should_continue
+
+    names = ["search_memory", "diagnose_payment_failure", "query_knowledge_base",
+             "get_customer_payment_history", "check_payment_status",
+             "discover_recovery_rail", "get_recovery_offer", "send_page_push",
+             "show_page_offer"]
+    msgs = [HumanMessage(content="failed")]
+    for i in range(9):
+        msgs.append(AIMessage(content="", tool_calls=[
+            {"name": names[i], "args": {"i": i}, "id": f"x{i}"}]))
+    state = {"messages": msgs, "tool_call_history": [], "blocked_rounds": 0}
+    assert should_continue(state) == "stopping_check"
+
+
+# ── the safety net obeys the same rule the agent does ───────────────────
+
+def test_the_frontend_safety_net_will_not_escalate_mid_ladder():
+    """The net fired on any run ending `failed`/`stopped`, whichever rung the
+    case was on — so it filed a human ticket for a case whose agent had just
+    scheduled a 24h retry, walking straight around the gate that exists to stop
+    exactly that."""
+    FRONTEND = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+                / "recovery_agent" / "frontend.py").read_text()
+    i = FRONTEND.index('if (final_status in ("escalated", "failed", "stopped")')
+    body = FRONTEND[i - 1400:i + 1600]
+    assert "_rungs_left" in body, "the net must consult the ladder"
+    assert "_handoff_to_agent(" in body, (
+        "rungs remaining means hand back to the agent, not file a ticket — "
+        "nothing else would restart the case and the alternative is silence"
+    )
+
+
+def test_the_net_still_escalates_once_the_ladder_is_done():
+    FRONTEND = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+                / "recovery_agent" / "frontend.py").read_text()
+    i = FRONTEND.index('if (final_status in ("escalated", "failed", "stopped")')
+    body = FRONTEND[i:i + 2200]
+    assert "elif (final_status in" in body and "enqueue(" in body
+
+
+def test_a_do_not_pursue_case_is_not_handed_back_to_climb_rungs():
+    FRONTEND = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+                / "recovery_agent" / "frontend.py").read_text()
+    i = FRONTEND.index("_rungs_left = (")
+    assert "pursuit_barred" in FRONTEND[i:i + 300]
+
+
+def test_the_nets_ticket_carries_the_ladder_too():
+    FRONTEND = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+                / "recovery_agent" / "frontend.py").read_text()
+    i = FRONTEND.index("source=\"ladder_exhausted\"")
+    body = FRONTEND[i - 1400:i]
+    assert "ladder climbed:" in body
+    assert "never tried —" in body
