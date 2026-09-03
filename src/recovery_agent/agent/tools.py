@@ -24,6 +24,19 @@ from typing import Any
 
 from langchain.tools import tool
 
+from recovery_agent.agent import ladder
+
+
+def _live_record(payment_id: str) -> dict:
+    """The durable case record. A Case object is rebuilt on every hand-off run,
+    so anything read from it alone forgets what earlier rungs did."""
+    try:
+        from recovery_agent.state_store import StateStore
+        return StateStore().get_payment(payment_id) or {}
+    except Exception:
+        return {}
+
+
 
 # ═══════════════════════════════════════════════════════════════
 # CONTEXT SCHEMA — passed to every tool via ToolRuntime
@@ -477,6 +490,9 @@ def show_page_offer(
     if case is not None:
         case.payment.metadata["page_offer"] = payload["offer"]
 
+    if result.get("status") == "delivered":
+        ladder.record_rung(payment_id, "offer", payload["offer_text"])
+
     return json.dumps({
         "status": result.get("status", "unknown"),
         "payment_id": payment_id,
@@ -611,6 +627,9 @@ def send_page_push(
 
     if case is not None:
         case.payment.metadata["last_push"] = payload
+
+    if result.get("status") == "delivered":
+        ladder.record_rung(payment_id, "page_push", payload["headline"])
 
     return json.dumps({
         "status": result.get("status", "unknown"),
@@ -756,8 +775,15 @@ def send_recovery_notification(
             amount=amount,
             attempt_count=attempt_count,
         )
+        # Which rung an email is depends on what came before it: the first one
+        # carries the offer, one sent after a call is the follow-up the call
+        # agreed to. Same tool, different place on the ladder.
+        rung = "post_call_email" if ladder.climbed(_live_record(payment_id),
+                                                   "voice_call") else "offer"
+        ladder.record_rung(payment_id, rung, message[:200])
         return json.dumps({
             "status": "ok",
+            "rung": rung,
             "channels": result.get("channels", []),
             "results": result.get("results", []),
         })
@@ -871,6 +897,32 @@ def escalate_to_human(
     """
     from recovery_agent.escalation_queue import enqueue
 
+    # A human queue is the LAST resort, not the fallback for a refused tool.
+    # Live, the approval gate blocked a discounted link at rung 2 and the agent
+    # filed a ticket for a INR 1,19,970 order that had been contacted exactly
+    # once — one silent in-page push. The customer had not been emailed, called,
+    # or offered anything. This refuses that, and names what to do instead.
+    #
+    # A rung that CANNOT be climbed here (no phone, voice calling switched off)
+    # does not block escalation — it is carried into the ticket instead, so the
+    # person picking it up knows what was never tried and why.
+    _rec = _live_record(payment_id)
+    _ladder = ladder.state(_rec)
+    _barred = ladder.pursuit_barred(_rec)
+    if _ladder["remaining"] and not _barred:
+        nxt = _ladder["remaining"][0]
+        return json.dumps({
+            "status": "blocked",
+            "reason": "the recovery ladder is not exhausted; escalation is the "
+                      "final step, not a fallback",
+            "already_tried": _ladder["climbed"] or ["nothing yet"],
+            "next_rung": nxt["rung"],
+            "next_step": nxt["what"],
+            "still_available": [r["rung"] for r in _ladder["remaining"]],
+            "guidance": f"Do this next: {nxt['what']}. Escalate only once every "
+                        f"rung has been tried and the customer still has not paid.",
+        })
+
     # Carry the case with it. A ticket holding only {payment_id, reason} forces
     # whoever picks it up to reconstruct everything from logs before they can say
     # a word to the customer, which is how a queue becomes a place cases go to be
@@ -905,7 +957,12 @@ def escalate_to_human(
             "contact": meta.get("customer_phone", ""),
         },
         attempts=attempts,
-        customer_signals=signals,
+        customer_signals=signals + [
+            f"ladder climbed: {', '.join(_ladder['climbed']) or 'none'}"
+        ] + [
+            f"never tried — {r['rung']}: {r.get('why_not', 'not applicable')}"
+            for r in _ladder["unavailable"]
+        ],
         offer=meta.get("page_offer") or ({"payable_rupees": meta.get("offer_payable")}
                                          if meta.get("offer_payable") else {}),
         recovery_link=meta.get("recovery_link", ""),
@@ -958,6 +1015,24 @@ def initiate_voice_call(
             "would_have_called": customer_phone,
         })
 
+    # The call comes AFTER the customer has had a real chance to use the offer.
+    # Ringing someone thirty seconds after emailing them a discount is not a
+    # negotiation, it is pestering — and it burns a paid call on a customer who
+    # was about to pay anyway.
+    _rec = _live_record(payment_id)
+    if ladder.climbed(_rec, "offer"):
+        _left = ladder.voice_wait_remaining_minutes(_rec)
+        if _left > 0:
+            return json.dumps({
+                "status": "too_soon",
+                "reason": f"the offer went out {ladder.VOICE_DELAY_MINUTES - _left:.0f} "
+                          f"minute(s) ago; a call is allowed after "
+                          f"{ladder.VOICE_DELAY_MINUTES}",
+                "minutes_remaining": round(_left, 1),
+                "guidance": "Call wait_for_customer and let the offer work. You "
+                            "will be started again when the wait is over.",
+            })
+
     # A per-call cost cap belongs in code, not in the model's judgment. Left to
     # the prompt, the agent reached for voice on every follow-up regardless of
     # amount, which would drain a small SuperU allowance in an afternoon.
@@ -996,10 +1071,16 @@ def initiate_voice_call(
         recovery_link=_last_recovery_link(runtime, payment_id),
     )
 
+    if result.get("status") in ("ok", "initiated", "queued", "success"):
+        ladder.record_rung(payment_id, "voice_call",
+                           f"called {customer_phone}")
+
     return json.dumps({
         "status": result.get("status", "unknown"),
         "campaign_id": result.get("campaign_id", ""),
         "phone": result.get("phone", customer_phone),
+        "next": "After the call, send the agreed pay link by email "
+                "(send_recovery_notification).",
     })
 
 
