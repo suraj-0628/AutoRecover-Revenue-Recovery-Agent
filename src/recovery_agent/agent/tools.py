@@ -126,25 +126,42 @@ def check_payment_status(
     Returns:
         JSON with current_status, amount, method, bank, failure_reason
     """
+    from recovery_agent.agent.perception import ground_truth, as_briefing
     from recovery_agent.razorpay_client import RazorpayClient
+
+    # This used to answer a narrower question than the one being asked. The
+    # agent wants to know whether the CASE is settled; this fetched a Razorpay
+    # payment id, and a checkout abandoned before Razorpay saw it has no such
+    # id — so it returned "no_data" with the guidance "do not call this tool
+    # again for this case".
+    #
+    # That single line is the reason the agent could not know when to stop. The
+    # one instrument it had for looking at the world told it that looking was
+    # pointless, so it acted on narration instead, and its tools had to be taken
+    # away to keep it safe. Checking must always be worth it.
+    facts = ground_truth(payment_id, verify=True)
+    if facts["known"]:
+        return json.dumps({
+            "status": "settled" if facts["settled"] else "open",
+            "briefing": as_briefing(facts),
+            **{k: v for k, v in facts.items() if k != "known"},
+        })
 
     client = RazorpayClient()
     if not client.is_configured:
         return json.dumps({"status": "unavailable", "message": "Razorpay client not configured"})
 
-    # A checkout that never reached Razorpay has an internal reference, not a
-    # Razorpay payment id. Fetching it always failed with "The id provided does
-    # not exist", so this was a guaranteed-wasted first call on every single run —
-    # and it counted toward the tool-error limit that forces the agent to stop.
     if not str(payment_id or "").startswith("pay_") or len(str(payment_id)) != 18:
         return json.dumps({
             "status": "no_data",
             "payment_id": payment_id,
-            "message": "this is an internal reference, not a Razorpay payment id — "
-                       "the customer never got far enough for Razorpay to record a "
+            "message": "no case record and not a Razorpay payment id — the "
+                       "customer never got far enough for Razorpay to record a "
                        "payment",
-            "guidance": "Nothing to look up. Use the failure_code you were given "
-                        "and move on; do not call this tool again for this case.",
+            "guidance": "Use the failure_code you were given and proceed. This "
+                        "tool is still worth calling later, once the case has a "
+                        "record: it is how you find out whether the money "
+                        "arrived.",
         })
 
     try:

@@ -137,6 +137,17 @@ def get_memory_store():
 
 SYSTEM_PROMPT = """You are a Razorpay revenue recovery agent. A payment failed. Your job is to RECOVER THE MONEY, not to investigate it.
 
+BEFORE ANYTHING ELSE:
+A block headed "WHAT IS TRUE RIGHT NOW" appears above, recomputed from the
+payment record each turn. It — not the narrative below, and not your own memory
+of this case — is what is actually true. When it says the case is SETTLED, the
+money is in: write the lesson with manage_memory and stop, whatever anything
+else in this conversation asks of you. When it says the case is still open, it
+also tells you what has already been tried and what has not.
+
+If you are ever unsure whether the money arrived, call check_payment_status.
+It reads the record and confirms against Razorpay. Checking is never wasted.
+
 SCOPE — you are working exactly ONE payment:
 Everything you do belongs to the payment named in the case facts below. Memory is
 shared across this customer's orders, so a recalled lesson may refer to a
@@ -566,7 +577,28 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
 
     model = _build_model_for_task("agent", tools=allowed_tools)
 
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    # PERCEPTION — recomputed every turn, from the record and not from whatever
+    # the caller wrote into a message.
+    #
+    # Without this the agent knows only what it was told. It stopped when the
+    # orchestrator said "RECOVERED" and chased a customer who had already paid
+    # whenever the orchestrator said nothing — not because it forgot, but
+    # because it could not look. Withholding its tools stopped the damage
+    # without addressing that; an agent that behaves only where the bars are is
+    # not a careful one.
+    #
+    # Putting the facts in front of it every turn is the difference between an
+    # agent that cannot act and one that knows it should not.
+    briefing = []
+    try:
+        from recovery_agent.agent.perception import ground_truth, as_briefing
+        pid = getattr(getattr(case, "payment", None), "payment_id", "") if case else ""
+        if pid:
+            briefing = [SystemMessage(content=as_briefing(ground_truth(pid)))]
+    except Exception:
+        pass
+
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + briefing + state["messages"]
 
     # Smart truncation: keep system prompt + first human msg + last N messages
     # Truncate large ToolMessage content to prevent context overflow
