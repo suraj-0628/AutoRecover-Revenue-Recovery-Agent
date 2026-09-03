@@ -201,3 +201,18 @@ def test_the_executed_tool_line_names_the_action_not_the_last_call():
     body = FRONTEND[i:i + 600]
     assert '"close_case": "close_case"' in body
     assert '"send_notification": "send_recovery_notification"' in body
+
+
+def test_the_critique_node_cannot_ask_for_tools_it_cannot_run():
+    """It reflects and stores a lesson; critique_tools can run nothing else. It
+    is bound to manage_memory alone and still asked for check_payment_status —
+    the conversation it reads is full of other tool names. The ToolNode then
+    answered "check_payment_status is not a valid tool", which reads in the
+    trace as the agent being refused a perfectly sensible call."""
+    i = GRAPH.index("def self_critique")
+    body = GRAPH[i:i + 3200]
+    assert 'tc.get("name") == "manage_memory"' in body
+    assert "model_copy" in body, (
+        "drop the call from the AIMessage rather than answering it with an "
+        "error, or an orphan tool_use is left for the next turn"
+    )

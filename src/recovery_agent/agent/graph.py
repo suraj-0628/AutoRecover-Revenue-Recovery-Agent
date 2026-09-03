@@ -1416,6 +1416,27 @@ def self_critique_node(state: RecoveryState) -> dict:
         for attempt in range(3):
             try:
                 response = model.invoke(msgs)
+
+                # This node reflects and stores a lesson; `critique_tools` can
+                # run nothing else. The model is bound to manage_memory alone
+                # and still asked for check_payment_status — the conversation it
+                # is reading is full of other tool names, so it reaches for one.
+                # The ToolNode then answered "check_payment_status is not a
+                # valid tool, try one of [manage_memory]", which reads in the
+                # trace as the agent being refused a perfectly sensible call.
+                #
+                # Dropped from the AIMessage rather than answered with an error,
+                # so no orphan tool_use is left behind for the next turn.
+                if getattr(response, "tool_calls", None):
+                    keep = [tc for tc in response.tool_calls
+                            if tc.get("name") == "manage_memory"]
+                    if len(keep) != len(response.tool_calls):
+                        dropped = [tc.get("name") for tc in response.tool_calls
+                                   if tc.get("name") != "manage_memory"]
+                        print(f"[SelfCritique] ignored out-of-scope tool calls: "
+                              f"{dropped}", flush=True)
+                        response = response.model_copy(update={"tool_calls": keep})
+
                 span = trace.get_current_span()
                 if span and span.is_recording():
                     span.set_attribute("critique.status", "completed")
