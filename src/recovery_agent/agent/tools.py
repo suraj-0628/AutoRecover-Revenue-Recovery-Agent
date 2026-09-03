@@ -811,15 +811,21 @@ def send_page_push(
     headline: str,
     body: str,
     cta_text: str = "Complete payment",
-    payment_link: str = "",
-    offer_text: str = "",
     wait_minutes: int = 5,
     runtime=None,
 ) -> str:
-    """Show an in-page notification to the customer who is still on the checkout.
+    """Show the ONE in-page notification, to a customer still on the checkout.
 
-    This is the SILENT first step: it costs nothing, interrupts nobody, and does
-    not put an offer on the table. Use it before email, SMS or a call.
+    The SILENT first rung: it costs nothing, interrupts nobody, and puts no
+    offer on the table. It cannot carry a link or a discount — those belong to
+    show_page_offer, which draws a banner instead. This is the plain nudge, and
+    there is only ever one of it.
+
+    It used to accept `payment_link` and `offer_text`, and the agent used them:
+    at the offer rung it sent a second notification carrying the link, which
+    landed on top of the banner already showing the same price. Two things
+    saying one thing, seconds apart, to a customer who had read the first. The
+    parameters are gone, so that is no longer something to remember not to do.
 
     The customer can act on it, dismiss it, or ignore it. Whatever they do comes
     back to you as a `push_outcome` observation so you can decide what to do
@@ -829,10 +835,8 @@ def send_page_push(
         payment_id: The payment this relates to
         headline: Short line the customer sees first
         body: One or two sentences of context
-        cta_text: Label for the action button
-        payment_link: Where the button sends them, if you have a link
-        offer_text: Optional incentive line. Only include one you obtained from
-            get_recovery_offer — never invent a discount.
+        cta_text: Label for the action button. It reopens the checkout they are
+            already on; there is no link to send them to.
         wait_minutes: How long to wait for a response before you are called again
 
     Returns:
@@ -887,15 +891,15 @@ def send_page_push(
                         "not add to the page.",
         })
 
-    link = payment_link or _last_recovery_link(runtime, payment_id)
-
+    # No link and no offer line. The button reopens the checkout the customer is
+    # already looking at, which is the whole idea of the silent rung.
     payload = {
         "payment_id": payment_id,
         "headline": headline[:120],
         "body": body[:400],
         "cta_text": cta_text[:40],
-        "payment_link": link,
-        "offer_text": offer_text[:160],
+        "payment_link": "",
+        "offer_text": "",
         "wait_minutes": max(1, int(wait_minutes or 5)),
     }
 
@@ -910,7 +914,7 @@ def send_page_push(
 
     if result.get("status") == "delivered":
         ladder.record_rung(payment_id, "page_push", payload["headline"])
-        ladder.record_action(payment_id, f"page_push:{'offer' if offer_text else 'plain'}", is_rung=True)
+        ladder.record_action(payment_id, "page_push:plain", is_rung=True)
 
     return json.dumps({
         "status": result.get("status", "unknown"),

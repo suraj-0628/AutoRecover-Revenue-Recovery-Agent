@@ -2233,9 +2233,7 @@ socket.on("agent_push", function(d) {
       'border:0;background:none;font-size:19px;color:#9ca3af;cursor:pointer;line-height:1">&times;</button>' +
     '<div style="font-weight:650;color:#111827;padding-right:22px">' + esc(d.headline) + '</div>' +
     '<div style="color:#4b5563;margin-top:6px;font-size:13px">' + esc(d.body) + '</div>' +
-    (d.offer_text ? '<div style="margin-top:10px;background:#ecfdf5;border:1px solid #a7f3d0;' +
-       'color:#065f46;border-radius:8px;padding:8px 10px;font-size:12.5px;font-weight:600">' +
-       esc(d.offer_text) + '</div>' : '') +
+
     '<button id="push-cta" style="margin-top:13px;width:100%;background:#2563eb;color:#fff;' +
       'border:0;border-radius:9px;padding:11px;font-size:14px;font-weight:600;cursor:pointer">' +
       esc(d.cta_text || "Complete payment") + '</button>' +
@@ -2246,9 +2244,10 @@ socket.on("agent_push", function(d) {
     closePush("dismissed", "Customer closed the notification.");
   };
   document.getElementById("push-cta").onclick = function () {
+    /* The plain nudge never carries a link — it reopens the checkout the
+       customer is already on. Offers travel by banner. */
     reportPush("acted", "Customer clicked the call to action.");
-    if (d.payment_link) window.open(d.payment_link, "_blank");
-    else startPayment();
+    startPayment();
     const el = document.getElementById("agent-push"); if (el) el.remove();
   };
 

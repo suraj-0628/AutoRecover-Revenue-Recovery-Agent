@@ -214,3 +214,21 @@ def test_no_push_once_an_offer_is_on_the_page():
     body = TOOLS[i:i + 4000]
     assert 'ladder.climbed(live, "offer")' in body
     assert "noise, not another chance" in body
+
+
+def test_the_plain_push_cannot_carry_a_link_or_an_offer():
+    """It used to accept payment_link and offer_text, and the agent used them:
+    at the offer rung it sent a second notification carrying the link, landing
+    on top of the banner already showing the same price. The parameters are
+    gone, so it is no longer something to remember not to do."""
+    from recovery_agent.agent.tools import TOOLS_BY_NAME
+    params = TOOLS_BY_NAME["send_page_push"].args_schema.model_json_schema()["properties"]
+    assert "payment_link" not in params
+    assert "offer_text" not in params
+
+
+def test_the_push_card_no_longer_renders_an_offer_or_opens_a_link():
+    i = PAY_PAGE_SRC.index('wrap.id = "agent-push"')
+    body = PAY_PAGE_SRC[i:i + 2600]
+    assert "d.offer_text" not in body
+    assert "window.open(d.payment_link" not in body

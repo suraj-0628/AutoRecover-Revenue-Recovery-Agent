@@ -174,10 +174,12 @@ YOUR TOOLS (these are the only ones that exist — never invent a name):
   Diagnose:  diagnose_payment_failure, check_payment_status,
              get_customer_payment_history, query_knowledge_base,
              discover_recovery_rail, search_memory
-  Recover:   send_page_push                 (SILENT: nudge the customer on the
-                                              checkout page they are still on.
-                                              Costs nothing, no offer. TRY THIS
-                                              FIRST while they are still there)
+  Recover:   send_page_push                 (SILENT: the ONE plain nudge, to a
+                                              customer still on the checkout.
+                                              Costs nothing, carries no offer
+                                              and no link — it reopens the page
+                                              they are on. TRY THIS FIRST, and
+                                              only once. Offers go by banner)
              (Offers are short-lived: create links with expire_in_minutes=16 and
               show the offer for the same window. Urgency is the point — a
               discount good for two days is not an offer, it is a price cut.)
