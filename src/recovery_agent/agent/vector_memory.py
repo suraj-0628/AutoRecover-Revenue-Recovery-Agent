@@ -16,12 +16,11 @@ Graceful degradation:
 """
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
 from typing import Any
 
-from recovery_agent.models import Case, FailureType
+from recovery_agent.models import Case
 
 
 def _build_outcome_text(case: Case) -> str:
@@ -279,61 +278,6 @@ class VectorMemoryStore:
             )
 
         return "\n".join(lines)
-
-    def get_recovery_stats(self, failure_type: str) -> dict[str, Any]:
-        """Get aggregate recovery statistics for a failure type.
-
-        Returns success_rate, total_cases, best_intervention.
-        """
-        if not self._available:
-            return {"success_rate": 0.0, "total_cases": 0, "best_intervention": "unknown"}
-
-        try:
-            results = self.query_similar(
-                failure_type=failure_type,
-                k=100,  # Get many results for stats
-                where={"failure_type": failure_type} if failure_type != "unknown" else None,
-            )
-
-            if not results:
-                return {"success_rate": 0.0, "total_cases": 0, "best_intervention": "unknown"}
-
-            total = len(results)
-            recovered = sum(1 for r in results if r.get("metadata", {}).get("recovered"))
-            success_rate = recovered / total if total > 0 else 0.0
-
-            # Find best intervention (highest success rate)
-            intervention_counts: dict[str, dict[str, int]] = {}
-            for r in results:
-                meta = r.get("metadata", {})
-                intervention = meta.get("intervention", "unknown")
-                if intervention not in intervention_counts:
-                    intervention_counts[intervention] = {"total": 0, "recovered": 0}
-                intervention_counts[intervention]["total"] += 1
-                if meta.get("recovered"):
-                    intervention_counts[intervention]["recovered"] += 1
-
-            best_intervention = "unknown"
-            best_rate = 0.0
-            for intervention, counts in intervention_counts.items():
-                rate = counts["recovered"] / counts["total"] if counts["total"] > 0 else 0.0
-                if rate > best_rate:
-                    best_rate = rate
-                    best_intervention = intervention
-
-            return {
-                "success_rate": round(success_rate, 3),
-                "total_cases": total,
-                "best_intervention": best_intervention,
-                "intervention_rates": {
-                    k: round(v["recovered"] / v["total"], 3) if v["total"] > 0 else 0.0
-                    for k, v in intervention_counts.items()
-                },
-            }
-
-        except Exception as e:
-            print(f"[vector_memory] ERROR: Stats query failed: {e}")
-            return {"success_rate": 0.0, "total_cases": 0, "best_intervention": "unknown"}
 
     def clear(self) -> bool:
         """Clear all stored outcomes. Used for testing."""

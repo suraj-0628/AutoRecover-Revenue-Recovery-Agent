@@ -1,7 +1,7 @@
 """Test case generator — creates synthetic payment failure scenarios.
 
-Source: Gold-standard datasets from NeMo Agent Toolkit
-        Evaluation framework from Evaluating AI Agents
+This is test infrastructure, not production code.
+Used by main.py (demo) and evaluation scripts.
 """
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from recovery_agent.models import FailureType, PaymentEvent
 
 
-# Templates for realistic payment failure scenarios
 FAILURE_SCENARIOS: list[dict] = [
     {
         "failure_type": FailureType.CARD_EXPIRED,
@@ -22,7 +21,7 @@ FAILURE_SCENARIOS: list[dict] = [
             "Card expiry date is in the past",
         ],
         "amount_range": (500, 50000),
-        "recoverable": True,  # Recoverable if customer updates card
+        "recoverable": True,
     },
     {
         "failure_type": FailureType.INSUFFICIENT_FUNDS,
@@ -33,7 +32,7 @@ FAILURE_SCENARIOS: list[dict] = [
             "Account has insufficient funds",
         ],
         "amount_range": (1000, 200000),
-        "recoverable": True,  # Recoverable on retry
+        "recoverable": True,
     },
     {
         "failure_type": FailureType.BANK_DECLINED,
@@ -44,7 +43,7 @@ FAILURE_SCENARIOS: list[dict] = [
             "Bank declined the transaction",
         ],
         "amount_range": (200, 100000),
-        "recoverable": True,  # Sometimes transient
+        "recoverable": True,
     },
     {
         "failure_type": FailureType.NETWORK_TIMEOUT,
@@ -55,7 +54,7 @@ FAILURE_SCENARIOS: list[dict] = [
             "Gateway timeout",
         ],
         "amount_range": (100, 50000),
-        "recoverable": True,  # Usually works on retry
+        "recoverable": True,
     },
     {
         "failure_type": FailureType.RISK_BLOCK,
@@ -66,7 +65,7 @@ FAILURE_SCENARIOS: list[dict] = [
             "Risk check failed",
         ],
         "amount_range": (10000, 500000),
-        "recoverable": False,  # Needs human review
+        "recoverable": False,
     },
     {
         "failure_type": FailureType.MANDATE_REVOKED,
@@ -77,7 +76,7 @@ FAILURE_SCENARIOS: list[dict] = [
             "NPCI mandate cancelled",
         ],
         "amount_range": (500, 100000),
-        "recoverable": False,  # Customer actively cancelled
+        "recoverable": False,
     },
 ]
 
@@ -110,10 +109,7 @@ def generate_payment_event(
 
 
 def generate_batch(num_cases: int = 30) -> list[PaymentEvent]:
-    """Generate a batch of diverse payment failure events.
-
-    Distributes evenly across failure types for balanced evaluation.
-    """
+    """Generate a batch of diverse payment failure events."""
     events = []
     scenarios_per_type = max(1, num_cases // len(FAILURE_SCENARIOS))
 
@@ -123,21 +119,8 @@ def generate_batch(num_cases: int = 30) -> list[PaymentEvent]:
                 break
             events.append(generate_payment_event(scenario=scenario))
 
-    # Fill remaining with random
     while len(events) < num_cases:
         events.append(generate_payment_event())
 
     random.shuffle(events)
     return events[:num_cases]
-
-
-def get_known_outcomes(events: list[PaymentEvent]) -> dict[str, dict]:
-    """Return known properties for each event (for evaluation)."""
-    outcomes = {}
-    for event in events:
-        outcomes[event.payment_id] = {
-            "failure_type": event.metadata.get("failure_type", "unknown"),
-            "recoverable": event.metadata.get("recoverable", False),
-            "amount": event.amount,
-        }
-    return outcomes

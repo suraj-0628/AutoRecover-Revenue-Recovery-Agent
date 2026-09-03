@@ -10,7 +10,7 @@ from recovery_agent.models import Case
 
 def run_single(payment_id: str = "pay_test_001", use_harness: bool = False) -> None:
     """Run a single case for demo."""
-    from recovery_agent.agent.test_generator import generate_payment_event, FAILURE_SCENARIOS
+    from tests.test_generator import generate_payment_event, FAILURE_SCENARIOS
 
     # Pick a specific scenario for demo
     scenario = FAILURE_SCENARIOS[0]  # Card expired

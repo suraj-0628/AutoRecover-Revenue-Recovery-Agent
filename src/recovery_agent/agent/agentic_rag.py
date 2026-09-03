@@ -416,6 +416,7 @@ class SubQuestionQueryEngine:
         sub_questions = self._decompose(payment_payload)
         sub_answers: list[dict[str, Any]] = []
         all_chunks: list[TextChunk] = []
+        max_similarity = 0.0
 
         for sq in sub_questions:
             retrieval = self.router.query(sq["question"], top_k=3)
@@ -429,6 +430,8 @@ class SubQuestionQueryEngine:
                 "index_used": retrieval.index_type,
             })
             all_chunks.extend(retrieval.chunks)
+            if retrieval.score > max_similarity:
+                max_similarity = retrieval.score
 
         synthesis_parts = []
         for sa in sub_answers:
@@ -439,8 +442,8 @@ class SubQuestionQueryEngine:
 
         return RAGResponse(
             answer=unified_context,
-            groundedness_score=0.0,
-            faithfulness_score=0.0,
+            groundedness_score=max_similarity,
+            faithfulness_score=max_similarity,
             retrieved_chunks=all_chunks,
             sub_answers=sub_answers,
             routed_index="sub_question_decomposition",
@@ -641,15 +644,8 @@ class LlamaIndexAgenticRAG:
                 "Please use alternate diagnostic tools."
             ) from e
 
-        # Assign groundedness from ChromaDB similarity score — no LLM needed.
-        # If chunks were retrieved, compute max semantic similarity as confidence.
-        if rag_response.retrieved_chunks:
-            rag_response.groundedness_score = 1.0
-            rag_response.faithfulness_score = 1.0
-        else:
-            rag_response.groundedness_score = 0.0
-            rag_response.faithfulness_score = 0.0
-
+        # Groundedness score already propagated from ChromaDB similarity
+        # by SubQuestionQueryEngine.query(). No override needed.
         return rag_response
 
     def query_by_error_code(self, error_code: str, method: str = "unknown") -> RAGResponse:

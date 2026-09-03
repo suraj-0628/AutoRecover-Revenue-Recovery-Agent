@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "AI Revenue Recovery Agent — Razorpay Buildathon Track 03"
 requires-python = ">=3.11"
 dependencies = [
+    "langchain>=0.3.0",
     "langgraph>=0.2.0",
+    "langgraph-checkpoint-sqlite>=1.0.0",
     "langchain-core>=0.3.0",
     "langchain-openai>=0.2.0",
     "pydantic>=2.0",

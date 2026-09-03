@@ -1,6 +1,6 @@
 # AutoRecover — Razorpay AI Revenue Recovery Agent
 
-An autonomous AI agent that detects failed payments, diagnoses root causes via LLM diagnostic reflection, and executes multi-channel recovery workflows — email, SMS, and **AI voice calls via SuperU** — using official Razorpay APIs. Built for the Razorpay Buildathon with LangGraph, Nemotron LLM, NVIDIA NAT Guardrails, and a Razorpay Agent Studio-inspired Merchant Dashboard.
+An autonomous AI agent that detects failed payments, diagnoses root causes via LLM reflection, and executes multi-channel recovery workflows — email, SMS, and AI voice calls via SuperU — using Razorpay APIs. Built for the Razorpay Buildathon with LangGraph, Gemini 2.5 Flash, custom safety guardrails, and a Razorpay Agent Studio-inspired Merchant Dashboard.
 
 ---
 
@@ -40,18 +40,17 @@ flowchart TB
     subgraph Storage ["Persistent State"]
         MemStore[(CustomerMemoryStore\nJSON + FileLocks)]
         VectorMem[(Vector Memory\nChromaDB + ONNX)]
-        SemanticCache[(Semantic Cache\nSimilar-Case Lookup)]
     end
 
     %% Core Agent Engine
     subgraph Agent ["Recovery Agent Engine"]
-        Harness{Agent Harness\nReAct Loop}
+        Graph{LangGraph ReAct Loop}
         
-        Diagnosis[Diagnosis Engine\n3-Layer LLM Reflection]
+        Diagnosis[Diagnosis Engine\n3-Layer]
         DeclineRouter[Decline Code Router\nPer-Code Strategies]
-        Guardrails[Semantic Guardrails\n5-Policy Safety Gate]
+        Guardrails[Safety Guardrails\n6-Policy Gate]
         KGRouter[Knowledge Graph Router\nNetworkX + 6 API Rails]
-        StrategyMetrics[Strategy Metrics\nHistorical Performance]
+        StrategyMetrics[Strategy Metrics\nThompson Bandit]
         
         subgraph RAG ["Agentic RAG Engine"]
             SubQ[Sub-Question Decomposer]
@@ -59,7 +58,7 @@ flowchart TB
             ChromaDB[(ChromaDB Vector Store)]
         end
         
-        Tools[Tool Executor\n12 Razorpay Tools]
+        Tools[Tool Executor\n13 Razorpay Tools]
         SDK[Razorpay SDK Client]
     end
 
@@ -93,27 +92,27 @@ flowchart TB
     Listener --> HMAC
     HMAC -- Valid --> Idempotency
     Idempotency -- New Event --> EventBus
-    EventBus -- "Trigger Case" --> Harness
-    Harness <--> MemStore
-    Harness <--> VectorMem
-    Harness --> Diagnosis
+    EventBus -- "Trigger Case" --> Graph
+    Graph <--> MemStore
+    Graph <--> VectorMem
+    Graph --> Diagnosis
     Diagnosis --> DeclineRouter
-    Harness --> RAG
+    Graph --> RAG
     RAG --> ChromaDB
-    Harness --> KGRouter
-    Harness --> Guardrails
+    Graph --> KGRouter
+    Graph --> Guardrails
     Guardrails -- "Policy Passed" --> Tools
     Tools -- "Execute Action" --> SDK
     Tools -- "Send Notification" --> NotifDispatch
     Tools -- "Voice Recovery" --> VoiceAgent
     VoiceAgent -- "AI Call" --> SuperU
-    SuperU -- "Call Outcome" --> Harness
+    SuperU -- "Call Outcome" --> Graph
     Tools -- "Wait & Retry" --> JobQueue
     Scheduler -- "Polls" --> JobQueue
     Scheduler -- "Execute" --> SDK
     SDK -- "API Call" --> Razorpay
-    Harness -- "Live Events" --> WebSockets
-    Harness --> Phoenix
+    Graph -- "Live Events" --> WebSockets
+    Graph --> Phoenix
     WebSockets --> DashboardUI
     WebSockets --> CheckoutUI
     Customer <--> CheckoutUI
@@ -131,8 +130,8 @@ flowchart TB
     classDef obs stroke:#607d8b,stroke-width:2px,color:inherit;
 
     class Razorpay,Customer,Merchant,SuperU external;
-    class Harness,Diagnosis,DeclineRouter,Guardrails,KGRouter,StrategyMetrics,RAG,SubQ,Triad,Tools,SDK agent;
-    class MemStore,Idempotency,ChromaDB,JobQueue,VectorMem,SemanticCache db;
+    class Graph,Diagnosis,DeclineRouter,Guardrails,KGRouter,StrategyMetrics,RAG,SubQ,Triad,Tools,SDK agent;
+    class MemStore,Idempotency,ChromaDB,JobQueue,VectorMem db;
     class DashboardUI,CheckoutUI,WebSockets ui;
     class Listener,HMAC,EventBus ingest;
     class ChaosGym test;
@@ -237,8 +236,8 @@ Serves:
 .venv/bin/pytest tests/ -v
 ```
 
-- **Unit Test Suite**: `209 PASSED` (100% pass rate).
-- **Adversarial Chaos Gym**: `31 PASSED` in `10.50s`.
+- **Unit Test Suite**: ~397 tests passing.
+- **Adversarial Chaos Gym**: 31 tests in chaos gym.
 
 ---
 
@@ -247,44 +246,49 @@ Serves:
 ```
 src/recovery_agent/
 ├── agent/
-│   ├── __init__.py              # LangGraph agent graph (detect → diagnose → decide → act → observe)
-│   ├── harness.py               # Agent harness — ReAct loop orchestrator (899 lines)
-│   ├── diagnosis.py             # LLM diagnostic reflection chain (3-layer)
-│   ├── decision.py              # LLM Strategy Planner & Guardrail intercept
-│   ├── execution.py             # Multi-channel action execution (email, SMS, voice, retry)
-│   ├── guardrails.py            # Semantic guardrails — 5-policy safety gate
-│   ├── kg_router.py             # Knowledge Graph router — NetworkX + 6 Razorpay API rails
-│   ├── decline_router.py        # Decline-code-specific routing (per-code strategies)
-│   ├── strategy_metrics.py      # Historical strategy performance tracking
-│   ├── memory.py                # Customer long-term memory store & payday radar
-│   ├── vector_memory.py         # Vector memory — ChromaDB episodic storage
-│   ├── semantic_cache.py        # Semantic cache — similar-case deduplication
-│   ├── agentic_rag.py           # Agentic RAG — sub-question decomposition + triad eval
-│   ├── tools.py                 # 12 Razorpay SDK tools (Payment Links, Retry, Refund, etc.)
-│   ├── llm_client.py            # Shared LLM client (Nemotron via OmniRoute)
-│   ├── squad.py                 # Multi-agent squad orchestrator (4 specialized agents)
-│   ├── signals.py               # 40+ signal enrichment (BIN, timezone, velocity, payday)
-│   ├── payday_scheduler.py      # Regional payroll cycle detection & optimal retry timing
-│   ├── stopping.py              # Stopping condition evaluator
-│   ├── evaluation.py            # Recovery trajectory evaluation & scoring
-│   └── test_generator.py        # Synthetic test case generator
+│   ├── __init__.py              # RecoveryAgent wrapper
+│   ├── graph.py                 # LangGraph ReAct loop (StateGraph + ToolNode)
+│   ├── tools.py                 # 13 @tool functions + langmem memory tools
+│   ├── diagnosis.py             # 3-layer: error code lookup → LLM → rules
+│   ├── decision.py              # LLM strategy planner + Thompson Bandit
+│   ├── execution.py             # Observable SDK execution
+│   ├── guardrails.py            # 6 safety policies
+│   ├── governance.py            # Tier-based tool access, PII masking
+│   ├── kg_router.py             # NetworkX graph, 6 API rails, Dijkstra
+│   ├── decline_router.py        # 12 decline codes → 9 strategies
+│   ├── strategy_metrics.py      # SQLite metrics + ThompsonBandit + A/B test
+│   ├── memory.py                # CustomerMemoryStore (JSON + filelock)
+│   ├── vector_memory.py         # ChromaDB semantic search
+│   ├── agentic_rag.py           # ChromaDB + sentence-transformers
+│   ├── planner.py               # pydantic-ai structured planning
+│   ├── llm_client.py            # ChatOpenAI → OmniRoute, fallback chain
+│   ├── payday_scheduler.py      # Regional payroll cycle detection
+│   ├── stopping.py              # Tier transition logic (silent → active)
+│   ├── evaluation.py            # Batch eval from CSV
+│   └── test_generator.py        # Synthetic failure scenarios
 ├── eval/
-│   ├── chaos_gym.py             # Adversarial chaos gym & red-team simulator
-│   └── trajectory_benchmark.py  # Step/friction/compliance scoring
-├── razorpay_knowledge_base.py   # Official Razorpay API Error Catalog & Normalizer
-├── razorpay_client.py           # Razorpay SDK API wrapper (Orders, Payments, Links, Refunds)
-├── frontend.py                  # Agent Studio Dashboard & Customer Checkout (Razorpay-inspired)
-├── webhook.py                   # Razorpay Webhook Listener + SuperU call-complete callback
-├── dashboard.py                 # Recovery Analytics Dashboard (Port 5001)
-├── communication.py             # LLM-generated personalized recovery messages
-├── notifications.py             # Multi-channel notification dispatcher (Email + SMS)
-├── retry_scheduler.py           # Smart retry timing with bank health awareness
-├── state_store.py               # Persistent case state (JSON + file locks)
-├── daemon_worker.py             # Background worker for scheduled retries
-├── main.py                      # Service entry point & process orchestrator
-├── logging/                     # JSONL structured audit logging
-└── templates/
-    └── index.html               # Analytics dashboard template
+│   ├── chaos_gym.py             # Adversarial chaos gym + gym-style step()
+│   ├── trajectory_benchmark.py  # Step/friction/compliance scoring
+│   ├── component_eval.py        # pydantic-evals
+│   ├── error_analysis.py        # arize-phoenix-evals
+│   ├── recovery_eval.py         # Custom F1 scoring
+│   ├── nat_eval.py              # nvidia-nat SDK evaluation
+│   └── phoenix_evals.py         # Phoenix evaluators
+├── razorpay_knowledge_base.py   # Razorpay API Error Catalog
+├── razorpay_client.py           # 8 async SDK wrappers
+├── frontend.py                  # Customer checkout + merchant dashboard
+├── webhook.py                   # Flask webhook listener
+├── dashboard.py                 # Analytics dashboard (port 5001)
+├── communication.py             # LLM-generated messages
+├── notifications.py             # Email + SMS dispatcher
+├── retry_scheduler.py           # Smart retry timing
+├── state_store.py               # File-backed JSON persistence
+├── daemon_worker.py             # Background retry worker
+├── config.py                    # pydantic-settings + YAML
+├── main.py                      # CLI entry point
+├── logging/                     # JSONL audit trail
+├── api/app.py                   # FastAPI REST API
+└── integrations/superu_client.py # SuperU AI voice calls
 ```
 
 ---
@@ -306,14 +310,7 @@ Based on deep-dive research on 6 production recovery systems — **Stripe, Redux
 - Code 19 (Try Again Later): Bank health monitoring — retry only when bank confirmed online.
 - Hard Declines (41, 43, 54, 14, 04, 46, 57, 93): Never retry — prevents $0.10/attempt Visa/MC network penalties.
 
-### Implemented: 40+ Signal Enrichment (`signals.py`)
-
-- Card brand, type, issuing bank, BIN lookup
-- Customer timezone, bank health score, velocity patterns
-- Merchant descriptor, MCC code, transaction amount vs norms
-- Payday detection, holiday awareness, regional payroll cycles
-
-### SuperU AI Voice Integration
+### Decline-Code Routing
 
 | Component | Role |
 |-----------|------|
@@ -341,7 +338,7 @@ Based on deep-dive research on 6 production recovery systems — **Stripe, Redux
 | **Razorpay** | Payment gateway + SDK + Webhooks | Core — all payment operations |
 | **SuperU AI** | AI voice calling platform | Tier 3 voice recovery — outbound AI phone calls |
 | **NVIDIA** | Nemotron LLM + NIM Guardrails | Agent reasoning + safety policies |
-| **LangGraph** | Agent orchestration framework | ReAct loop + state machine |
+| **LangGraph** | Agent orchestration framework | Deterministic DAG state machine |
 | **ChromaDB** | Vector database | Agentic RAG + episodic memory |
 | **Phoenix** | Observability + tracing | OpenTelemetry spans for every agent decision |
 

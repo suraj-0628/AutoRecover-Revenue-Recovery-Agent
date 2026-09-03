@@ -180,6 +180,7 @@
     .status-thinking { background: rgba(210, 168, 255, 0.1); color: var(--accent-purple); border: 1px solid var(--accent-purple); }
     .status-executing { background: rgba(255, 166, 87, 0.1); color: var(--accent-amber); border: 1px solid var(--accent-amber); }
     .status-recovered { background: rgba(126, 231, 135, 0.1); color: var(--accent-green); border: 1px solid var(--accent-green); }
+    .status-failed { background: rgba(239, 68, 68, 0.1); color: var(--accent-red); border: 1px solid var(--accent-red); }
 
     .panel-body {
       flex: 1;
@@ -385,6 +386,10 @@
       justify-content: space-between;
       align-items: center;
       font-size: 0.78rem;
+      cursor: pointer;
+    }
+    .tool-title:hover {
+      opacity: 0.8;
     }
     .tool-title .tool-label {
       background: rgba(245,158,11,0.1);
@@ -874,11 +879,30 @@
         <span class="panel-title">
           Agent Execution & Reasoning Monologue
         </span>
-        <span class="status-pill status-idle" id="status-pill">AGENT IDLE</span>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <button onclick="copyMonologue()" style="background:var(--accent-purple); color:#fff; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:11px; font-family:monospace;" title="Copy all monologue contents">COPY</button>
+          <span class="status-pill status-idle" id="status-pill">AGENT IDLE</span>
+          <select id="phase-dropdown" style="background:var(--bg-dark); color:var(--text-secondary); border:1px solid var(--border); padding:3px 6px; border-radius:4px; font-size:10px; font-family:monospace; display:none;" onchange="this.style.borderColor=this.value==='complete'?'var(--success)':this.value==='error'?'var(--error)':'var(--accent-purple)'">
+            <option value="initializing">initializing</option>
+            <option value="diagnosing">diagnosing</option>
+            <option value="guard_check">guard_check</option>
+            <option value="acting">acting</option>
+            <option value="self_critique">self_critique</option>
+            <option value="tier_transition">tier_transition</option>
+            <option value="complete">complete</option>
+            <option value="error">error</option>
+          </select>
+        </div>
       </div>
       <div class="panel-body">
         
         <!-- Thought Stream Console -->
+        <!-- Session tabs: one open payment per tab, like files in an editor.
+             Every payment gets its own agent session, so the stream from one
+             must never be interleaved with another's. -->
+        <div id="session-tabs" style="display:none;align-items:stretch;gap:1px;
+             border-bottom:1px solid var(--border);background:var(--bg-dark);
+             overflow-x:auto;white-space:nowrap;min-height:28px"></div>
         <div class="terminal-box" id="terminal-stream">
           <div class="trace-step">
             <div class="trace-header">
@@ -891,12 +915,12 @@
 
         <!-- Tool Call Card -->
         <div class="tool-card" id="tool-card" style="display:none;">
-          <div class="tool-title">
+          <div class="tool-title" onclick="var a=document.getElementById('tool-args'); a.style.display=a.style.display==='none'?'block':'none';" style="cursor:pointer;">
             <span id="tool-name">RazorpaySDK.tool_call</span>
             <span class="tool-label" id="tool-status">EXECUTED</span>
           </div>
           <div class="tool-kv" id="tool-kv"></div>
-          <pre class="tool-code" id="tool-args" style="display:none;">{}</pre>
+          <pre class="tool-code" id="tool-args" style="display:none; max-height:200px; overflow-y:auto;">{}</pre>
         </div>
 
         <!-- Compact Status Bar -->
@@ -940,10 +964,10 @@
         <!-- Business Scenario Context Bar -->
         <div class="biz-context-bar" id="biz-context-bar">
           <div>
-            <span id="biz-name" style="font-weight:600; color:var(--text-bright);">SaaS Subscription Platform</span>
-            <span style="font-size:0.7rem; color:var(--text-muted); margin-left:6px;">(Annual Pro Plan)</span>
+            <span id="biz-name" style="font-weight:600; color:var(--text-bright);">Payment Platform</span>
+            <span style="font-size:0.7rem; color:var(--text-muted); margin-left:6px;" id="biz-detail-span">(Select a scenario)</span>
           </div>
-          <span class="biz-badge" id="biz-badge">Gateway 504 Degradation</span>
+          <span class="biz-badge" id="biz-badge">IDLE</span>
         </div>
 
         <!-- Enterprise Razorpay Recovery Canvas Card -->
@@ -961,8 +985,8 @@
           <!-- Order Summary Itemization -->
           <div class="order-summary" id="order-summary">
             <div class="order-row">
-              <span id="item-name">Pro Subscription Plan (Annual)</span>
-              <span id="item-subtotal">INR 4,999.00</span>
+              <span id="item-name">Select a scenario to begin</span>
+              <span id="item-subtotal">INR 0.00</span>
             </div>
             <div class="order-row">
               <span>Razorpay Recovery Engine</span>
@@ -970,23 +994,23 @@
             </div>
             <div class="order-row total">
               <span>Total Payable</span>
-              <span id="canvas-price" style="color:var(--accent-blue);">INR 4,999.00</span>
+              <span id="canvas-price" style="color:var(--accent-blue);">INR 0.00</span>
             </div>
           </div>
 
           <!-- Virtual Credit Card Preview -->
           <div class="virtual-card" id="virtual-card">
-            <div class="card-number" id="card-num-preview">•••• •••• •••• 4242</div>
+            <div class="card-number" id="card-num-preview">•••• •••• •••• ••••</div>
             <div class="card-footer">
-              <span>RAHUL KUMAR</span>
-              <span id="card-exp-preview">EXP: 08/29</span>
+              <span>CARD HOLDER</span>
+              <span id="card-exp-preview">EXP: MM/YY</span>
             </div>
           </div>
 
           <!-- Morph Container -->
           <div id="morph-container">
-            <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504 (HDFC Netbanking drop)')">
-              Pay INR 4,999.00 Now
+            <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504')">
+              Pay Now
             </button>
           </div>
         </div>
@@ -998,9 +1022,9 @@
             <span style="font-size:0.72rem; color:var(--accent-green);">[CONNECTED]</span>
           </div>
           <div style="font-size:0.78rem; color:var(--text-main); font-style:italic; background:#0d1117; padding:8px; border-radius:4px; margin-top:8px; border:1px solid #21262d;" id="voice-transcript">
-            "Namaste Rahul ji! Aapka Razorpay payment decline ho gaya hai. Tap karein to auto-retry..."
+            "Voice call will appear here when triggered..."
           </div>
-          <button class="btn-voice-audio" onclick="speakHinglish('Namaste Rahul ji! Aapka Razorpay payment decline ho gaya hai. Tap karein to auto retry payment.')">
+          <button class="btn-voice-audio" onclick="speakHinglish('Voice call replay not available. Trigger a voice call scenario first.')">
             Replay Voice Agent Call
           </button>
         </div>
@@ -1012,11 +1036,11 @@
             <span style="color:var(--accent-blue);" id="progress-status-label">IDLE</span>
           </div>
           <div class="progress-steps">
-            <div class="step-pill" id="p-detect">1. DETECT</div>
-            <div class="step-pill" id="p-diagnose">2. DIAGNOSE</div>
-            <div class="step-pill" id="p-guardrail">3. GUARDRAIL</div>
-            <div class="step-pill" id="p-morph">4. MORPH</div>
-            <div class="step-pill" id="p-recovered">5. RECOVERED</div>
+            <div class="step-pill" id="p-detect">1. PERCEIVE</div>
+            <div class="step-pill" id="p-diagnose">2. REASON</div>
+            <div class="step-pill" id="p-guardrail">3. GUARD</div>
+            <div class="step-pill" id="p-morph">4. ACT</div>
+            <div class="step-pill" id="p-recovered">5. LEARN</div>
           </div>
         </div>
 
@@ -1046,6 +1070,82 @@
   <script>
     const socket = io();
     const terminal = document.getElementById("terminal-stream");
+
+    /* ── Sessions ─────────────────────────────────────────────────────────
+       Each payment is a separate agent session, so the HUD keeps a separate
+       buffer per payment and shows one at a time. Previously every payment
+       streamed into the same terminal and `activePaymentId` was overwritten by
+       whichever emitted last — with two live payments the operator was reading
+       an interleaved transcript, and the card-expiry form and voice approval
+       (both keyed on `activePaymentId`) could act on the wrong order. */
+    const sessions = new Map();          // payment_id -> {lines:[], status, amount, unread}
+    let selectedSession = null;          // the tab the operator is viewing
+    let streamingPid = null;             // the payment currently being rendered
+
+    function sessionFor(pid) {
+      if (!sessions.has(pid)) {
+        sessions.set(pid, {lines: [], status: "running", amount: null, unread: 0});
+        if (!selectedSession) selectSession(pid);
+        renderTabs();
+      }
+      return sessions.get(pid);
+    }
+
+    function selectSession(pid) {
+      selectedSession = pid;
+      activePaymentId = pid;             // the form and the voice gate follow the tab
+      const s = sessions.get(pid);
+      if (s) {
+        s.unread = 0;
+        terminal.innerHTML = s.lines.join("");
+        terminal.scrollTop = terminal.scrollHeight;
+        renderToolCard(s.toolCall);      // this tab's card, or hidden if it has none
+      } else {
+        renderToolCard(null);
+      }
+      renderTabs();
+    }
+
+    function closeSession(pid, ev) {
+      if (ev) ev.stopPropagation();
+      sessions.delete(pid);
+      if (selectedSession === pid) {
+        const next = sessions.keys().next();
+        selectedSession = null;
+        if (!next.done) selectSession(next.value); else terminal.innerHTML = "";
+      }
+      renderTabs();
+    }
+
+    function renderTabs() {
+      const bar = document.getElementById("session-tabs");
+      if (!sessions.size) { bar.style.display = "none"; return; }
+      bar.style.display = "flex";
+      const esc = t => String(t == null ? "" : t).replace(/[&<>"']/g,
+        c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+      const dot = {running:"var(--accent-purple)", awaiting_customer:"var(--warning,#f0c26b)",
+                   recovered:"var(--success)", escalated:"var(--error)"};
+      bar.innerHTML = [...sessions.entries()].map(([pid, s]) => {
+        const on = pid === selectedSession;
+        return '<div onclick="selectSession(\'' + esc(pid) + '\')" title="' + esc(pid) + '" style="' +
+          'display:flex;align-items:center;gap:6px;padding:5px 10px;cursor:pointer;font-size:10.5px;' +
+          'font-family:monospace;border-right:1px solid var(--border);' +
+          (on ? 'background:var(--bg-panel,#12151d);color:var(--text-primary,#e6e9ef);' +
+                'border-top:2px solid var(--accent-purple)'
+              : 'background:transparent;color:var(--text-secondary,#8b93a7);border-top:2px solid transparent') +
+          '">' +
+          '<span style="width:6px;height:6px;border-radius:50%;background:' +
+            (dot[s.status] || dot.running) + '"></span>' +
+          '<span>' + esc(pid.replace(/^pay_/, "")) + '</span>' +
+          (s.amount ? '<span style="opacity:.6">' + esc(s.amount) + '</span>' : '') +
+          (s.unread && !on ? '<span style="background:var(--accent-purple);color:#fff;border-radius:8px;' +
+             'padding:0 5px;font-size:9px">' + s.unread + '</span>' : '') +
+          '<span onclick="closeSession(\'' + esc(pid) + '\',event)" ' +
+            'style="opacity:.5;padding-left:2px">&times;</span>' +
+        '</div>';
+      }).join("");
+    }
+
     const statusPill = document.getElementById("status-pill");
     const toolCard = document.getElementById("tool-card");
     const toolName = document.getElementById("tool-name");
@@ -1057,6 +1157,7 @@
 
     let activePaymentId = "";
     let lastTier = "";
+    let currentScenario = null;  // Stores scenario context from API
 
     function switchRightPanelTab(mode) {
       const btnCanvas = document.getElementById("btn-view-canvas");
@@ -1087,41 +1188,30 @@
       document.getElementById("p-recovered").className = "step-pill";
     }
 
-    function updateScenarioContext(name) {
-      const bizName = document.getElementById("biz-name");
-      const bizBadge = document.getElementById("biz-badge");
-      const itemName = document.getElementById("item-name");
-      const itemSubtotal = document.getElementById("item-subtotal");
-      const canvasPrice = document.getElementById("canvas-price");
+    function updateScenarioView() {
+      if (!currentScenario) return;
+      const ctx = currentScenario;
 
-      if (name === "degradation") {
-        bizName.textContent = "SaaS Subscription Platform";
-        bizBadge.textContent = "Gateway 504 Degradation";
-        itemName.textContent = "Pro Subscription Plan (Annual)";
-        canvasPrice.textContent = "INR 4,999.00";
-        if (itemSubtotal) itemSubtotal.textContent = "INR 4,999.00";
-      } else if (name === "card_expiry") {
-        bizName.textContent = "Recurring Auto-Debit Membership";
-        bizBadge.textContent = "Card Expiry Failure";
-        itemName.textContent = "Enterprise Cloud Infrastructure";
-        canvasPrice.textContent = "INR 12,999.00";
-        if (itemSubtotal) itemSubtotal.textContent = "INR 12,999.00";
-      } else if (name === "abandonment") {
-        bizName.textContent = "E-Commerce Magic Checkout";
-        bizBadge.textContent = "Cart Abandonment";
-        itemName.textContent = "Noise-Cancelling Headphones";
-        canvasPrice.textContent = "INR 2,999.00";
-        if (itemSubtotal) itemSubtotal.textContent = "INR 2,999.00";
-      } else if (name === "voice_call") {
-        bizName.textContent = "B2B Enterprise Invoice Gateway";
-        bizBadge.textContent = "High-Value Voice AI";
-        itemName.textContent = "Quarterly API Gateway License";
-        canvasPrice.textContent = "INR 8,500.00";
-        if (itemSubtotal) itemSubtotal.textContent = "INR 8,500.00";
-      } else if (name === "batch") {
-        bizName.textContent = "High-Volume Transaction Stream";
-        bizBadge.textContent = "30-Case Batch Evaluation";
+      // Update business context bar
+      document.getElementById("biz-name").textContent = ctx.biz_name;
+      document.getElementById("biz-badge").textContent = ctx.badge;
+      if (ctx.biz_detail) {
+        document.getElementById("biz-name").innerHTML = ctx.biz_name + '<span style="font-size:0.7rem; color:var(--text-muted); margin-left:6px;">(' + escapeHtml(ctx.biz_detail) + ')</span>';
       }
+
+      // Update order summary
+      document.getElementById("item-name").textContent = ctx.item_name;
+      const priceStr = "INR " + ctx.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 });
+      document.getElementById("item-subtotal").textContent = priceStr;
+      document.getElementById("canvas-price").textContent = priceStr;
+
+      // Update virtual card
+      document.getElementById("card-num-preview").textContent = "•••• •••• •••• " + ctx.card_last4;
+      document.getElementById("card-exp-preview").textContent = "EXP: " + ctx.card_expiry;
+      document.querySelector("#virtual-card .card-footer span:first-child").textContent = ctx.card_holder;
+
+      // Update Pay button
+      document.getElementById("pay-now-btn").textContent = "Pay " + priceStr + " Now";
     }
 
     function fetchMetrics() {
@@ -1206,6 +1296,19 @@
     }
 
     var TAG_COLORS = {
+      'INIT': 'var(--accent-blue)',
+      'AGENT': '#8b5cf6',
+      'SEARCH KB': 'var(--accent-green)',
+      'HISTORY': 'var(--accent-purple)',
+      'STATUS': 'var(--accent-purple)',
+      'THINKING': 'var(--accent-purple)',
+      'LINK': 'var(--accent-red)',
+      'SCHEDULE': 'var(--accent-amber)',
+      'ESCALATE': 'var(--accent-red)',
+      'VOICE CALL': 'var(--accent-red)',
+      'LLM DOWN': 'var(--accent-red)',
+      'STOPPED': 'var(--accent-red)',
+      'EXECUTE': 'var(--accent-amber)',
       'DETECT': 'var(--accent-red)',
       'DIAGNOSE': 'var(--accent-blue)',
       'ROOT CAUSE': 'var(--accent-green)',
@@ -1214,6 +1317,7 @@
       'GUARDRAIL': 'var(--accent-amber)',
       'MEMORY': 'var(--accent-purple)',
       'KG': 'var(--accent-green)',
+      'KG RAILS': 'var(--accent-green)',
       'ACTION': 'var(--accent-red)',
       'HARNESS': '#3b82f6',
       'SUCCESS': 'var(--accent-green)',
@@ -1224,22 +1328,35 @@
       'BATCH': 'var(--accent-green)',
       'SCHEDULED': '#3b82f6',
       'SYSTEM': 'var(--accent-green)',
+      'STRATEGY SOURCE': '#f59e0b',
+      'LLM REASONING': '#8b5cf6',
+      'REFLECTION': '#ef4444',
+      'TIER ENFORCED': '#f97316',
+      'BANDIT OVERRIDE': '#ec4899',
+      'LLM UNAVAILABLE': '#ef4444',
     };
 
     function buildStepHtml(tag, text, detail, tier, ts) {
       var tagColor = TAG_COLORS[tag] || 'var(--text-muted)';
       var tierBadge = tier ? '<span class="tier-badge tier-' + escapeHtml(tier) + ' trace-tier"><span class="tier-dot"></span> ' + escapeHtml(tier.toUpperCase()) + '</span>' : '';
-      var isReasoning = /THINK|PLAN|DIAGNOSE|GUARD|MEMORY|KG|ROOT CAUSE/i.test(tag);
+      var isReasoning = /THINK|PLAN|DIAGNOSE|GUARD|MEMORY|KG|ROOT CAUSE|LLM REASONING|REFLECTION|STRATEGY SOURCE|TIER ENFORCED|BANDIT OVERRIDE|SEARCH KB|HISTORY|STATUS|THINKING|AGENT|INIT/i.test(tag);
       var openCls = isReasoning ? ' open' : '';
       var detailHtml = detail ? formatDetailChips(detail) : '';
       // Colored left border per tag type
       var borderColors = {
+        'INIT': '#3b82f6', 'AGENT': '#8b5cf6',
+        'SEARCH KB': '#22c55e', 'HISTORY': '#8b5cf6', 'STATUS': '#8b5cf6',
+        'THINKING': '#8b5cf6', 'LINK': '#ef4444', 'SCHEDULE': '#f59e0b',
+        'ESCALATE': '#ef4444', 'VOICE CALL': '#ef4444',
         'DETECT': '#8b5cf6', 'DIAGNOSE': '#3b82f6', 'ROOT CAUSE': '#3b82f6',
         'GUARDRAIL': '#f59e0b', 'STRATEGY': '#f59e0b', 'THINK': '#8b5cf6',
         'ACT': '#ef4444', 'ACTION': '#ef4444', 'HARNESS': '#3b82f6',
         'SUCCESS': '#22c55e', 'FAIL': '#ef4444', 'BLOCKED': '#ef4444',
         'UI SPEC': '#ec4899', 'MEMORY': '#06b6d4', 'KG': '#22c55e',
-        'APPROVAL NEEDED': '#f97316', 'APPROVAL DENIED': '#ef4444'
+        'KG RAILS': '#22c55e', 'APPROVAL NEEDED': '#f97316', 'APPROVAL DENIED': '#ef4444',
+        'STRATEGY SOURCE': '#f59e0b', 'LLM REASONING': '#8b5cf6',
+        'REFLECTION': '#ef4444', 'TIER ENFORCED': '#f97316', 'BANDIT OVERRIDE': '#ec4899',
+        'LLM DOWN': '#ef4444', 'STOPPED': '#ef4444', 'EXECUTE': '#f59e0b',
       };
       var borderColor = borderColors[tag] || '#21262d';
       var html = '<div class="trace-header" onclick="toggleStep(this)" style="border-left-color:' + borderColor + '">'
@@ -1258,19 +1375,22 @@
     var _traceDraining = false;
 
     function _appendTraceStep(stepEl) {
-      _traceQueue.push(stepEl);
+      // Capture the owning payment now. The queue drains on a timer, so by the
+      // time a line is drawn another payment may be streaming — that is how
+      // every line ended up in one session's buffer despite the tabs.
+      _traceQueue.push({el: stepEl, pid: streamingPid});
       if (!_traceDraining) _drainTraceQueue();
     }
 
     function _drainTraceQueue() {
       if (_traceQueue.length === 0) { _traceDraining = false; return; }
       _traceDraining = true;
-      var el = _traceQueue.shift();
+      var item = _traceQueue.shift();
+      var el = item.el;
       _traceCounter++;
       var delay = Math.min(_traceCounter * 60, 300);
       el.style.animationDelay = delay + 'ms';
-      terminal.appendChild(el);
-      terminal.scrollTop = terminal.scrollHeight;
+      sessionAppend(el, item.pid);
       setTimeout(_drainTraceQueue, 80);
     }
 
@@ -1300,7 +1420,7 @@
 
     function submitCardExpiryFix(event, pid) {
       if (event) event.preventDefault();
-      const val = document.getElementById("expiry-input")?.value || "08/29";
+      const val = document.getElementById("expiry-input")?.value || "MM/YY";
       fetch("/api/customer-responded", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1319,8 +1439,9 @@
     }
 
     function startPaymentFromCanvas(scenarioReason) {
+      const ctx = currentScenario || { amount: 2999, customer: { name: "Customer", email: "" }, item_name: "Order" };
       const paymentId = "pay_sim_" + Math.floor(1000 + Math.random() * 9000);
-      const amount = 4999.0;
+      const amount = ctx.amount;
       activePaymentId = paymentId;
       
       resetProgressPills();
@@ -1338,7 +1459,7 @@
         document.getElementById("progress-status-label").textContent = "PROCESSING PAYMENT...";
         
         setTimeout(() => {
-          logThought("GATEWAY", "tag-acting", `Razorpay Gateway Failure Event Fired!`, `Reason: ${scenarioReason || 'Gateway Timeout 504 (HDFC Netbanking drop)'}`);
+          logThought("GATEWAY", "tag-acting", `Razorpay Gateway Failure Event Fired!`, `Reason: ${scenarioReason || 'Gateway Timeout 504'}`);
           fetch("/api/payment-failed", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1346,10 +1467,10 @@
               payment_id: paymentId,
               amount: amount,
               failure_code: "gateway_timeout",
-              failure_reason: scenarioReason || "Gateway Timeout 504 (HDFC Netbanking drop)",
+              failure_reason: scenarioReason || "Gateway Timeout 504",
               error_source: "gateway",
               error_step: "payment_authorization",
-              customer: { name: "Rahul Kumar", email: "rahul@example.com" }
+              customer: ctx.customer
             })
           });
         }, 800);
@@ -1359,12 +1480,24 @@
     function triggerScenario(name) {
       voiceWidget.classList.remove("active");
       resetProgressPills();
-      updateScenarioContext(name);
       document.getElementById("progress-status-label").textContent = "SIMULATING...";
       fetch("/api/simulate/" + name, { method: "POST" })
         .then(r => r.json())
         .then(data => {
           if (data.payment_id) activePaymentId = data.payment_id;
+          // Store scenario context from API (no more hardcoded values)
+          currentScenario = {
+            biz_name: data.biz_name || "Payment Platform",
+            biz_detail: data.biz_detail || "",
+            badge: data.badge || data.scenario,
+            item_name: data.item_name || "Order",
+            amount: data.amount || 0,
+            customer: data.customer || { name: "Customer", email: "", contact: "" },
+            card_last4: data.card_last4 || "0000",
+            card_expiry: data.card_expiry || "MM/YY",
+            card_holder: data.card_holder || "CARD HOLDER",
+          };
+          updateScenarioView();
           if (data.status === "batch_completed") {
             logThought("BATCH", "tag-kg", "Batch Evaluation Complete!", data.summary);
             fetchMetrics();
@@ -1423,93 +1556,19 @@
             <span class="trace-chip purple">${data.reason}</span>
           </div>
         </div>`;
-      terminal.appendChild(step);
-      terminal.scrollTop = terminal.scrollHeight;
+      sessionAppend(step);
     });
 
-    socket.on("agent_stream", function(data) {
-      if (data.payment_id) activePaymentId = data.payment_id;
 
-      // Extract tier info from guardrail or ui_spec
-      const tier = (data.guardrail && data.guardrail.recovery_tier) || (data.ui_spec && data.ui_spec.recovery_tier) || "active";
-      const strategy = (data.guardrail && data.guardrail.decline_strategy) || (data.ui_spec && data.ui_spec.decline_strategy) || "";
-      const penalties = (data.guardrail && data.guardrail.penalties_prevented) || (data.ui_spec && data.ui_spec.penalties_prevented) || 0;
-      const payday = (data.guardrail && data.guardrail.payday_target) || (data.ui_spec && data.ui_spec.payday_target) || "";
+    /* Every write goes into the selected session's buffer as well as the DOM, so
+       switching tabs replays that session's own history instead of a shared
+       scrollback. Writes belonging to a background session are buffered only. */
+    function renderToolCard(tc) {
+      if (!tc) { toolCard.style.display = "none"; return; }
 
-      // Update compact status bar
-      if (tier) {
-        const tierEl = document.getElementById("tele-tier");
-        const tierLabel = tier === "silent" ? "SILENT" : tier === "hard_decline_blocked" ? "BLOCKED" : "ACTIVE";
-        tierEl.className = "tier-badge tier-" + tier;
-        tierEl.innerHTML = '<span class="tier-dot"></span> ' + tierLabel;
-        if (tier !== "silent" && lastTier === "silent") {
-          resetSilentBanner();
-        }
-        if (tier === "silent" && lastTier !== "silent") {
-          showSilentBanner(payday || "", strategy || "");
-        }
-        lastTier = tier;
-      }
-      if (strategy) {
-        document.getElementById("tele-strategy").textContent = "Strategy: " + strategy;
-      }
-      if (penalties > 0) {
-        document.getElementById("tele-penalties").textContent = "Penalties: " + penalties + " blocked";
-        document.getElementById("tele-penalties").style.display = "";
-      }
-      if (payday) {
-        document.getElementById("tele-payday").textContent = "Payday: " + payday;
-        document.getElementById("tele-payday").style.display = "";
-      }
-
-      // 1. Log streaming thoughts & update live progress pills (with tier color coding)
-      if (data.step === "detecting") {
-        setStatus("THINKING...", "status-thinking");
-        logThoughtWithTier("DETECT", "tag-thinking", data.msg, data.detail, tier);
-        document.getElementById("p-detect").className = "step-pill active-detect";
-        document.getElementById("progress-status-label").textContent = "DETECTING ANOMALY";
-      } else if (data.step === "diagnosing") {
-        setStatus("DIAGNOSING...", "status-thinking");
-        logThoughtWithTier("DIAGNOSE", "tag-diagnosing", data.msg, data.detail, tier);
-        document.getElementById("p-diagnose").className = "step-pill active-diagnose";
-        document.getElementById("progress-status-label").textContent = "LLM DIAGNOSIS";
-      } else if (data.step === "diagnosed") {
-        logThoughtWithTier("ROOT CAUSE", "tag-kg", data.msg, data.detail, tier);
-      } else if (data.step === "deciding") {
-        setStatus("CHECKING GUARDRAILS", "status-executing");
-        logThoughtWithTier("GUARDRAIL", "tag-guardrail", data.msg, data.detail, tier);
-        document.getElementById("p-guardrail").className = "step-pill active-guardrail";
-        document.getElementById("progress-status-label").textContent = "GUARDRAIL CHECK";
-        if (data.guardrail) {
-          const g = data.guardrail;
-          document.getElementById("tele-guardrail").textContent = (g.allowed ? "Allowed" : "Modified: " + (g.modified_action || "")) + " | Attempt " + (g.attempt_cap || "1/3");
-        }
-      } else if (data.step === "harness_start") {
-        setStatus("HARNESS ACTIVE", "status-thinking");
-        logThoughtWithTier("HARNESS", "tag-harness", data.msg, data.detail, tier);
-        document.getElementById("progress-status-label").textContent = "AGENT HARNESS";
-      } else if (data.step === "harness_turn") {
-        setStatus("HARNESS THINKING", "status-thinking");
-        logThoughtWithTier("HARNESS", "tag-harness", data.msg, data.detail, tier);
-        document.getElementById("progress-status-label").textContent = "HARNESS REASONING";
-      } else if (data.step === "acting") {
-        setStatus("EXECUTING TOOL", "status-executing");
-        logThoughtWithTier("ACTION", "tag-acting", data.msg, data.detail, tier);
-        document.getElementById("p-morph").className = "step-pill active-morph";
-        document.getElementById("progress-status-label").textContent = "GENUI MORPHING";
-      } else if (data.step === "stopping") {
-        setStatus("RECOVERED!", "status-recovered");
-        logThoughtWithTier("SUCCESS", "tag-kg", data.msg, data.detail, tier);
-        document.getElementById("p-recovered").className = "step-pill active-recovered";
-        document.getElementById("progress-status-label").textContent = "RECOVERED";
-        fetchMetrics();
-      }
-
-      // 2. Render Tool Call Cards (real SDK responses)
-      if (data.tool_call) {
         toolCard.style.display = "block";
-        toolName.textContent = data.tool_call.tool || "RazorpayTool";
-        const sdkPayload = data.tool_call.raw_razorpay_response || data.tool_call.response || data.tool_call;
+        toolName.textContent = tc.tool || "RazorpayTool";
+        const sdkPayload = tc.raw_razorpay_response || tc.response || tc;
         // Render structured key-value pairs
         var kvHtml = '';
         var displayKeys = {
@@ -1569,6 +1628,226 @@
           toolStatus.style.background = 'rgba(245,158,11,0.1)';
           toolStatus.style.color = '#f59e0b';
           toolStatus.style.borderColor = 'rgba(245,158,11,0.2)';
+        }    }
+
+    function sessionAppend(el, pid) {
+      // Attribute the line to the payment that PRODUCED it, not to whatever tab
+      // the operator happens to be looking at. Defaulting to selectedSession put
+      // every line from both live payments into one buffer — sessB ended up with
+      // 400 lines and sessA with none, which is the interleaving these tabs exist
+      // to prevent, just hidden one level down.
+      const target = pid || streamingPid || selectedSession;
+      if (target) {
+        const sess = sessionFor(target);
+        sess.lines.push(el.outerHTML);
+        if (sess.lines.length > 400) sess.lines.shift();
+        if (target !== selectedSession) return;   // buffered, not shown
+      }
+      terminal.appendChild(el);
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    socket.on("agent_stream", function(data) {
+      // Do NOT hijack the operator's selected tab. The old line here set
+      // activePaymentId to whichever payment emitted last, so a second live
+      // payment silently stole the view and the action buttons.
+      streamingPid = data.payment_id || null;
+      if (data.payment_id) {
+        const sess = sessionFor(data.payment_id);
+        const amt = data.amount || (data.ui_spec && data.ui_spec.amount) ||
+                    (data.trail_amount) || null;
+        if (amt) sess.amount = "INR " + Number(amt).toLocaleString("en-IN");
+        if (data.status) sess.status = data.status;
+        else if (data.event === "complete" || data.event === "recovery_confirmed") sess.status = "recovered";
+        if (data.payment_id !== selectedSession) { sess.unread += 1; renderTabs(); }
+        else renderTabs();
+      }
+
+      // Extract tier info from guardrail or ui_spec
+      const tier = (data.guardrail && data.guardrail.recovery_tier) || (data.ui_spec && data.ui_spec.recovery_tier) || "active";
+      const strategy = (data.guardrail && data.guardrail.decline_strategy) || (data.ui_spec && data.ui_spec.decline_strategy) || "";
+      const penalties = (data.guardrail && data.guardrail.penalties_prevented) || (data.ui_spec && data.ui_spec.penalties_prevented) || 0;
+      const payday = (data.guardrail && data.guardrail.payday_target) || (data.ui_spec && data.ui_spec.payday_target) || "";
+
+      // Update compact status bar
+      if (tier) {
+        const tierEl = document.getElementById("tele-tier");
+        const tierLabel = tier === "silent" ? "SILENT" : tier === "hard_decline_blocked" ? "BLOCKED" : "ACTIVE";
+        tierEl.className = "tier-badge tier-" + tier;
+        tierEl.innerHTML = '<span class="tier-dot"></span> ' + tierLabel;
+        if (tier !== "silent" && lastTier === "silent") {
+          resetSilentBanner();
+        }
+        if (tier === "silent" && lastTier !== "silent") {
+          showSilentBanner(payday || "", strategy || "");
+        }
+        lastTier = tier;
+      }
+      if (strategy) {
+        document.getElementById("tele-strategy").textContent = "Strategy: " + strategy;
+      }
+      if (penalties > 0) {
+        document.getElementById("tele-penalties").textContent = "Penalties: " + penalties + " blocked";
+        document.getElementById("tele-penalties").style.display = "";
+      }
+      if (payday) {
+        document.getElementById("tele-payday").textContent = "Payday: " + payday;
+        document.getElementById("tele-payday").style.display = "";
+      }
+
+      // 1. Log streaming thoughts & update live progress pills (with tier color coding)
+      // New pipeline: perceive → reason → guard → act → observe → learn
+      if (data.step === "init") {
+        setStatus("INITIALIZING...", "status-thinking");
+        logThoughtWithTier("INIT", "tag-thinking", data.msg, data.detail, tier);
+        document.getElementById("p-detect").className = "step-pill active-detect";
+        document.getElementById("progress-status-label").textContent = "CASE INIT";
+      } else if (data.step === "perceive") {
+        setStatus("GATHERING CONTEXT", "status-thinking");
+        logThoughtWithTier("PERCEIVE", "tag-thinking", data.msg, data.detail, tier);
+        document.getElementById("p-detect").className = "step-pill active-detect";
+        document.getElementById("progress-status-label").textContent = "GATHERING CONTEXT";
+      } else if (data.step === "reason") {
+        setStatus("LLM REASONING", "status-thinking");
+        logThoughtWithTier("REASON", "tag-harness", data.msg, data.detail, tier);
+        document.getElementById("p-diagnose").className = "step-pill active-diagnose";
+        document.getElementById("progress-status-label").textContent = "LLM REASONING";
+      } else if (data.step === "guard") {
+        setStatus("GUARDRAILS", "status-thinking");
+        logThoughtWithTier("GUARD", "tag-guardrail", data.msg, data.detail, tier);
+        document.getElementById("p-guardrail").className = "step-pill active-guardrail";
+        document.getElementById("progress-status-label").textContent = "GUARDRAILS";
+      } else if (data.step === "act") {
+        setStatus("EXECUTING", "status-executing");
+        logThoughtWithTier("ACT", "tag-acting", data.msg, data.detail, tier);
+        document.getElementById("p-morph").className = "step-pill active-morph";
+        document.getElementById("progress-status-label").textContent = "EXECUTING ACTION";
+      } else if (data.step === "observe") {
+        setStatus("OBSERVING", "status-thinking");
+        logThoughtWithTier("OBSERVE", "tag-thinking", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "WAITING FOR RESPONSE";
+      } else if (data.step === "learn") {
+        setStatus("LEARNING", "status-thinking");
+        logThoughtWithTier("LEARN", "tag-kg", data.msg, data.detail, tier);
+        document.getElementById("p-recovered").className = "step-pill active-recovered";
+        document.getElementById("progress-status-label").textContent = "RECORDING OUTCOME";
+        fetchMetrics();
+      } else if (data.step === "harness_start") {
+        setStatus("AGENT ACTIVE", "status-thinking");
+        logThoughtWithTier("AGENT", "tag-harness", data.msg, data.detail, tier);
+        document.getElementById("p-diagnose").className = "step-pill active-diagnose";
+        document.getElementById("progress-status-label").textContent = "AGENT REASONING";
+      } else if (data.step === "investigating") {
+        setStatus("SEARCHING KB", "status-thinking");
+        logThoughtWithTier("SEARCH KB", "tag-kg", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "KNOWLEDGE BASE SEARCH";
+      } else if (data.step === "checking_history") {
+        setStatus("CHECKING HISTORY", "status-thinking");
+        logThoughtWithTier("HISTORY", "tag-thinking", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "CUSTOMER HISTORY";
+      } else if (data.step === "checking_status") {
+        setStatus("CHECKING STATUS", "status-thinking");
+        logThoughtWithTier("STATUS", "tag-thinking", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "PAYMENT STATUS";
+      } else if (data.step === "harness_thinking") {
+        setStatus("THINKING...", "status-thinking");
+        logThoughtWithTier("THINKING", "tag-thinking", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "AGENT THINKING";
+      } else if (data.step === "generating_link") {
+        setStatus("GENERATING LINK", "status-executing");
+        logThoughtWithTier("LINK", "tag-acting", data.msg, data.detail, tier);
+        document.getElementById("p-guardrail").className = "step-pill active-guardrail";
+        document.getElementById("progress-status-label").textContent = "RECOVERY LINK";
+      } else if (data.step === "scheduling_retry") {
+        setStatus("SCHEDULING", "status-executing");
+        logThoughtWithTier("SCHEDULE", "tag-guardrail", data.msg, data.detail, tier);
+        document.getElementById("p-guardrail").className = "step-pill active-guardrail";
+        document.getElementById("progress-status-label").textContent = "SCHEDULING RETRY";
+      } else if (data.step === "escalating") {
+        setStatus("ESCALATING", "status-executing");
+        logThoughtWithTier("ESCALATE", "tag-acting", data.msg, data.detail, tier);
+        document.getElementById("p-guardrail").className = "step-pill active-guardrail";
+        document.getElementById("progress-status-label").textContent = "ESCALATING TO HUMAN";
+      } else if (data.step === "calling") {
+        setStatus("VOICE CALL", "status-executing");
+        logThoughtWithTier("VOICE CALL", "tag-acting", data.msg, data.detail, tier);
+        document.getElementById("p-guardrail").className = "step-pill active-guardrail";
+        document.getElementById("progress-status-label").textContent = "AI VOICE CALL";
+      } else if (data.step === "llm_unavailable") {
+        setStatus("LLM UNAVAILABLE", "status-failed");
+        logThoughtWithTier("LLM DOWN", "tag-acting", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "LLM SERVER DOWN";
+      } else if (data.step === "agent_start") {
+        setStatus("AGENT ACTIVE", "status-thinking");
+        logThoughtWithTier("AGENT", "tag-harness", data.msg, data.detail, tier);
+        document.getElementById("p-detect").className = "step-pill active-detect";
+        document.getElementById("progress-status-label").textContent = "REACT AGENT STARTED";
+      } else if (data.step === "agent_thinking") {
+        setStatus("AGENT THINKING", "status-thinking");
+        logThoughtWithTier("TOOL CALL", "tag-harness", data.msg, data.detail, tier);
+        document.getElementById("p-diagnose").className = "step-pill active-diagnose";
+        document.getElementById("progress-status-label").textContent = "AGENT CALLING TOOL";
+      } else if (data.step === "tool_result") {
+        setStatus("TOOL RESULT", "status-thinking");
+        logThoughtWithTier("RESULT", "tag-kg", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "TOOL RESULT RECEIVED";
+      } else if (data.step === "agent_summary") {
+        setStatus("AGENT COMPLETE", "status-success");
+        logThoughtWithTier("SUMMARY", "tag-success", data.msg, data.detail, tier);
+        document.getElementById("p-recovered").className = "step-pill active-recovered";
+        document.getElementById("progress-status-label").textContent = "AGENT FINISHED";
+        fetchMetrics();
+      } else if (data.step === "stopped") {
+        setStatus("STOPPED", "status-failed");
+        logThoughtWithTier("STOPPED", "tag-acting", data.msg, data.detail, tier);
+        document.getElementById("progress-status-label").textContent = "AGENT STOPPED";
+      } else if (data.step === "acting") {
+        setStatus("EXECUTING", "status-executing");
+        logThoughtWithTier("EXECUTE", "tag-acting", data.msg, data.detail, tier);
+        document.getElementById("p-morph").className = "step-pill active-morph";
+        document.getElementById("progress-status-label").textContent = "EXECUTING ACTION";
+      } else if (data.step === "stopping") {
+        setStatus("RECOVERED!", "status-recovered");
+        logThoughtWithTier("SUCCESS", "tag-kg", data.msg, data.detail, tier);
+        document.getElementById("p-recovered").className = "step-pill active-recovered";
+        document.getElementById("progress-status-label").textContent = "RECOVERED";
+        fetchMetrics();
+      }
+
+      // Phase updates from graph nodes (Case.status is source of truth)
+      if (data.event === "phase_update" && data.phase) {
+        const dd = document.getElementById("phase-dropdown");
+        dd.style.display = "inline-block";
+        dd.value = data.phase;
+        // Update status pill text to match phase
+        const phaseLabels = {
+          initializing: "INITIALIZING",
+          diagnosing: "DIAGNOSING",
+          guard_check: "GUARD CHECK",
+          acting: "EXECUTING",
+          self_critique: "SELF CRITIQUE",
+          tier_transition: "TIER TRANSITION",
+          complete: "COMPLETE",
+          error: "ERROR",
+        };
+        const label = phaseLabels[data.phase] || data.phase.toUpperCase();
+        const cls = data.phase === "complete" ? "status-success" :
+                    data.phase === "error" ? "status-failed" :
+                    data.phase === "acting" ? "status-executing" : "status-thinking";
+        setStatus(label, cls);
+      }
+
+      // 2. Render Tool Call Cards (real SDK responses)
+      //
+      // Session-scoped: the card is one shared panel, so an event from a
+      // background payment used to overwrite it — pay_finA's card was on screen
+      // while pay_finB was the selected tab. Store it per session and paint only
+      // for the tab being viewed.
+      if (data.tool_call) {
+        const _sess = data.payment_id ? sessionFor(data.payment_id) : null;
+        if (_sess) _sess.toolCall = data.tool_call;
+        if (!data.payment_id || data.payment_id === selectedSession) {
+          renderToolCard(data.tool_call);
         }
       }
 
@@ -1597,19 +1876,20 @@
               <strong style="color:var(--accent-amber);">${headline}</strong><br/>
               <span style="font-size:0.78rem; color:var(--text-muted);">${subtext}</span>
               ${discount}
-              <input type="text" id="expiry-input" placeholder="MM/YY" style="width:100%; margin-top:8px; padding:8px; border-radius:4px; border:1px solid var(--accent-amber); background:#0d1117; color:var(--text-bright); font-family:var(--font-mono);" value="08/29"/>
+              <input type="text" id="expiry-input" placeholder="MM/YY" style="width:100%; margin-top:8px; padding:8px; border-radius:4px; border:1px solid var(--accent-amber); background:#0d1117; color:var(--text-bright); font-family:var(--font-mono);" value=""/>
               <button type="submit" style="margin-top:8px; width:100%; background:#d29922; color:#0d1117; border:none; padding:8px; border-radius:4px; font-weight:600; font-family:var(--font-mono); cursor:pointer;">
                 ${cta}
               </button>
             </form>`;
         } else if (uiType === "ABANDONMENT_WHATSAPP_OVERLAY") {
+          const cust = (currentScenario && currentScenario.customer) || { name: "Customer", contact: "" };
           morphContainer.innerHTML = `
             <div class="gen-morph-box morph-whatsapp">
               <strong style="color:var(--accent-green);">${headline}</strong><br/>
               <span style="font-size:0.78rem; color:var(--text-muted);">${subtext}</span>
               <div class="wa-bubble">
-                <strong style="color:var(--accent-green);">WhatsApp Magic Link (+91 98765 43210):</strong><br/>
-                "Hi Rahul! We saved your cart. Complete purchase in 5 mins for instant cashback."
+                <strong style="color:var(--accent-green);">WhatsApp Magic Link (${escapeHtml(cust.contact)}):</strong><br/>
+                "Hi ${escapeHtml(cust.name)}! We saved your cart. Complete purchase in 5 mins for instant cashback."
                 <button style="margin-top:8px; width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:8px; border-radius:4px; font-weight:600; font-family:var(--font-mono); cursor:pointer;" onclick="triggerScenario('abandonment')">
                   Complete Purchase via Magic Link
                 </button>
@@ -1618,7 +1898,8 @@
             </div>`;
         } else if (uiType === "HINGLISH_VOICE_CALL") {
           voiceWidget.classList.add("active");
-          const vScript = spec.hinglish_voice_script || "Namaste Rahul ji! Aapka Razorpay payment decline ho gaya hai. Tap karein to auto retry payment.";
+          const cust = (currentScenario && currentScenario.customer) || { name: "Customer" };
+          const vScript = spec.hinglish_voice_script || `Namaste ${cust.name} ji! Aapka Razorpay payment decline ho gaya hai. Tap karein to auto retry payment.`;
           document.getElementById("voice-transcript").textContent = `"${vScript}"`;
           speakHinglish(vScript);
         } else if (uiType === "RECOVERY_SUCCESS") {
@@ -1646,12 +1927,11 @@
           INVISIBLE AI AGENT ACTIVE — Background Recovery Mode
         </div>
         <ul>
-          <li>Customer communication <strong>SUPPRESSED</strong> to eliminate cancellation churn (-23% churn reduction).</li>
+          <li>Customer communication <strong>SUPPRESSED</strong> to eliminate cancellation churn.</li>
           <li><strong>Payday Scheduler:</strong> Target 12:01 AM liquidity window${paydayTarget ? " — next payday " + paydayTarget : " calculated"}.</li>
           <li><strong>Bank Health:</strong> ${bankHealth || "Gateways monitored silently without disturbing customer."}</li>
         </ul>`;
-      terminal.appendChild(line);
-      terminal.scrollTop = terminal.scrollHeight;
+      sessionAppend(line);
     }
 
     function resetSilentBanner() { silentBannerShown = false; }
@@ -1681,6 +1961,44 @@
         }
       }, 1000);
     });
+
+    // ── Copy Monologue ──
+    function copyMonologue() {
+      const terminal = document.getElementById("terminal-stream");
+      if (!terminal) return;
+      const lines = [];
+      terminal.querySelectorAll(".trace-step").forEach(function(step) {
+        const header = step.querySelector(".trace-header");
+        if (header) {
+          const tag = header.querySelector(".trace-tag") || header.querySelector(".trace-chip");
+          const title = header.querySelector(".trace-title");
+          const detail = header.querySelector(".trace-detail");
+          let line = "";
+          if (tag) line += tag.textContent.trim() + " ";
+          if (title) line += title.textContent.trim();
+          if (detail) line += "\n    " + detail.textContent.trim();
+          if (line) lines.push(line);
+        }
+        // Expanded detail body (collapsed content)
+        step.querySelectorAll(".trace-detail-body, .trace-detail, .trace-sub, .trace-code-block").forEach(function(el) {
+          const t = el.textContent.trim();
+          if (t) lines.push("  " + t);
+        });
+      });
+      // Also grab anything in the silent banner if present
+      const banner = document.querySelector(".silent-banner");
+      if (banner) {
+        const bt = banner.textContent.trim();
+        if (bt) lines.push("\n--- SILENT BANNER ---\n" + bt);
+      }
+      const text = lines.join("\n");
+      if (text) {
+        navigator.clipboard.writeText(text).then(function() {
+          const btn = document.querySelector("button[onclick='copyMonologue()']");
+          if (btn) { btn.textContent = "COPIED"; setTimeout(function() { btn.textContent = "COPY"; }, 1500); }
+        });
+      }
+    }
 
     function voiceCallApprove(approved) {
       if (!_vaPaymentId) return;

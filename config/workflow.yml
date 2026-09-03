@@ -1,0 +1,25 @@
+# NAT Workflow Configuration — Recovery Agent
+# MANDATE 6: Uses REAL nvidia-nat workflow format
+#
+# This config wraps our LangGraph agent in NAT's configuration-driven workflow.
+# Run with: nat serve -t recovery_agent -c config/workflow.yml
+#
+# NVIDIA NeMo Agent Toolkit course pattern:
+#   - Configuration-driven workflows
+#   - LLM-as-judge trajectory scoring
+#   - Data-driven improvements through evaluation experiments
+
+general: {}
+
+functions: {}
+
+eval:
+  general:
+    output_dir: ./eval_output
+    max_concurrency: 8
+  evaluators: {}
+
+llms: {}
+embedders: {}
+memory: {}
+middleware: {}

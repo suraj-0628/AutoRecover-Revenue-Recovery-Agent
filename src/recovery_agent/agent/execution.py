@@ -48,12 +48,15 @@ def execute_action(
         try:
             # Generate recovery link if not provided — notification MUST have a link
             if not recovery_link:
-                from recovery_agent.agent.tools import execute_tool
-                link_result = execute_tool("generate_smart_recovery_link", {
+                from recovery_agent.agent.tools import TOOLS_BY_NAME
+                link_result = TOOLS_BY_NAME["generate_recovery_payment_link"].invoke({
                     "payment_id": payment_id,
-                    "allowed_rails": ["upi", "card", "netbanking"],
+                    "amount": amount or 0,
+                    "allowed_rails": "upi,card,netbanking",
                 })
-                recovery_link = link_result.get("short_url") or link_result.get("link_url") or ""
+                import json as _json
+                parsed = _json.loads(link_result) if isinstance(link_result, str) else link_result
+                recovery_link = parsed.get("link_url") or parsed.get("short_url") or ""
 
             from recovery_agent.notifications import NotificationDispatcher
             dispatcher = NotificationDispatcher()
@@ -189,12 +192,15 @@ def execute_action(
             client = get_superu_client()
             # Generate recovery link if not provided
             if not recovery_link:
-                from recovery_agent.agent.tools import execute_tool
-                link_result = execute_tool("generate_smart_recovery_link", {
+                from recovery_agent.agent.tools import TOOLS_BY_NAME
+                link_result = TOOLS_BY_NAME["generate_recovery_payment_link"].invoke({
                     "payment_id": payment_id,
-                    "allowed_rails": ["upi", "card", "netbanking"],
+                    "amount": amount or 0,
+                    "allowed_rails": "upi,card,netbanking",
                 })
-                recovery_link = link_result.get("short_url") or link_result.get("link_url") or ""
+                import json as _json
+                parsed = _json.loads(link_result) if isinstance(link_result, str) else link_result
+                recovery_link = parsed.get("link_url") or parsed.get("short_url") or ""
             customer_name = kwargs.get("customer_name", "Customer")
             result = client.initiate_recovery_call(
                 payment_id=payment_id,
@@ -244,11 +250,13 @@ def execute_action(
 
     elif action == ActionType.ESCALATE_TO_HUMAN:
         try:
-            from recovery_agent.agent.tools import escalate_to_human_agent
-            ticket = escalate_to_human_agent(
-                payment_id=payment_id,
-                reason=failure_reason or "Escalation requested by agent",
-            )
+            from recovery_agent.agent.tools import TOOLS_BY_NAME
+            ticket_raw = TOOLS_BY_NAME["escalate_to_human"].invoke({
+                "payment_id": payment_id,
+                "reason": failure_reason or "Escalation requested by agent",
+            })
+            import json as _json
+            ticket = _json.loads(ticket_raw) if isinstance(ticket_raw, str) else ticket_raw
             return {
                 "action": "escalate_to_human",
                 "detail": f"Escalation ticket {ticket.get('ticket_id', 'unknown')} created. Reason: {failure_reason}",

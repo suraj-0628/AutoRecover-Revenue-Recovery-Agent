@@ -61,8 +61,10 @@ class CustomerMemoryStore:
                 yield
         except Timeout:
             print(f"[memory] WARNING: Could not acquire file lock within 10s: {lock_path}")
-            # Proceed without lock — better than deadlock
-            yield
+            raise RuntimeError(
+                f"File lock timeout after 10s on {lock_path}. "
+                "Another process may be stuck. Retry or check for stale locks."
+            )
 
     # --- Profile Access ---
 

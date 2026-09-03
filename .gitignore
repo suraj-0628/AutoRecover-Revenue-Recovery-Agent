@@ -64,3 +64,8 @@ data/*.json
 .agents/
 
 
+
+# D1 case ledger (runtime state)
+data/ledger.db
+data/ledger.db-wal
+data/ledger.db-shm

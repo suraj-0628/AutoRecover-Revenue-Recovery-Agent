@@ -89,7 +89,8 @@ class RazorpayClient:
     ) -> dict[str, Any]:
         """Create a Razorpay order.
 
-        Amount in paise (INR). For INR 500, pass 50000.
+        `amount` is in RUPEES, despite the older docstring here claiming paise —
+        the body multiplies by 100. Do NOT pre-convert.
         """
         if not self.is_configured:
             import time
@@ -149,8 +150,14 @@ class RazorpayClient:
         currency: str = "INR",
         customer: dict | None = None,
         notes: dict | None = None,
+        expire_by: int | None = None,
     ) -> dict[str, Any]:
-        """Create a Razorpay Payment Link."""
+        """Create a Razorpay Payment Link.
+
+        `amount` is in RUPEES. This method converts to paise itself — do NOT
+        pre-convert. Passing paise here bills the customer 100x the debt, which
+        shipped and reached the live account before it was caught.
+        """
         if not self.is_configured:
             import time
             ref_id = f"plink_rzp_{os.urandom(4).hex()}"
@@ -173,6 +180,8 @@ class RazorpayClient:
                 "customer": customer or {},
                 "notes": notes or {},
             }
+            if expire_by:
+                params["expire_by"] = int(expire_by)
             return self.client.payment_link.create(params)
         except Exception as e:
             return {"error": str(e)}

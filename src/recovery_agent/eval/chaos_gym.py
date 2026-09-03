@@ -286,7 +286,7 @@ class RevenueLossEnvironment:
         self.rng = random.Random(seed)
         self.state: GymState | None = None
         self.use_harness = use_harness
-        self.agent = RecoveryAgent(use_harness=use_harness)
+        self.agent = RecoveryAgent()
 
     def reset(self, seed: int | None = None) -> GymState:
         """Generate a fresh, messy revenue-loss case."""
@@ -529,16 +529,15 @@ class RevenueLossEnvironment:
         }
 
     def _agent_decide(self, state: GymState) -> ActionType:
-        """Multi-agent squad decision logic for the Gym.
+        """Agent decision logic for the Gym.
 
-        Uses SquadOrchestrator to coordinate specialized agents:
-        DiagnosticAgent → StrategyPlannerAgent → ComplianceOverseerAgent → ToolExecutionAgent
+        Uses diagnosis + guardrails + heuristic (same as graph pipeline nodes).
         """
         case = state.case
         from recovery_agent.agent.memory import CustomerMemoryStore
         from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
         from recovery_agent.agent.guardrails import GuardrailEngine
-        from recovery_agent.agent.squad import SquadOrchestrator
+        from recovery_agent.agent.diagnosis import run_diagnosis
 
         if not hasattr(self, "memory_store"):
             self.memory_store = CustomerMemoryStore()
@@ -546,12 +545,6 @@ class RevenueLossEnvironment:
             self.kg_router = RazorpayKnowledgeGraph()
         if not hasattr(self, "guardrail_engine"):
             self.guardrail_engine = GuardrailEngine()
-        if not hasattr(self, "squad"):
-            self.squad = SquadOrchestrator(
-                memory_store=self.memory_store,
-                kg_router=self.kg_router,
-                guardrail_engine=self.guardrail_engine,
-            )
 
         profile = self.memory_store.get_or_create_profile(case.payment.customer_id)
         
@@ -580,15 +573,17 @@ class RevenueLossEnvironment:
                 profile.payment_history.append(record)
                 recent_sms.append(record)
 
-        # Run squad pipeline: Diagnose → Plan (Memory+KG) → Guard (Compliance Intercept)
-        diagnosis = self.squad.diagnostic.diagnose(case)
-        case.diagnosis = diagnosis
+        # Run diagnosis
+        run_diagnosis(case)
 
         # Keep case attempt count synced with Gym state
         case.attempt_count = max(0, state.attempt_count - 1)
 
-        proposed_action = self.squad.planner.plan(case, profile, self.kg_router, self.memory_store)
-        approved_action, checks = self.squad.compliance.intercept(case, proposed_action, profile)
+        # Heuristic decision based on diagnosis
+        proposed_action = self._heuristic_fallback(state)
+
+        # Run guardrails
+        approved_action, checks = self.guardrail_engine.validate_action(case, proposed_action, profile)
 
         verdict = "pass"
         if approved_action != proposed_action:
@@ -600,10 +595,11 @@ class RevenueLossEnvironment:
         # Store trajectory step for benchmarking
         if not hasattr(self, "trajectory"):
             self.trajectory = []
+        diagnosis = case.diagnosis
         self.trajectory.append({
             "step": state.attempt_count,
-            "diagnosis": diagnosis.root_cause.value,
-            "diagnosis_confidence": diagnosis.confidence,
+            "diagnosis": diagnosis.root_cause.value if diagnosis else "unknown",
+            "diagnosis_confidence": diagnosis.confidence if diagnosis else 0.0,
             "proposed_action": proposed_action.value,
             "approved_action": approved_action.value,
             "verdict": verdict,

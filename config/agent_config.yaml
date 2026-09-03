@@ -1,0 +1,64 @@
+# Recovery Agent Configuration
+# NVIDIA NeMo: "configuration-driven workflows"
+# MANDATE 1: pydantic-settings for validation, YAML for external config
+
+# ── LLM Configuration ──
+llm:
+  base_url: "http://localhost:20128/v1"
+  model: "antigravity/gemini-2.5-flash"
+  api_key: "dummy"
+  temperature: 0
+  max_tokens: 2048
+  timeout: 25
+  # Multi-model routing (CrewAI pattern)
+  model_routes:
+    self_critique: null  # null = use primary model
+    planning: null
+    diagnosis: null
+
+# ── Governance ──
+governance:
+  agent_version: "2.0.0"
+  escalation_threshold_paise: 5000000  # ₹50,000
+  approval_threshold_paise: 5000000
+
+# ── Tier Policies ──
+tiers:
+  silent:
+    max_communications_per_day: 2
+    allow_financial_tools: false
+    require_approval_above_paise: 0
+    allowed_failure_categories: ["transient"]
+    can_escalate: false
+  active:
+    max_communications_per_day: 3
+    allow_financial_tools: false
+    require_approval_above_paise: 5000000
+    allowed_failure_categories: ["transient", "permanent", "unknown"]
+    can_escalate: true
+  escalated:
+    max_communications_per_day: 5
+    allow_financial_tools: true
+    require_approval_above_paise: 10000000
+    allowed_failure_categories: ["transient", "permanent", "unknown"]
+    can_escalate: true
+
+# ── Guardrails ──
+guardrails:
+  quiet_hours_start: 21  # 9 PM IST
+  quiet_hours_end: 8     # 8 AM IST
+  max_retries_per_day: 3
+  monetary_cap_paise: 100000000  # ₹10,00,000
+
+# ── Memory ──
+memory:
+  namespace: ["recovery", "{customer_id}"]
+  episode_store: true
+  vector_search: true
+
+# ── Observability ──
+observability:
+  phoenix_endpoint: "http://localhost:6006/v1/traces"
+  enabled: true
+  log_tool_calls: true
+  log_pii_masked: true

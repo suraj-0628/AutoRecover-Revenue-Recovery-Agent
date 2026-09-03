@@ -23,6 +23,8 @@ from flask_socketio import SocketIO
 
 from recovery_agent.razorpay_client import RazorpayClient
 from recovery_agent.state_store import StateStore
+import json
+from langchain_core.messages import AIMessage, ToolMessage
 
 # ── HITL Approval Gate for Voice Calls ──
 # When agent decides VOICE_CALL, it blocks here until merchant approves or 60s timeout.
@@ -46,11 +48,11 @@ def _get_tracer():
         exporter = OTLPSpanExporter(endpoint="http://localhost:6006/v1/traces")
         provider.add_span_processor(SimpleSpanProcessor(exporter))
         trace.set_tracer_provider(provider)
-        _otel_tracer = trace.get_tracer("recovery-agent-frontend")
+        _otel_tracer = trace.get_tracer("recovery-agent")
     except Exception:
         # Graceful degradation — spans become no-ops
         from opentelemetry import trace
-        _otel_tracer = trace.get_tracer("recovery-agent-frontend")
+        _otel_tracer = trace.get_tracer("recovery-agent")
     return _otel_tracer
 
 app = Flask(__name__)
@@ -59,6 +61,418 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 razorpay_client = RazorpayClient()
 store = StateStore()
+
+def _do_flush():
+    """Persist current state to disk."""
+    try:
+        store.flush()
+    except Exception:
+        pass
+
+
+def _emit_status_summary():
+    """Emit current payment summary to connected clients."""
+    try:
+        all_p = store.all_payments()
+        total = len(all_p)
+        recovered = sum(1 for p in all_p.values() if p.get("status") == "recovered")
+        socketio.emit("status_summary", {
+            "total": total,
+            "recovered": recovered,
+            "recovery_rate": f"{(recovered/total*100):.1f}%" if total else "0%",
+        })
+    except Exception:
+        pass
+
+
+def _watch_for_recovery(payment_id: str, max_wait_seconds: int = 300):
+    """Poll Razorpay for payment capture. Belt to webhook's suspenders.
+
+    Two-pronged polling:
+    1. Check if webhook already updated the store (fast path)
+    2. Fetch the payment link from Razorpay to see if it's been paid
+    3. Fetch recent payments to find one with original_payment note match
+    """
+    import time
+    from recovery_agent.razorpay_client import RazorpayClient
+
+    client = RazorpayClient()
+    if not client.is_configured:
+        return
+
+    start_ts = time.time()
+    while time.time() - start_ts < max_wait_seconds:
+        time.sleep(15)
+        try:
+            # Fast path: check if webhook already handled it
+            if store.has_payment(payment_id):
+                p = store.get_payment(payment_id)
+                if p.get("status") == "recovered":
+                    return
+
+            # Strategy 1: Fetch payment link by link_id stored in order_id
+            p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
+            link_id = p.get("order_id", "")
+            if link_id and link_id.startswith("plink_"):
+                try:
+                    link_data = client.client.payment_link.fetch(link_id)
+                    link_status = link_data.get("status", "")
+                    if link_status == "paid":
+                        # Extract payment details from the link
+                        payments = link_data.get("payments", [])
+                        for pay in payments:
+                            if pay.get("status") == "captured":
+                                # Razorpay returns `payment_id` on a link's
+                                # payments, not `id`. Reading the wrong key left
+                                # the recovery payment unrecorded — the trail
+                                # literally logged "Payment: ." — so nothing
+                                # linked the money that came in to the case it
+                                # came in for.
+                                _mark_recovered(
+                                    payment_id, pay.get("amount", 0) / 100,
+                                    pay.get("payment_id") or pay.get("id", ""),
+                                    int(time.time() - start_ts),
+                                    f"link {link_id} paid (poll)",
+                                )
+                                return
+                except Exception as e:
+                    pass  # Payment link fetch failed, try next strategy
+
+            # Strategy 2: the ORIGINAL checkout order. When the agent's push has
+            # no link, its CTA reopens Razorpay on the page against this order —
+            # so this is the object that actually gets paid on the commonest
+            # recovery path of all, and nothing here used to look at it.
+            order_id = p.get("original_order_id") or p.get("order_id") or ""
+            if order_id.startswith("order_"):
+                try:
+                    od = client.client.order.fetch(order_id)
+                    if od.get("status") == "paid":
+                        for pay in client.client.order.payments(order_id).get("items", []):
+                            if pay.get("status") == "captured":
+                                _mark_recovered(
+                                    payment_id, pay.get("amount", 0) / 100,
+                                    pay.get("id", ""), int(time.time() - start_ts),
+                                    f"order {order_id} paid (poll)",
+                                )
+                                return
+                except Exception:
+                    pass
+
+            # Strategy 3: Fetch the original payment — maybe it was captured directly
+            try:
+                payment = client.client.payment.fetch(payment_id)
+                if payment.get("status") == "captured":
+                    # This branch used to update the store and return WITHOUT
+                    # calling _notify_agent_of_recovery, so a case recovered this
+                    # way went quiet: recorded as paid, agent never told, nothing
+                    # learned from it.
+                    _mark_recovered(payment_id, payment.get("amount", 0) / 100,
+                                    payment_id, int(time.time() - start_ts),
+                                    "original payment captured (poll)")
+                    return
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+    # The customer has not paid. Deciding what happens next is the agent's job,
+    # not this poller's — it used to emit "customer may need follow-up" and stop,
+    # which quietly ended every unrecovered case. Hand the situation back to the
+    # agent with what actually happened and let it choose: another channel, a
+    # voice call, a scheduled retry, or escalation.
+    push_event(payment_id, "recovery_timeout", {
+        "detail": f"Payment not captured after {max_wait_seconds}s. Handing back to the agent.",
+    })
+
+    p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
+    prior = p.get("last_action", "a recovery message")
+    minutes = max(1, max_wait_seconds // 60)
+    _handoff_to_agent(
+        payment_id,
+        f"No payment after {minutes} minute(s). A previous recovery attempt "
+        f"({prior}) was delivered and the customer has not paid. Reason about why, "
+        f"then choose the next channel — do not repeat one that already failed.",
+        scenario="followup",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# IN-PAGE PUSH — the silent first rung of the recovery ladder
+# ═══════════════════════════════════════════════════════════════
+#
+# Cheapest possible nudge: the customer is still on the checkout, so talk to
+# them there. No email, no SMS, no incentive. Whatever they do with it — act,
+# dismiss, or ignore — comes back to the agent as a signal about their intent,
+# and the agent decides the next channel from that.
+
+
+def deliver_page_push(payload: dict) -> dict:
+    """Emit an agent-authored push to the customer's open checkout page."""
+    payment_id = payload.get("payment_id", "")
+    if not payment_id:
+        return {"status": "error", "note": "no payment_id"}
+
+    if store.has_payment(payment_id):
+        store.update_payment(
+            payment_id,
+            pending_push={**payload, "sent_at": datetime.now(timezone.utc).isoformat()},
+            push_outcome=None,
+        )
+        store.flush()
+
+    socketio.emit("agent_push", payload)
+    push_event(payment_id, "page_push", {
+        "detail": payload.get("headline", ""), "body": payload.get("body", ""),
+    })
+
+    socketio.start_background_task(
+        _watch_push_response, payment_id, int(payload.get("wait_minutes", 5)) * 60
+    )
+    return {"status": "delivered",
+            "note": f"waiting up to {payload.get('wait_minutes', 5)} min for a response"}
+
+
+def _watch_push_response(payment_id: str, timeout_seconds: int) -> None:
+    """If the customer neither acts nor dismisses, that silence is itself a signal."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        socketio.sleep(3)
+        p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
+        if p.get("push_outcome"):
+            return                      # /api/push-response already handled it
+        if p.get("status") in ("recovered", "escalated"):
+            return
+
+    _record_push_outcome(payment_id, "ignored", seconds_shown=timeout_seconds,
+                         detail="Customer left the notification on screen without acting.")
+
+
+def _record_push_outcome(payment_id: str, action: str, seconds_shown: float = 0.0,
+                         detail: str = "") -> None:
+    """Store what the customer did, then let the agent interpret it."""
+    if not store.has_payment(payment_id):
+        return
+    p = store.get_payment(payment_id)
+    prior = p.get("push_outcome") or {}
+    if prior and prior.get("action") != "superseded":
+        return                          # first real outcome wins; never double-handle
+
+    push = p.get("pending_push") or {}
+    outcome = {
+        "action": action,                       # acted | dismissed | ignored
+        "seconds_shown": round(float(seconds_shown or 0), 1),
+        "headline": push.get("headline", ""),
+        "offer_text": push.get("offer_text", ""),
+        "detail": detail,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    store.update_payment(payment_id, push_outcome=outcome)
+    store.flush()
+    push_event(payment_id, "push_outcome", outcome)
+
+    if action == "acted":
+        # This used to just return, on the belief that "the recovery watcher has
+        # it". For a plain push nothing was watching: `_watch_for_recovery` is
+        # only started when a payment LINK is sent. So the one path the customer
+        # is most likely to take — tap the first notification, pay inline — had
+        # no observer at all. Start one now. The browser also reports success
+        # directly; this is the belt for when the tab is closed first.
+        socketio.start_background_task(_watch_for_recovery, payment_id, 420)
+        return
+
+    if action == "superseded":
+        # The agent replaced its own message. That is not the customer telling us
+        # anything, so it is recorded but must not trigger another hand-off —
+        # doing so would have the agent react to itself.
+        return
+
+    # Hand the observation to the agent. Deliberately NOT interpreted here — the
+    # agent is told what the customer did and reasons about why, and about which
+    # channel that implies. Encoding "dismissed => send email" in this function
+    # would be putting the judgement back in the plumbing.
+    _handoff_to_agent(
+        payment_id,
+        f"In-page notification outcome: the customer {action.upper()} it after "
+        f"{outcome['seconds_shown']:.0f}s. Shown: {push.get('headline','(none)')!r}"
+        + (f" with offer {push.get('offer_text')!r}" if push.get("offer_text") else " with no offer")
+        + f". {detail} Work out what that behaviour implies about their intent, "
+          f"then choose the channel most likely to recover this payment. Do not "
+          f"repeat a channel that has already failed.",
+        scenario="push_followup",
+    )
+
+
+def _link_original_order_to_recovery(payment_id: str, recovery_payment_id: str) -> None:
+    """Annotate the original checkout order with where the money actually arrived.
+
+    A discounted recovery MUST be a separate object — Razorpay refuses to change
+    an order's amount ("amount is/are not required and should not be sent"), and
+    the same holds for payment links. So two objects always exist, and the
+    original will read unpaid in the dashboard forever, because it genuinely was.
+
+    Notes ARE editable on an order, so the two are cross-referenced: the recovery
+    link carries the original payment id, and the original order now carries the
+    recovery payment id. Anyone opening either one in Razorpay can see the other.
+    """
+    p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
+    original_order = p.get("original_order_id") or ""
+    if not original_order.startswith("order_") or not razorpay_client.is_configured:
+        return
+    try:
+        razorpay_client.client.order.edit(original_order, {"notes": {
+            "recovered_by_payment": recovery_payment_id or "",
+            "recovered_amount": str(p.get("recovered_amount") or ""),
+            "recovery_case": payment_id,
+            "note": "not paid directly; recovered via the recovery agent",
+        }})
+        print(f"[Frontend] linked {original_order} -> {recovery_payment_id}", flush=True)
+    except Exception as exc:
+        print(f"[Frontend] could not annotate {original_order}: {exc}", flush=True)
+
+
+def _notify_agent_of_recovery(payment_id: str, amount: float, recovery_payment_id: str,
+                              seconds: int) -> None:
+    """Tell the agent it worked.
+
+    The poller was updating the store and returning, so the case read
+    `recovered` while the agent never learned the outcome. It could not confirm
+    to the customer, and — worse — it never recorded *what worked*. The offer
+    that actually recovered the money is the single most valuable thing a
+    recovery agent can learn, and it was being thrown away on every success.
+    """
+    p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
+    what = p.get("last_action", "a recovery attempt")
+    offer = (p.get("ui_spec") or {}).get("offer") or {}
+    offer_note = (f" after a {offer.get('discount_pct')}% offer"
+                  if offer.get("discount_pct") else "")
+
+    _link_original_order_to_recovery(payment_id, recovery_payment_id)
+
+    _handoff_to_agent(
+        payment_id,
+        f"RECOVERED. The customer paid INR {amount:,.2f} "
+        f"({recovery_payment_id or 'payment id unavailable'}) {seconds}s after "
+        f"{what}{offer_note}. The money is back — do NOT attempt any further "
+        f"recovery, do NOT contact the customer again. Record with manage_memory "
+        f"what worked and why, so the next case for this customer starts from it, "
+        f"then stop.",
+        scenario="recovered",
+    )
+
+
+def _mark_recovered(payment_id: str, amount: float, rzp_payment_id: str,
+                    seconds: int, how: str) -> bool:
+    """Single place where a case becomes RECOVERED.
+
+    Every route that can learn the money arrived — the link poller, the original
+    order poller, the browser reporting its own checkout success — has to do the
+    same four things: write the store, tell the dashboard, cross-reference the
+    order in Razorpay, and tell the agent. They were each doing a different
+    subset of that, which is how a captured payment could sit in Razorpay while
+    the case still read `awaiting_customer`.
+
+    Returns False if the case was already recovered, so a poller and a browser
+    callback racing on the same payment cannot double-count it.
+    """
+    if not store.has_payment(payment_id):
+        return False
+    sp = store.get_payment(payment_id)
+    if sp.get("status") == "recovered":
+        return False
+    sp["status"] = "recovered"
+    sp["recovered_amount"] = amount
+    sp["recovered_payment_id"] = rzp_payment_id
+    sp.setdefault("trail", []).append({
+        "step": "recovery_confirmed",
+        "msg": f"Payment captured: INR {amount:,.2f}",
+        "detail": f"{how}. Payment {rzp_payment_id}. After {seconds}s",
+        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+    })
+    store.flush()
+    push_event(payment_id, "recovery_confirmed", {
+        "status": "recovered", "payment_id": payment_id, "amount": amount,
+        "captured_payment_id": rzp_payment_id, "detail": f"{how} after {seconds}s",
+    })
+    socketio.emit("agent_event", {"payment_id": payment_id, "event": "complete",
+                                  "status": "recovered"})
+    _notify_agent_of_recovery(payment_id, amount, rzp_payment_id, seconds)
+    return True
+
+
+def _handoff_to_agent(payment_id: str, observation: str, scenario: str) -> None:
+    """Re-invoke the agent on an existing case with something new that happened."""
+    p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
+    # A recovered case still gets exactly one closing run — that is the whole
+    # point of telling the agent it worked.
+    if scenario != "recovered" and p.get("status") in ("recovered", "escalated"):
+        return
+    if p.get(f"handoff_{scenario}"):
+        return                          # one hand-off per kind, never a loop
+    store.update_payment(payment_id, **{f"handoff_{scenario}": True})
+    store.flush()
+
+    customer = {k: v for k, v in (p.get("customer") or {}).items() if v} or {
+        k: v for k, v in {
+            "email": p.get("customer_email", ""),
+            "name": p.get("customer_name", ""),
+            "contact": p.get("customer_phone", ""),
+        }.items() if v
+    }
+    if not customer.get("email") and not customer.get("contact"):
+        # Better to stop than to let the agent invent a recipient.
+        push_event(payment_id, "handoff_blocked", {
+            "detail": "no customer contact on file — cannot follow up",
+        })
+        return
+
+    socketio.start_background_task(
+        run_agent_for_payment, payment_id, float(p.get("amount", 0) or 0),
+        observation, customer, scenario,
+        p.get("decline_strategy", "") or "no_response",
+    )
+
+
+# Register with the neutral bus so tools reach *this* Socket.IO server. Importing
+# this module by name from a tool would load a second copy (see push_bus).
+from recovery_agent import push_bus as _push_bus
+_push_bus.register_delivery(deliver_page_push)
+
+
+@app.route("/api/escalations", methods=["GET"])
+def api_escalations():
+    """The batch a human works. Open by default."""
+    from recovery_agent.escalation_queue import list_tickets, summary
+    status = request.args.get("status", "open") or None
+    return jsonify({"summary": summary(), "tickets": list_tickets(status=status)})
+
+
+@app.route("/api/escalations/<ticket_id>/resolve", methods=["POST"])
+def api_resolve_escalation(ticket_id: str):
+    from recovery_agent.escalation_queue import resolve
+    data = request.get_json(silent=True) or {}
+    closed = resolve(ticket_id, outcome=str(data.get("outcome") or ""),
+                     by=str(data.get("by") or "human"))
+    if closed is None:
+        return jsonify({"error": "no such ticket"}), 404
+    return jsonify(closed)
+
+
+@app.route("/api/push-response", methods=["POST"])
+def push_response():
+    """The checkout page reports what the customer did with the notification."""
+    data = request.get_json(silent=True) or {}
+    payment_id = str(data.get("payment_id") or "")
+    action = str(data.get("action") or "").lower()
+    if not payment_id or action not in ("acted", "dismissed", "superseded"):
+        return jsonify({
+            "error": "payment_id and action (acted|dismissed|superseded) required"
+        }), 400
+    _record_push_outcome(payment_id, action,
+                         seconds_shown=data.get("seconds_shown", 0),
+                         detail=str(data.get("detail") or ""))
+    return jsonify({"status": "recorded", "action": action})
+
 
 # Transient — only tracks in-flight agent threads, not persisted
 active_agent_payments: set[str] = set()
@@ -194,19 +608,35 @@ def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, c
         active_agent_payments.discard(payment_id)
 
 
+def _parse_tool_result(content) -> dict:
+    """Parse a ToolMessage body into a dict.
+
+    `mask_tool_outputs_node` prepends a "[TOOL ERROR] ..." line to failures, so a
+    plain `startswith("{")` check treated every failed tool result as unparseable
+    raw text and the reason was lost.
+    """
+    text = str(content or "")
+    start = text.find("{")
+    if start >= 0:
+        try:
+            return json.loads(text[start:])
+        except (ValueError, TypeError):
+            pass
+    return {"raw": text}
+
+
 def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason: str, customer: dict, scenario_type: str = "standard", failure_code: str = "", error_source: str = "", error_step: str = ""):
-    """Inner agent execution — wires real AgentHarness, Razorpay SDK, and retry scheduler."""
+    """Inner agent execution — wires real LangGraph ReAct agent, Razorpay SDK, and retry scheduler.
+
+    The agent uses LLM reasoning to decide which tools to call at each step.
+    """
+    import json
     import uuid
-    from recovery_agent.agent.diagnosis import run_diagnosis
-    from recovery_agent.agent.decision import run_decision
-    from recovery_agent.agent.execution import execute_action, observe_outcome
     from recovery_agent.agent.guardrails import GuardrailEngine
-    from recovery_agent.agent.harness import AgentHarness
-    from recovery_agent.agent.kg_router import RazorpayKnowledgeGraph
     from recovery_agent.agent.memory import CustomerMemoryStore
-    from recovery_agent.agent.llm_client import invoke_llm_json
-    from recovery_agent.agent.tools import execute_tool
-    from recovery_agent.models import Case, PaymentEvent, ActionType, GenerativeUISpec
+
+
+    from recovery_agent.models import Case, CaseStatus, PaymentEvent, GenerativeUISpec
     from recovery_agent.retry_scheduler import get_retry_windows, get_next_retry_time
 
     tracer = _get_tracer()
@@ -227,12 +657,32 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
     with tracer.start_as_current_span("agent_recovery", attributes=parent_attrs) as parent_span:
       memory_store = CustomerMemoryStore()
       guardrail_engine = GuardrailEngine()
-      kg_router = RazorpayKnowledgeGraph()
 
       customer_email = customer.get("email", "")
       cust_profile = memory_store.get_or_create_profile(customer_email)
 
-      trail = []
+      # Persist who the customer is. The dict is handed to this run as an
+      # argument and was never stored, so any later hand-off (push dismissed,
+      # payment timeout) rebuilt an empty one and the agent invented a
+      # placeholder — the follow-up email with the discount was addressed to
+      # "customer@email.com" and reached nobody.
+      if customer and store.has_payment(payment_id):
+          store.update_payment(
+              payment_id,
+              customer={k: v for k, v in customer.items() if v},
+              customer_email=customer_email,
+              customer_name=customer.get("name", ""),
+              customer_phone=customer.get("contact") or customer.get("phone", ""),
+          )
+          store.flush()
+
+      # A case is a story told across several runs — push, then email, then the
+      # confirmation that the money arrived. Starting this empty made every
+      # hand-off erase everything before it: the run that closes a recovery
+      # deleted the `recovery_confirmed` entry that started it, and the HUD
+      # showed only the last rung of a ladder the agent had climbed.
+      trail = list((store.get_payment(payment_id) or {}).get("trail") or []) \
+          if store.has_payment(payment_id) else []
 
       def emit_thought(step: str, thought: str, detail: str = "", tool_call: dict = None, guardrail: dict = None, memory: dict = None, ui_morph: str = None, ui_spec: dict = None):
           entry = {
@@ -252,238 +702,303 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
               store.get_payment(payment_id)["trail"] = list(trail)
           push_event(payment_id, step, entry)
 
-      from recovery_agent.razorpay_knowledge_base import normalize_razorpay_failure
-      from recovery_agent.agent.decline_router import DeclineCodeRouter
-      from recovery_agent.agent.payday_scheduler import PaydayScheduler
+      # ── INITIALIZE CASE ──
+      with tracer.start_as_current_span("init_case") as init_span:
+        raw_reason = failure_reason or "Payment failed during checkout"
+        norm = {}
+        try:
+            from recovery_agent.razorpay_knowledge_base import normalize_razorpay_failure
+            norm = normalize_razorpay_failure(raw_reason)
+        except Exception:
+            pass
 
-      decline_router = DeclineCodeRouter()
-      payday_scheduler = PaydayScheduler()
+        event = PaymentEvent(
+            payment_id=payment_id,
+            customer_id=customer_email,
+            amount=amount,
+            currency="INR",
+            failure_code=failure_code or norm.get("failure_code", "payment_failed"),
+            failure_reason=raw_reason,
+            metadata={
+                "customer_name": customer.get("name", ""),
+                "scenario": scenario_type,
+                "error_code": failure_code or norm.get("error_code", "BAD_REQUEST_ERROR"),
+                "error_source": error_source or norm.get("error_source", "gateway"),
+                "error_step": error_step or norm.get("error_step", "payment_authorization"),
+                "error_description": raw_reason,
+                "recommended_rail": norm.get("recommended_rail", "payment_link"),
+                "customer_profile": cust_profile.model_dump(),
+                # What the customer already did, so the agent reasons with it and
+                # any escalation ticket carries it.
+                **({"push_outcome": (store.get_payment(payment_id) or {}).get("push_outcome")}
+                   if store.has_payment(payment_id)
+                   and (store.get_payment(payment_id) or {}).get("push_outcome") else {}),
+                "customer_email": customer.get("email", ""),
+                "customer_name": customer.get("name", ""),
+                "customer_phone": customer.get("contact") or customer.get("phone", ""),
+            },
+        )
+        case = Case(payment=event, max_attempts=3)
 
-      raw_reason = failure_reason or "Payment failed during checkout"
-      norm = normalize_razorpay_failure(raw_reason)
+        # Carry the case's real state into the fresh Case object. A new Case is
+        # built on every run and defaults to OPEN, so a recovered case arrived at
+        # the agent looking brand new — and the terminal-tool guard, which is what
+        # stops it re-contacting a customer who has already paid, never fired.
+        _prior = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
+        _status_map = {
+            "recovered": CaseStatus.RECOVERED,
+            "escalated": CaseStatus.ESCALATED,
+            "failed": CaseStatus.STOPPED,
+            "stopped": CaseStatus.STOPPED,
+        }
+        if _prior.get("status") in _status_map:
+            case.status = _status_map[_prior["status"]]
+        if _prior.get("status") == "recovered" or float(_prior.get("recovered_amount") or 0) > 0:
+            case.recovered = True
+            case.recovered_amount = float(_prior.get("recovered_amount") or 0)
 
-      event = PaymentEvent(
-          payment_id=payment_id,
-          customer_id=customer_email,
-          amount=amount,
-          currency="INR",
-          failure_code=failure_code or norm.get("failure_code", "payment_failed"),
-          failure_reason=raw_reason,
-          metadata={
-              "customer_name": customer.get("name", ""),
-              "scenario": scenario_type,
-              "error_code": failure_code or norm.get("error_code", "BAD_REQUEST_ERROR"),
-              "error_source": error_source or norm.get("error_source", "gateway"),
-              "error_step": error_step or norm.get("error_step", "payment_authorization"),
-              "error_description": raw_reason,
-              "recommended_rail": norm.get("recommended_rail", "payment_link"),
-          },
-      )
-      case = Case(payment=event, max_attempts=3)
+        if scenario_type == "followup":
+            # The customer has already been contacted, so this case is past the
+            # silent tier by definition — and the active tier is what unlocks the
+            # customer-facing channels a follow-up needs.
+            from recovery_agent.models import RecoveryTier
+            case.recovery_tier = RecoveryTier.ACTIVE
+        init_span.set_attribute("failure_code", case.payment.failure_code)
+        init_span.set_attribute("amount", amount)
 
-      # ── 1. DETECT ──
-      with tracer.start_as_current_span("detect") as detect_span:
-        detect_span.set_attribute("payment_id", payment_id)
-        detect_span.set_attribute("failure_reason", failure_reason)
         emit_thought(
-            step="detecting",
-            thought=f"Anomaly Detected on {payment_id}: {failure_reason}",
-            detail=f"Amount: INR {amount:,.2f} | Reason: {event.failure_reason}",
+            step="init",
+            thought=f"Case Initialized: {payment_id}",
+            detail=f"Amount: INR {amount:,.2f} | Reason: {raw_reason} | Customer: {customer_email}",
             memory={
                 "customer_id": customer_email,
                 "payday_window": cust_profile.salary_window.is_salary_due,
                 "promise_to_pay": cust_profile.promises[0].promised_date if cust_profile.promises else None,
-                "risk_score": 0.1,
             },
         )
 
-      # ── 2. DIAGNOSE (real LLM diagnosis) ──
-      with tracer.start_as_current_span("diagnose") as diag_span:
-        emit_thought(
-            step="diagnosing",
-            thought="Initiating LLM Diagnostic Reflection Engine",
-            detail="Nemotron analyzing raw failure payload, customer history, bank health signals",
-        )
-        case = run_diagnosis(case)
-        cause = case.diagnosis.root_cause.value if case.diagnosis else "unknown"
-        confidence = case.diagnosis.confidence if case.diagnosis else 0.7
-        diag_span.set_attribute("root_cause", cause)
-        diag_span.set_attribute("confidence", confidence)
+      # ── RUN LANGGRAPH REACT AGENT ──
+      with tracer.start_as_current_span("graph_execution") as graph_span:
+        from recovery_agent.agent import RecoveryAgent
+        from recovery_agent.agent.graph import build_initial_state, RecoveryContext
+        
+        agent = RecoveryAgent(guardrail_engine=guardrail_engine)
+        
+        initial_state = build_initial_state(case)
 
-        # Extract RAG groundedness from diagnosis reasoning if present
-        groundedness = 0.0
-        rag_evidence = ""
-        if case.diagnosis and "RAG Grounded" in case.diagnosis.reasoning:
-            import re as _re
-            grounded_match = _re.search(r"groundedness=([0-9.]+)", case.diagnosis.reasoning)
-            if grounded_match:
-                groundedness = float(grounded_match.group(1))
-            rag_evidence = "Grounded via LlamaIndex RAG"
+        # Pass emit_thought as callback for real-time graph progress
+        def graph_emit(step, msg, detail=""):
+            emit_thought(step=step, thought=msg, detail=detail)
+
+        context = RecoveryContext(
+            guardrail_engine=agent.guardrails,
+            case=case,
+        )
+
+        from recovery_agent.agent.tools import ns_safe
+        config = {
+            "configurable": {
+                # One session per PAYMENT, not per run.
+                #
+                # This was `case.id`, and a fresh Case (new uuid) is built on
+                # every invocation — so a single payment ran as several unrelated
+                # sessions. pay_fw1l0oppo had three: the first attempt, the
+                # push-dismissed follow-up, and the closing run after payment.
+                # Each began with an empty thread and knew only what the frontend
+                # re-injected, like reopening the same file as a blank buffer.
+                #
+                # Keying on payment_id gives each payment one continuous session
+                # and guarantees two payments can never share one.
+                "thread_id": f"case:{payment_id}",
+                "payment_id": payment_id,
+                # Namespace label for langmem — periods are rejected.
+                "customer_id": ns_safe(customer_email),
+            },
+        }
+
+        emit_thought(
+            step="agent_start",
+            thought="Launching ReAct Agent — LLM will reason, call tools, and adapt",
+            detail=f"Loop: agent → tools → agent → ... → END",
+        )
 
         try:
-            recommended_rails = kg_router.discover_recovery_path(cause)
-        except Exception:
-            recommended_rails = ["payment_link", "upi_autopay"]
-
-        diag_reasoning = format_reasoning_newlines(case.diagnosis.reasoning) if case.diagnosis else "Analyzed gateway failure payload"
-
-        rag_detail = f" | RAG Groundedness: {groundedness:.0%}" if groundedness > 0 else ""
-
-        emit_thought(
-            step="diagnosed",
-            thought=f"Root Cause Confirmed: {cause.upper()} (Confidence: {confidence:.0%}{rag_detail})",
-            detail=f"Reasoning:\n{diag_reasoning}",
-            tool_call={
-                "tool": "RazorpayKnowledgeGraph.discover_recovery_path",
-                "args": {"failure_code": cause, "current_rail": "card"},
-                "raw_razorpay_response": {"target_rail": recommended_rails[0] if recommended_rails else "payment_link"},
-            },
-        )
-
-      # ── 3. DECIDE (real LLM strategy planner + guardrails) ──
-      with tracer.start_as_current_span("decide") as decide_span:
-        emit_thought(
-            step="deciding",
-            thought="Initiating LLM Strategy Planner",
-            detail="Querying strategy metrics and planning optimal recovery intervention",
-        )
-        case.attempt_count = 0
-        case = run_decision(case)
-        action_val = case.payment.metadata.get("decided_action", "send_notification")
-        action = ActionType(action_val)
-        strategy_source = case.payment.metadata.get("strategy_source", "unknown")
-        decide_span.set_attribute("action", action_val)
-        decide_span.set_attribute("strategy_source", strategy_source)
-
-        strategy_reasoning = format_reasoning_newlines(case.payment.metadata.get("strategy_reasoning", ""))
-        recovery_tier = case.payment.metadata.get("recovery_tier", "active")
-        failure_code_norm = norm.get("failure_code", cause)
-        decline_strategy = DECLINE_STRATEGY_DISPLAY.get(cause, "LLM Diagnostic Routing")
-        payday_info = payday_scheduler.get_payday_info(country_code="IN")
-        payday_target = payday_info.get("next_payday", "") if isinstance(payday_info, dict) else ""
-
-        push_tier_event(
-            payment_id,
-            tier=recovery_tier,
-            penalties_prevented=case.penalties_prevented,
-            decline_strategy=decline_strategy,
-            payday_target_date=payday_target,
-        )
-        push_decline_strategy_event(payment_id, failure_code_norm, decline_strategy, recovery_tier)
-
-        approved_action, check_results = guardrail_engine.validate_action(
-            case=case, action=action, profile=cust_profile,
-        )
-        is_allowed = (approved_action == action)
-        action_val = approved_action.value
-
-        # Build transparent guardrail header
-        if not is_allowed and check_results:
-            # Find which guardrail(s) triggered the modification/block
-            interceptors = []
-            for cr in check_results:
-                if cr.verdict.value in ("modified", "blocked"):
-                    interceptors.append(f"{cr.guardrail} ({cr.verdict.value})")
-            interceptor_str = " / ".join(interceptors) if interceptors else "Multiple Policies"
-            thought_str = f"NVIDIA NAT Guardrail INTERCEPTED: Proposed '{action.value.upper()}' ──► Modified to '{approved_action.value.upper()}' (Policy: {interceptor_str})"
-        else:
-            thought_str = f"LLM Strategy Planner selected intervention: {approved_action.value.upper()}"
-
-        # Build guardrail detail with per-policy breakdown
-        guardrail_detail_parts = []
-        for cr in check_results:
-            if cr.verdict.value == "pass":
-                guardrail_detail_parts.append(f"  ✅ {cr.guardrail}: PASS — {cr.reason}")
-            elif cr.verdict.value == "modified":
-                guardrail_detail_parts.append(f"  ⚠️ {cr.guardrail}: MODIFIED → {cr.modified_action} — {cr.reason}")
-            elif cr.verdict.value == "blocked":
-                guardrail_detail_parts.append(f"  🚫 {cr.guardrail}: BLOCKED — {cr.reason}")
-        guardrail_detail = "\n".join(guardrail_detail_parts) if guardrail_detail_parts else "All guardrails passed"
-
-        # Source badge: deterministic_fast_path | llm_strategy_planner | heuristic_fallback
-        source_label = {
-            "deterministic_fast_path": "⚡ Deterministic Fast-Path (0ms, no LLM)",
-            "llm_strategy_planner": "🧠 LLM Strategy Planner",
-            "heuristic_fallback": "📏 Heuristic Fallback",
-        }.get(strategy_source, f"❓ {strategy_source}")
-
-        emit_thought(
-            step="deciding",
-            thought=thought_str,
-            detail=f"Strategy Source: {source_label}\nGuardrail Policy Breakdown:\n{guardrail_detail}\nStrategic reasoning:\n{strategy_reasoning if strategy_reasoning else 'NVIDIA NAT Guardrails evaluated all 6 policies'}",
-            guardrail={
-                "allowed": is_allowed,
-                "quiet_hours_active": False,
-                "attempt_cap": f"{case.attempt_count + 1}/{case.max_attempts}",
-                "double_debit_lock": "SECURE",
-                "modified_action": approved_action.value if not is_allowed else None,
-                "recovery_tier": recovery_tier,
-                "decline_strategy": decline_strategy,
-                "penalties_prevented": case.penalties_prevented,
-                "payday_target": payday_target,
-                "strategy_source": strategy_source,
-            },
-        )
-
-      # ── 4. RUN REAL AGENT HARNESS (multi-turn ReAct reasoning + MCP tool calls) ──
-      with tracer.start_as_current_span("harness") as harness_span:
-        harness = AgentHarness(memory_store=memory_store, guardrail_engine=guardrail_engine)
-        emit_thought(
-            step="harness_start",
-            thought="Launching TrueForge AgentHarness — multi-turn ReAct reasoning loop",
-            detail=f"Tools: query_payment_recovery_kb (RAG), query_gateway_error_details, check_bank_health, calculate_payday_window, generate_smart_recovery_link, schedule_payday_retry, escalate_to_human_agent, initiate_voice_call",
-        )
-
-        harness_result = harness.run_recovery_case(case)
-        harness_span.set_attribute("harness_turns", harness_result.total_turns)
-        harness_span.set_attribute("tools_called", len(harness_result.tools_called))
-
-        # Stream each harness observation to WebSocket
-        for obs in harness_result.observations:
-            tools_detail = ""
-            tool_call_data = None
-            if obs.tool_calls:
-                tc = obs.tool_calls[0]
-                tool_call_data = {
-                    "tool": tc.tool,
-                    "args": tc.arguments,
-                    "raw_razorpay_response": tc.result,
-                    "is_error": tc.is_error,
-                }
-                tools_detail = f"Tool: {tc.tool} → {tc.result.get('status', 'unknown')}"
-                if tc.is_error:
-                    tools_detail += f" | Error: {tc.result.get('message', '')}"
-
+            all_messages = []
+            seen_events = set()
+            current_phase = "initializing"
+            for s in agent.graph.stream(initial_state, config=config, context=context, stream_mode="updates"):
+                if not s:
+                    continue
+                for node_name, state_update in s.items():
+                    if not state_update:
+                        continue
+                    # Track phase from graph state updates
+                    new_phase = state_update.get("phase")
+                    if new_phase and new_phase != current_phase:
+                        current_phase = new_phase
+                        push_event(payment_id, "phase_update", {
+                            "phase": current_phase,
+                            "node": node_name,
+                        })
+                    msgs = state_update.get("messages", [])
+                    all_messages.extend(msgs)
+                    for msg in msgs:
+                        # Only emit for AIMessage and ToolMessage — skip Human/System
+                        if not isinstance(msg, (AIMessage, ToolMessage)):
+                            continue
+                        # Dedup by content signature to handle copies from mask_outputs
+                        if isinstance(msg, AIMessage) and msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                sig = f"thinking:{tc['name']}:{json.dumps(tc['args'], default=str)[:100]}"
+                                if sig in seen_events:
+                                    continue
+                                seen_events.add(sig)
+                                emit_thought(
+                                    step="agent_thinking",
+                                    thought=f"[AGENT] Calling tool: {tc['name']}",
+                                    detail=f"Args: {json.dumps(tc['args'], default=str)[:200]}",
+                                )
+                        elif isinstance(msg, ToolMessage):
+                            sig = f"result:{msg.name}:{msg.tool_call_id}"
+                            if sig in seen_events:
+                                continue
+                            seen_events.add(sig)
+                            content = msg.content[:300] if msg.content else "(empty)"
+                            emit_thought(
+                                step="tool_result",
+                                thought=f"[TOOL] {msg.name}: {content}",
+                                detail="",
+                            )
+                        # LLM final response (AIMessage with content but NO tool_calls)
+                        elif isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+                            # One summary per case. The graph produces a final
+                            # response and then the self-critique node produces
+                            # another, and both arrived as "agent_summary" — so
+                            # every case showed two conclusions, often phrased
+                            # differently, with no way to tell which was current.
+                            sig = f"summary:{msg.content[:100]}"
+                            if seen_events.intersection({"summary_emitted"}):
+                                continue
+                            seen_events.add("summary_emitted")
+                            if sig not in seen_events:
+                                seen_events.add(sig)
+                                emit_thought(
+                                    step="agent_summary",
+                                    thought=f"[AGENT] {msg.content[:300]}",
+                                    detail="",
+                                )
+        except Exception as e:
+            # Graph error or LLM unavailable — surface the real error
+            print(f"[Frontend] Graph stream error for {payment_id}: {type(e).__name__}: {e}", flush=True)
+            import traceback as _tb; _tb.print_exc()
             emit_thought(
-                step="harness_turn",
-                thought=f"Harness Turn {obs.turn}: {obs.reasoning}",
-                detail=tools_detail,
-                tool_call=tool_call_data,
+                step="llm_unavailable",
+                thought="LLM UNAVAILABLE — Using Thompson bandit + heuristic fallback",
+                detail=f"Error: {e}. Agent will use empirical data for decisions.",
             )
+            store.update_payment(payment_id,
+                status="failed",
+                strategy_reasoning=str(e),
+                strategy_source="graph_error",
+                tier="ERROR",
+                ts=datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            )
+            _do_flush()
+            _emit_status_summary()
+            return {
+                "status": "failed",
+                "strategy_reasoning": str(e),
+                "tier": "ERROR",
+            }
 
-      # ── 5. WIRE REAL RAZORPAY SDK based on harness-executed tools ──
-      # The harness is the SINGLE execution path. It dispatches tools based on
-      # the strategy planner's decision. The frontend does NOT re-execute.
+      # ── EXTRACT RESULTS FROM REACT AGENT ──
       with tracer.start_as_current_span("act") as act_span:
-        action_val = case.payment.metadata.get("decided_action", action_val)
-        sdk_res = {}
-        tool_name_str = ""
+        cause = case.payment.failure_code or "unknown"
+        strategy_source = "react_agent"
+        recovery_tier = case.payment.metadata.get("recovery_tier", "active")
 
-        # Check what the harness actually executed
-        if harness_result.tools_called:
-            last_tool = harness_result.tools_called[-1]
-            tool_name_str = f"Tool.{last_tool}"
-            # Extract sdk_res from harness observations if available
-            for obs in reversed(harness_result.observations):
-                for tc in obs.tool_calls:
-                    if tc.tool == last_tool and not tc.is_error:
-                        sdk_res = tc.result
-                        break
-                if sdk_res:
-                    break
+        # Parse tool calls and results from the agent's message history.
+        #
+        # Results are matched by tool_call_id. The previous version assigned each
+        # result to the first tool that still had `result is None`, in dict
+        # insertion order — so with the 3-4 parallel tool calls this agent makes
+        # every turn, results landed on the wrong tools. The practical effect was
+        # that `generate_recovery_payment_link` carried some other tool's output,
+        # `sdk_res["link_url"]` was empty, `_watch_for_recovery` never started,
+        # and a customer who paid was never noticed.
+        calls_by_id: dict[str, dict] = {}
+        order: list[str] = []
+        for msg in all_messages:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc["id"] not in calls_by_id:
+                        calls_by_id[tc["id"]] = {"name": tc["name"], "args": tc["args"],
+                                                 "result": None}
+                        order.append(tc["id"])
+            elif isinstance(msg, ToolMessage):
+                entry = calls_by_id.get(getattr(msg, "tool_call_id", None))
+                if entry is not None:
+                    entry["result"] = _parse_tool_result(msg.content)
 
-        if action_val == "wait_and_retry":
-            # Wire real retry scheduler via daemon worker
+        # Downstream wants name -> {args, result}; keep the latest call per name,
+        # preferring one that actually produced a result.
+        tool_calls_made = {}
+        for cid in order:
+            entry = calls_by_id[cid]
+            prev = tool_calls_made.get(entry["name"])
+            if prev is None or entry["result"] is not None:
+                tool_calls_made[entry["name"]] = {"args": entry["args"],
+                                                  "result": entry["result"]}
+
+        # Determine the primary action, and the receipt that represents it.
+        #
+        # This used to walk the tool names in reverse and take the first match,
+        # so a run that created a link and *then* sent a notification picked the
+        # notification's result — which has no link_url. `order_id` came out
+        # empty and `_watch_for_recovery` never started, so a customer who paid
+        # was never noticed. Choose by meaning, not by call order, and always
+        # prefer the payment link as the receipt when one was created.
+        def _ok(name):
+            r = (tool_calls_made.get(name) or {}).get("result") or {}
+            return r if isinstance(r, dict) and r.get("status") in (
+                "ok", "scheduled", "delivered") else {}
+
+        push_res = _ok("send_page_push")
+        link_res = _ok("generate_recovery_payment_link")
+        retry_res = _ok("retry_in_hours") or _ok("schedule_retry")
+        notify_res = _ok("send_recovery_notification")
+        escalate_res = (tool_calls_made.get("escalate_to_human") or {}).get("result") or {}
+
+        if escalate_res:
+            action_val, sdk_res = "escalate_to_human", escalate_res
+        elif push_res and not (link_res or notify_res):
+            # A push on its own is the silent first rung. The case is waiting on
+            # the customer's response, not finished — treating it as "no action"
+            # marked the case escalated, which then blocked the follow-up
+            # hand-off when they dismissed it.
+            action_val, sdk_res = "page_push", push_res
+        elif link_res or notify_res:
+            # The link is what the customer acts on, so it is the receipt even
+            # when a notification was the last thing sent.
+            action_val, sdk_res = "send_notification", (link_res or notify_res)
+        elif retry_res:
+            action_val, sdk_res = "wait_and_retry", retry_res
+        else:
+            # No recovery action was taken this turn. That is NOT the same as
+            # giving up: the closing run after a successful payment calls only
+            # manage_memory, and this branch used to read that as
+            # "escalate_to_human" — so a case that had just recovered INR 47,481
+            # was filed as a ticket asking a human to chase the customer for
+            # non-payment. A fallback should be the least consequential option
+            # available, never the most severe one.
+            action_val, sdk_res = "none", {}
+
+        tool_name_str = list(tool_calls_made.keys())[-1] if tool_calls_made else "agent"
+        act_span.set_attribute("action", action_val)
+        act_span.set_attribute("strategy_source", strategy_source)
+
+        # ── WAIT_AND_RETRY: Register background job ──
+        if action_val == "wait_and_retry" and sdk_res.get("status") == "scheduled":
             from recovery_agent.models import FailureType
             from recovery_agent.daemon_worker import register_retry_job
             try:
@@ -494,9 +1009,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             next_time = get_next_retry_time(ft, case.attempt_count)
             best_window = windows[0] if windows else None
 
-            target_ts = (next_time or datetime.now(timezone.utc)).isoformat()
-
-            # Register real background retry job with daemon worker
+            target_ts = sdk_res.get("target_timestamp") or (next_time or datetime.now(timezone.utc)).isoformat()
             registered_job = register_retry_job(
                 payment_id=payment_id,
                 amount=amount,
@@ -507,73 +1020,60 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                 reason=best_window.reason if best_window else "Scheduled retry",
                 confidence=best_window.confidence if best_window else 0.5,
             )
-
             sdk_res = registered_job
             tool_name_str = "DaemonWorker.register_retry_job"
 
-            # Store scheduled job
             if not store.has_payment(payment_id):
                 store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "scheduled", "trail": [], "attempts": 0})
             p = store.get_payment(payment_id)
             p["scheduled_job"] = registered_job
             p["status"] = "scheduled"
 
-            # Emit scheduled job event
             socketio.emit("scheduled_job", {
                 "payment_id": payment_id,
                 **registered_job,
                 "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             })
-        elif not sdk_res and action_val != "wait_and_retry":
-            # Harness didn't execute a tool — fallback to direct execution
-            # This is a safety net; ideally the harness always executes the right tool
-            fallback_dispatch = {
-                "retry_payment": ("generate_smart_recovery_link", {"payment_id": payment_id, "allowed_rails": recommended_rails or ["upi", "card", "netbanking"]}),
-                "update_payment_method": ("generate_smart_recovery_link", {"payment_id": payment_id, "allowed_rails": ["card", "upi"]}),
-                "send_notification": ("generate_smart_recovery_link", {"payment_id": payment_id, "allowed_rails": ["upi", "card", "netbanking"]}),
-                "escalate_to_human": ("escalate_to_human_agent", {"payment_id": payment_id, "reason": f"Harness did not execute tool after {harness_result.total_turns} turns"}),
-            }
-            if action_val in fallback_dispatch:
-                tool_name, tool_args = fallback_dispatch[action_val]
-                sdk_res = execute_tool(tool_name, tool_args)
-                tool_name_str = f"Tool.{tool_name} (fallback)"
 
-        act_span.set_attribute("action", action_val)
-        act_span.set_attribute("tool_name", tool_name_str)
+        # ── GENERATE UI SPEC FROM AGENT'S FINAL RESPONSE ──
+        # MANDATE 0: No separate LLM call. Parse the agent's own response for UI context.
+        agent_final_text = ""
+        for msg in reversed(all_messages):
+            if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+                agent_final_text = msg.content
+                break
 
+        from recovery_agent.models import GenerativeUISpec
+        ui_type_map = {
+            "card_expired": "CARD_EXPIRY_FIXER",
+            "network_timeout": "SMART_FAILOVER_BANNER",
+            "bank_declined": "BANK_DECLINED_RECOVERY",
+            "insufficient_funds": "INSUFFICIENT_FUNDS_SCHEDULER",
+            "mandate_revoked": "MANDATE_REAUTH_MODAL",
+            "risk_block": "RISK_VERIFICATION_FLOW",
+        }
+        ui_spec_dict = GenerativeUISpec(
+            ui_type=ui_type_map.get(cause, "PAYMENT_LINK_MODAL"),
+            headline=agent_final_text[:120] if agent_final_text else f"Payment of INR {amount:,.2f} needs attention",
+            subtext=f"Recovery strategy: {action_val.replace('_', ' ').title()}",
+            primary_cta_text="Complete Payment" if action_val != "escalate_to_human" else "Contact Support",
+            discount_incentive="",
+            target_rail=case.payment.metadata.get("recommended_rail", "payment_link"),
+            hinglish_voice_script=f"Namaste {customer.get('name', '')} ji! Aapka payment fail ho gaya hai. Hum aapki help karenge.",
+            tone="supportive",
+        )
         emit_thought(
-            step="acting",
-            thought="Generating Dynamic Customer UI Spec",
-            detail="Morphing the frontend checkout experience based on the harness decision",
+            step="ui_spec",
+            thought=f"UI Spec: {ui_spec_dict.ui_type} ({ui_spec_dict.tone} tone)",
+            detail=f"Headline: {ui_spec_dict.headline}",
+            ui_morph=ui_spec_dict.ui_type,
+            ui_spec=ui_spec_dict.model_dump(),
         )
 
-        # Generate UI spec — own child span + emit_thought for visibility
-        with tracer.start_as_current_span("generate_ui_spec") as uispec_span:
-            ui_spec_dict = _generate_ui_spec(
-                llm_fn=invoke_llm_json,
-                cause=cause,
-                amount=amount,
-                failure_reason=failure_reason,
-                recommended_rail=recommended_rails[0] if recommended_rails else "payment_link",
-                customer_name=customer.get("name", ""),
-                action=action_val,
-                scenario_type=scenario_type,
-            )
-            uispec_span.set_attribute("ui_type", ui_spec_dict.ui_type)
-            uispec_span.set_attribute("tone", ui_spec_dict.tone)
-            emit_thought(
-                step="ui_spec",
-                thought=f"UI Spec Generated: {ui_spec_dict.ui_type} ({ui_spec_dict.tone} tone)",
-                detail=f"Headline: {ui_spec_dict.headline}\nCTA: {ui_spec_dict.primary_cta_text}\nTarget Rail: {ui_spec_dict.target_rail}",
-                ui_morph=ui_spec_dict.ui_type,
-                ui_spec=ui_spec_dict.model_dump(),
-            )
-
-        # Emit real SDK response to UI
         emit_thought(
             step="acting",
-            thought=f"Executing Real SDK Call: {tool_name_str}",
-            detail=f"Harness chose {action_val} after {harness_result.total_turns} turns. Morphing customer UI to {ui_spec_dict.ui_type}",
+            thought=f"Agent executed: {tool_name_str}",
+            detail=f"Primary action: {action_val}",
             tool_call={
                 "tool": tool_name_str,
                 "args": {"payment_id": payment_id, "amount_in_paise": int(amount * 100), "currency": "INR", "customer": customer_email},
@@ -583,160 +1083,161 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             ui_spec={
                 **ui_spec_dict.model_dump(),
                 "recovery_tier": recovery_tier,
-                "decline_strategy": decline_strategy,
+                "decline_strategy": cause,
                 "penalties_prevented": case.penalties_prevented,
-                "payday_target": payday_target,
-                "harness_turns": harness_result.total_turns,
-                "harness_tools_called": harness_result.tools_called,
                 "scheduled_job": sdk_res if action_val == "wait_and_retry" else None,
             },
         )
 
-        # Push UI spec as visible overlay — appears ABOVE Razorpay iframe
         socketio.emit("ui_spec_overlay", {
             "payment_id": payment_id,
             **ui_spec_dict.model_dump(),
             "recovery_tier": recovery_tier,
-            "decline_strategy": decline_strategy,
+            "decline_strategy": cause,
         })
 
-        # ── HITL: Voice Call Approval Gate ──
-        # Block agent thread until merchant approves or 60s timeout.
-        if action_val == "voice_call":
-            approval_event = threading.Event()
-            _pending_voice_approvals[payment_id] = approval_event
-
-            emit_thought(
-                step="approval_needed",
-                thought="Voice Call Requires Merchant Approval",
-                detail=f"Agent wants to call {customer.get('contact', 'N/A')} for INR {amount:.0f}. Waiting for merchant approval...",
-            )
-            socketio.emit("voice_call_approval_request", {
-                "payment_id": payment_id,
-                "customer_phone": customer.get("contact", "N/A"),
-                "amount": amount,
-                "failure_reason": failure_reason,
-                "recovery_link": sdk_res.get("short_url") or sdk_res.get("link_url", ""),
-                "cause": cause,
-            })
-
-            # Block agent thread for up to 60 seconds
-            approved = approval_event.wait(timeout=60)
-            _pending_voice_approvals.pop(payment_id, None)
-            approved = approved and _voice_call_approved.pop(payment_id, False)
-
-            if not approved:
-                # Timeout or denied — fall back to notification
-                emit_thought(
-                    step="approval_denied",
-                    thought="Voice Call Approval Denied / Timed Out",
-                    detail="Falling back to SEND_NOTIFICATION",
-                )
-                action_val = "send_notification"
-                sdk_res = {}
-                tool_name_str = "Tool.generate_smart_recovery_link (fallback)"
-                from recovery_agent.agent.tools import execute_tool
-                sdk_res = execute_tool("generate_smart_recovery_link", {
-                    "payment_id": payment_id,
-                    "allowed_rails": ["upi", "card", "netbanking"],
-                })
-
-        execution = execute_action(
-            action=action_val,
-            cause_value=cause,
-            amount=amount,
-            payment_id=payment_id,
-            customer_email=customer_email,
-            customer_phone=customer.get("contact", ""),
-            recovery_link=sdk_res.get("short_url") or sdk_res.get("link_url"),
-            failure_reason=failure_reason,
-            attempt_count=case.attempt_count,
-        )
-
-        emit_thought(
-            step="acted",
-            thought=f"Executed: {action_val}",
-            detail=execution.get("detail", ""),
-        )
-
-        if not store.has_payment(payment_id):
-            store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "trail": [], "attempts": 0})
-        p = store.get_payment(payment_id)
-        p["attempts"] = p.get("attempts", 0) + 1
-        p["last_action"] = action_val
-        p["last_detail"] = execution["detail"]
-        p["trail"] = trail
-        p["ui_spec"] = ui_spec_dict.model_dump()
-        p["order_id"] = sdk_res.get("id", "")
-        p["harness_turns"] = harness_result.total_turns
-
-        # ── 6. OBSERVE & RECOVER ──
-        # Recovery ONLY happens via real webhook (payment.captured / order.paid)
-        # or customer completing checkout via POST /api/customer-responded.
-        # NEVER emit fake success — if no payment completed, escalate to human.
+        # ── OBSERVE & RECOVER ──
         if action_val == "wait_and_retry":
-            # Scheduled background retry — don't block waiting for customer
             emit_thought(
                 step="stopping",
                 thought=f"Background Retry Scheduled: {sdk_res.get('job_id', 'N/A')}",
                 detail=f"Target: {sdk_res.get('target_timestamp', 'N/A')} | Confidence: {sdk_res.get('confidence', 0):.0%} | Reason: {sdk_res.get('reason', '')}",
                 ui_morph="SCHEDULED_RETRY",
             )
-        else:
+        elif action_val == "escalate_to_human":
+            emit_thought(
+                step="stopping",
+                thought=f"Escalated to Human: {sdk_res.get('ticket_id', 'N/A')}",
+                detail=f"Reason: {sdk_res.get('reason', failure_reason)}",
+                ui_morph="ESCALATED",
+            )
+        elif action_val == "send_notification" and sdk_res.get("link_url"):
             store.save_pending(payment_id, {
                 "action": action_val,
-                "execution": execution,
+                "execution": sdk_res,
                 "attempt": 0,
                 "trail": trail,
                 "amount": amount,
             })
-            push_event(payment_id, "waiting_for_customer", {"action": action_val, "detail": execution["detail"], "ui_morph": ui_spec_dict.ui_type})
+            push_event(payment_id, "waiting_for_customer", {"action": action_val, "detail": f"Payment link sent: {sdk_res['link_url']}", "ui_morph": ui_spec_dict.ui_type})
+            socketio.start_background_task(_watch_for_recovery, payment_id, 300)
 
-            # No blocking poll — recovery is confirmed asynchronously via:
-            #   1. POST /api/customer-responded (customer completes checkout)
-            #   2. POST /api/webhook-forward (Razorpay capture webhook)
-            # The agent thread returns immediately; pending_actions is cleaned up
-            # when either endpoint fires.
-
-        # Determine final status — NEVER claim failed when waiting for customer
-        if case.recovered:
+        # Determine final status from Case.status (graph is source of truth)
+        # Fallback to tool-name mapping if Case.status not yet set
+        from recovery_agent.models import CaseStatus
+        case_status = case.status
+        if case_status == CaseStatus.RECOVERED:
             final_status = "recovered"
-        elif action_val in ("send_notification", "update_payment_method"):
-            final_status = "awaiting_customer"
-        elif action_val == "wait_and_retry":
-            final_status = "scheduled"
-        elif action_val == "escalate_to_human":
+        elif case_status == CaseStatus.ESCALATED:
             final_status = "escalated"
-        else:
+        elif case_status == CaseStatus.STOPPED:
             final_status = "failed"
+        elif case_status == CaseStatus.AWAITING_CUSTOMER:
+            final_status = "awaiting_customer"
+        else:
+            # Fallback: derive from action_val for granular statuses
+            if action_val == "none":
+                # Nothing happened to the case this turn; keep what it already had.
+                final_status = (store.get_payment(payment_id) or {}).get(
+                    "status", "recovering") if store.has_payment(payment_id) else "recovering"
+            elif action_val == "page_push":
+                final_status = "awaiting_customer"
+            elif action_val == "wait_and_retry":
+                final_status = "scheduled"
+            elif action_val == "send_notification":
+                final_status = "awaiting_customer"
+            elif action_val == "escalate_to_human":
+                final_status = "escalated"
+            else:
+                final_status = "completed"
 
-        if store.has_payment(payment_id):
-            p = store.get_payment(payment_id)
+        if not store.has_payment(payment_id):
+            store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": final_status, "trail": [], "attempts": 0})
+        p = store.get_payment(payment_id)
+        p["attempts"] = p.get("attempts", 0) + 1
+        p["last_action"] = action_val
+        p["last_detail"] = sdk_res.get("message", "")
+        p["trail"] = trail
+        p["ui_spec"] = ui_spec_dict.model_dump()
+        if sdk_res.get("link_id"):
+            p["recovery_link_id"] = sdk_res["link_id"]
+        p["order_id"] = sdk_res.get("link_id", "") or p.get("order_id", "")
+        # Never downgrade a recovered case. The closing run calls only
+        # manage_memory, so the action selector would fall through to its
+        # escalate default and rewrite a paid case as "escalated" — losing a
+        # recovery that had already been confirmed against Razorpay.
+        if p.get("status") == "recovered" and final_status != "recovered":
+            print(f"[Frontend] keeping {payment_id} as recovered "
+                  f"(closing run reported {final_status})", flush=True)
+        else:
             p["status"] = final_status
-            p["trail"] = trail
-            p["recovery_tier"] = recovery_tier
-            p["decline_strategy"] = decline_strategy
-            p["penalties_prevented"] = case.penalties_prevented
+        p["recovery_tier"] = recovery_tier
+        p["decline_strategy"] = cause
+        p["penalties_prevented"] = case.penalties_prevented
+
+        # Anything that finishes without the money coming back is a person's
+        # problem now. Relying on the agent to always call escalate_to_human
+        # would let a case that simply ran out of attempts end in silence.
+        # Gate on what actually happened, not on a status string. `final_status`
+        # is derived from which tools ran, so a bookkeeping turn could label a
+        # paid case "escalated" and put it in front of a human. Money in the bank
+        # ends the case, whatever the label says.
+        already_recovered = (
+            (store.get_payment(payment_id) or {}).get("status") == "recovered"
+            or float((store.get_payment(payment_id) or {}).get("recovered_amount") or 0) > 0
+            or case.recovered
+        ) if store.has_payment(payment_id) else case.recovered
+
+        # Skip when the agent already escalated through its own tool — that call
+        # queued a ticket with the full case context. This safety net exists for
+        # cases that simply ran out of road, not to second-guess the agent, and
+        # firing both produced two tickets for one payment 29 seconds apart.
+        agent_already_escalated = bool(escalate_res)
+
+        if (final_status in ("escalated", "failed", "stopped")
+                and not already_recovered and not agent_already_escalated):
+            try:
+                from recovery_agent.escalation_queue import enqueue
+                enqueue(
+                    payment_id=payment_id,
+                    reason=(case.payment.metadata.get("agent_summary")
+                            or f"recovery ended as {final_status} without payment")[:400],
+                    amount=float(amount or 0),
+                    customer={"email": customer_email,
+                              "name": customer.get("name", ""),
+                              "contact": customer.get("contact") or customer.get("phone", "")},
+                    attempts=[{"action": getattr(a.action_type, "value", ""),
+                               "result": a.result} for a in case.attempts],
+                    customer_signals=[
+                        f"in-page notification {o['action']} after {o.get('seconds_shown','?')}s"
+                        for o in [(store.get_payment(payment_id) or {}).get("push_outcome") or {}]
+                        if o.get("action")
+                    ],
+                    offer=case.payment.metadata.get("page_offer") or {},
+                    recovery_link=case.payment.metadata.get("recovery_link", ""),
+                    failure_code=case.payment.failure_code or "",
+                    source="ladder_exhausted",
+                )
+            except Exception as exc:
+                print(f"[Frontend] escalation enqueue failed for {payment_id}: {exc}", flush=True)
 
         push_tier_event(
             payment_id,
             tier=recovery_tier,
             penalties_prevented=case.penalties_prevented,
-            decline_strategy=decline_strategy,
-            payday_target_date=payday_target,
+            decline_strategy=cause,
+            payday_target_date="",
         )
 
         push_event(payment_id, "complete", {
             "status": final_status,
-            "attempts": store.get_payment(payment_id).get("attempts", 1) if store.has_payment(payment_id) else 1,
+            "attempts": p.get("attempts", 1),
             "trail": trail,
             "amount": amount,
             "recovery_tier": recovery_tier,
-            "decline_strategy": decline_strategy,
+            "decline_strategy": cause,
             "penalties_prevented": case.penalties_prevented,
-            "harness_turns": harness_result.total_turns,
-            "harness_errors": harness_result.error_count,
-            "order_id": sdk_res.get("id", ""),
+            "order_id": sdk_res.get("link_id", ""),
             "scheduled_job": sdk_res if action_val == "wait_and_retry" else None,
         })
         parent_span.set_attribute("final_status", final_status)
@@ -744,86 +1245,10 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         parent_span.set_attribute("strategy_source", strategy_source)
         parent_span.set_attribute("root_cause", cause)
         parent_span.set_attribute("decided_action", action_val)
-        parent_span.set_attribute("harness_turns", harness_result.total_turns)
-        parent_span.set_attribute("harness_errors", harness_result.error_count)
         parent_span.set_attribute("silent_attempts", case.silent_attempts)
         parent_span.set_attribute("attempt_count", case.attempt_count)
         store.flush()
 
-
-def _generate_ui_spec(
-    llm_fn,
-    cause: str,
-    amount: float,
-    failure_reason: str,
-    recommended_rail: str,
-    customer_name: str,
-    action: str,
-    scenario_type: str,
-):
-    """Generate a Generative UI Spec using LLM. Falls back to smart defaults."""
-    from recovery_agent.models import GenerativeUISpec
-
-    prompt = f"""Generate a real-time UI morphing specification for a customer checkout page.
-
-CONTEXT:
-  Payment failure cause: {cause}
-  Amount: INR {amount:,.2f}
-  Failure reason: {failure_reason}
-  Recommended recovery rail: {recommended_rail}
-  Customer name: {customer_name}
-  Agent action: {action}
-  Scenario: {scenario_type}
-
-Generate a UI spec that:
-1. Has a clear, empathetic headline explaining what happened
-2. Subtext that reassures the customer and explains the next step
-3. A primary CTA button text that drives recovery
-4. An optional discount incentive to encourage completion
-5. The target payment rail to switch to
-6. A Hinglish voice script for voice call scenarios
-7. Appropriate tone (supportive, urgent, friendly)
-
-Output JSON:"""
-
-    result = llm_fn(
-        prompt=prompt,
-        system="You are a Razorpay UX copywriter. Generate UI specs as JSON. Be concise, empathetic, and action-oriented.",
-        temperature=0.3,
-        max_tokens=400,
-    )
-
-    if result and isinstance(result, dict):
-        return GenerativeUISpec(
-            ui_type=result.get("ui_type", "GENERATIVE_FAILOVER_MODAL"),
-            headline=result.get("headline", f"Payment of INR {amount:,.2f} needs attention"),
-            subtext=result.get("subtext", "We're helping you complete this payment securely."),
-            primary_cta_text=result.get("primary_cta_text", "Complete Payment"),
-            discount_incentive=result.get("discount_incentive", ""),
-            target_rail=result.get("target_rail", recommended_rail),
-            hinglish_voice_script=result.get("hinglish_voice_script", ""),
-            tone=result.get("tone", "supportive"),
-        )
-
-    # Fallback spec — smart defaults, not hardcoded if/else
-    ui_type_map = {
-        "card_expired": "CARD_EXPIRY_FIXER",
-        "network_timeout": "SMART_FAILOVER_BANNER",
-        "bank_declined": "BANK_DECLINED_RECOVERY",
-        "insufficient_funds": "INSUFFICIENT_FUNDS_SCHEDULER",
-        "mandate_revoked": "MANDATE_REAUTH_MODAL",
-        "risk_block": "RISK_VERIFICATION_FLOW",
-    }
-    return GenerativeUISpec(
-        ui_type=ui_type_map.get(cause, "PAYMENT_LINK_MODAL"),
-        headline=f"Payment of INR {amount:,.2f} needs attention",
-        subtext=f"We detected an issue: {failure_reason}. Let's get this sorted.",
-        primary_cta_text="Complete Payment Now",
-        discount_incentive="",
-        target_rail=recommended_rail,
-        hinglish_voice_script=f"Namaste {customer_name} ji! Aapka payment fail ho gaya hai. Hum aapki help karenge.",
-        tone="supportive",
-    )
 
 
 # ─── Customer Payment Page ────────────────────────────────────
@@ -1298,6 +1723,15 @@ function startPayment() {
       btn.style.background = "var(--green)";
       document.getElementById("action-box").classList.remove("visible");
       document.getElementById("decline-wall").classList.remove("visible");
+      const ap = document.getElementById("agent-push"); if (ap) ap.remove();
+      const ab = document.getElementById("agent-offer-banner");
+      if (ab) { ab.remove(); document.body.style.paddingTop = ""; }
+      /* Tell the server. Without this the money reaches Razorpay and the case
+         never learns, so the agent keeps chasing a customer who has paid. The
+         server verifies with Razorpay before believing any of it. */
+      fetch("/api/payment-succeeded", {method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({payment_id:paymentId, razorpay_payment_id:r.razorpay_payment_id,
+                             razorpay_order_id:r.razorpay_order_id})}).catch(function(){});
     },
     prefill: {name:cust.name, email:cust.email, contact:cust.contact},
     theme: {color:"#2563eb"},
@@ -1355,6 +1789,133 @@ function showStatus(type, msg) {
   if (type === "processing" || type === "recovering") el.innerHTML = '<span class="spinner"></span> ' + msg;
   else el.innerHTML = msg;
 }
+
+/* ── Agent push: the silent first rung of the recovery ladder ──
+   The agent authors this; the page only renders it and reports back what the
+   customer did. Acting, dismissing and ignoring are three different signals and
+   all three are sent, because the agent reasons about intent from them. */
+let _pushShownAt = 0, _pushTimer = null, _pushReported = false;
+
+function reportPush(action, detail) {
+  if (_pushReported) return;
+  _pushReported = true;
+  if (_pushTimer) { clearInterval(_pushTimer); _pushTimer = null; }
+  fetch("/api/push-response", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      payment_id: paymentId, action: action,
+      seconds_shown: (Date.now() - _pushShownAt) / 1000, detail: detail || ""
+    })
+  }).catch(function(){});
+}
+
+function closePush(action, detail) {
+  const el = document.getElementById("agent-push");
+  if (el) el.remove();
+  reportPush(action || "dismissed", detail);
+}
+
+socket.on("agent_push", function(d) {
+  if (d.payment_id !== paymentId) return;
+  var esc = function (t) {
+    return String(t == null ? "" : t).replace(/[&<>"']/g, function (c) {
+      return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+    });
+  };
+  const old = document.getElementById("agent-push");
+  if (old) {
+    /* A newer notification is taking its place. Removing it silently made it
+       look like the message disappeared on its own after a few seconds, and the
+       customer's non-response to it was lost — so report it honestly first. */
+    reportPush("superseded", "Replaced by a newer notification.");
+    old.remove();
+  }
+  _pushShownAt = Date.now(); _pushReported = false;
+
+  /* Coupon banner: the offer is not just described in the notification, it is
+     applied to the page the customer is looking at. Original struck through,
+     new total beside it — the same figure the payment link charges, because the
+     tool refuses to display one that disagrees. */
+  const oldBanner = document.getElementById("agent-offer-banner");
+  if (oldBanner) oldBanner.remove();
+  if (d.offer && d.offer.payable_rupees) {
+    const o = d.offer;
+    const money = function (n) {
+      return "\u20B9" + Number(n).toLocaleString("en-IN", {minimumFractionDigits: 2});
+    };
+    const bar = document.createElement("div");
+    bar.id = "agent-offer-banner";
+    bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9998;" +
+      "background:linear-gradient(90deg,#065f46,#047857);color:#fff;padding:11px 16px;" +
+      "display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;" +
+      "font:14px/1.4 ui-sans-serif,system-ui,sans-serif;box-shadow:0 2px 12px rgba(0,0,0,.18)";
+    bar.innerHTML =
+      (o.discount_pct ? '<span style="background:#fff;color:#065f46;border-radius:999px;' +
+        'padding:3px 11px;font-weight:700;font-size:12.5px">' +
+        Number(o.discount_pct).toFixed(0) + '% OFF</span>' : '') +
+      '<span style="font-weight:600">' + esc(d.headline) + '</span>' +
+      (o.original_rupees ? '<span style="opacity:.75;text-decoration:line-through">' +
+        money(o.original_rupees) + '</span>' : '') +
+      '<span style="font-weight:700;font-size:16px">' + money(o.payable_rupees) + '</span>' +
+      '<span id="offer-countdown" style="opacity:.85;font-size:12px"></span>';
+    document.body.appendChild(bar);
+    document.body.style.paddingTop = "44px";
+
+    let osec = Math.max(1, o.expires_in_minutes || 15) * 60;
+    const oc = document.getElementById("offer-countdown");
+    const otimer = setInterval(function () {
+      osec -= 1;
+      if (osec <= 0) {
+        clearInterval(otimer);
+        const b = document.getElementById("agent-offer-banner");
+        if (b) b.remove();
+        document.body.style.paddingTop = "";
+        return;
+      }
+      if (oc) oc.textContent = "expires in " + Math.floor(osec / 60) + ":" +
+        String(osec % 60).padStart(2, "0");
+    }, 1000);
+  }
+
+  const wrap = document.createElement("div");
+  wrap.id = "agent-push";
+  wrap.style.cssText = "position:fixed;right:20px;bottom:20px;z-index:9999;max-width:360px;" +
+    "background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:18px 18px 16px;" +
+    "box-shadow:0 12px 40px rgba(0,0,0,.16);font:14px/1.5 ui-sans-serif,system-ui,sans-serif;" +
+    "animation:slideUp .3s ease-out";
+  wrap.innerHTML =
+    '<button id="push-x" aria-label="Dismiss" style="position:absolute;top:10px;right:12px;' +
+      'border:0;background:none;font-size:19px;color:#9ca3af;cursor:pointer;line-height:1">&times;</button>' +
+    '<div style="font-weight:650;color:#111827;padding-right:22px">' + esc(d.headline) + '</div>' +
+    '<div style="color:#4b5563;margin-top:6px;font-size:13px">' + esc(d.body) + '</div>' +
+    (d.offer_text ? '<div style="margin-top:10px;background:#ecfdf5;border:1px solid #a7f3d0;' +
+       'color:#065f46;border-radius:8px;padding:8px 10px;font-size:12.5px;font-weight:600">' +
+       esc(d.offer_text) + '</div>' : '') +
+    '<button id="push-cta" style="margin-top:13px;width:100%;background:#2563eb;color:#fff;' +
+      'border:0;border-radius:9px;padding:11px;font-size:14px;font-weight:600;cursor:pointer">' +
+      esc(d.cta_text || "Complete payment") + '</button>' +
+    '<div id="push-countdown" style="margin-top:8px;font-size:11.5px;color:#9ca3af;text-align:center"></div>';
+  document.body.appendChild(wrap);
+
+  document.getElementById("push-x").onclick = function () {
+    closePush("dismissed", "Customer closed the notification.");
+  };
+  document.getElementById("push-cta").onclick = function () {
+    reportPush("acted", "Customer clicked the call to action.");
+    if (d.payment_link) window.open(d.payment_link, "_blank");
+    else startPayment();
+    const el = document.getElementById("agent-push"); if (el) el.remove();
+  };
+
+  let left = Math.max(1, (d.wait_minutes || 5)) * 60;
+  const cd = document.getElementById("push-countdown");
+  _pushTimer = setInterval(function () {
+    left -= 1;
+    if (left <= 0) { clearInterval(_pushTimer); _pushTimer = null; if (cd) cd.textContent = ""; return; }
+    if (cd) cd.textContent = "Offer expires in " + Math.floor(left / 60) + ":" +
+      String(left % 60).padStart(2, "0");
+  }, 1000);
+});
 
 socket.on("agent_event", function(data) {
   if (data.payment_id !== paymentId) return;
@@ -1574,7 +2135,7 @@ tr:hover{background:var(--bg-surface)}
 .trail{max-height:500px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border-subtle) transparent}
 .trail-item{padding:12px;border-left:3px solid var(--border-subtle);margin-bottom:4px;border-radius:0 10px 10px 0;background:var(--bg-surface);font-size:12px;transition:background .15s}
 .trail-item:hover{background:var(--brand-blue-light)}
-.trail-item.t-detecting{border-left-color:var(--brand-blue)}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8B5CF6}.trail-item.t-deciding{border-left-color:var(--warning)}.trail-item.t-acting,.trail-item.t-acted{border-left-color:var(--success)}.trail-item.t-waiting{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-observed{border-left-color:#6366F1}.trail-item.t-stopping{border-left-color:var(--error)}
+.trail-item.t-detecting{border-left-color:var(--brand-blue)}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8B5CF6}.trail-item.t-deciding{border-left-color:var(--warning)}.trail-item.t-acting,.trail-item.t-acted{border-left-color:var(--success)}.trail-item.t-waiting{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-observed{border-left-color:#6366F1}.trail-item.t-stopping{border-left-color:var(--error)}.trail-item.t-init{border-left-color:var(--brand-blue)}.trail-item.t-harness_start{border-left-color:#8B5CF6}.trail-item.t-harness_turn{border-left-color:#6366F1}.trail-item.t-llm_unavailable{border-left-color:var(--error);background:rgba(220,38,38,0.05)}.trail-item.t-stopped{border-left-color:var(--error)}.trail-item.t-ui_spec{border-left-color:#10B981}.trail-item.t-approval_needed{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-approval_denied{border-left-color:var(--error)}.trail-item.t-waiting_for_customer{border-left-color:var(--warning)}.trail-item.t-complete{border-left-color:var(--success)}
 .trail-time{color:var(--text-muted);font-size:10px;font-weight:500}.trail-msg{color:var(--text-primary);margin-top:3px;font-weight:500}.trail-detail{color:var(--text-secondary);margin-top:3px;font-size:11px;line-height:1.5}
 
 /* Toast */
@@ -1786,13 +2347,25 @@ function openDrawer(paymentId){
   if(p.decline_strategy){html+=`<div class="drawer-section"><h3>Decline Strategy</h3><div style="font-size:13px;color:var(--text-secondary)">${p.decline_strategy}</div></div>`}
   if(p.penalties_prevented){html+=`<div class="drawer-section"><h3>Penalties Prevented</h3><div style="font-size:13px;color:var(--success);font-weight:600">${p.penalties_prevented} blocked ($${(p.penalties_prevented*0.10).toFixed(2)} saved)</div></div>`}
   if(p.trail&&p.trail.length){
-    const diagnosed=p.trail.find(e=>e.step==="diagnosed"||e.step==="diagnosing");
-    const decided=p.trail.find(e=>e.step==="deciding");
-    if(diagnosed){html+=`<div class="drawer-section"><h3>Diagnosis</h3><div style="font-size:13px;color:var(--text-secondary)">${diagnosed.msg}${diagnosed.detail?'<br>'+diagnosed.detail:''}</div></div>`}
-    if(decided){html+=`<div class="drawer-section"><h3>Strategy</h3><div style="font-size:13px;color:var(--text-secondary)">${decided.msg}${decided.detail?'<br>'+decided.detail:''}</div></div>`}
-    html+=`<div class="drawer-section"><h3>Agent Trail (${p.trail.length} steps)</h3><div class="drawer-trail">`;
+    const initStep=p.trail.find(e=>e.step==="init");
+    const investigationSteps=p.trail.filter(e=>["investigating","checking_history","checking_status","harness_thinking","harness_start"].includes(e.step));
+    const actionSteps=p.trail.filter(e=>["generating_link","scheduling_retry","escalating","calling","acting"].includes(e.step));
+    if(initStep){html+=`<div class="drawer-section"><h3>Case Init</h3><div style="font-size:13px;color:var(--text-secondary)">${initStep.msg}${initStep.detail?'<br>'+initStep.detail:''}</div></div>`}
+    if(investigationSteps.length){
+      html+=`<div class="drawer-section"><h3>Investigation (${investigationSteps.length} steps)</h3><div style="font-size:13px;color:var(--text-secondary)">`;
+      investigationSteps.forEach(t=>{html+=`<div style="margin-bottom:6px;padding:6px;border-left:3px solid #8b5cf6;background:var(--bg-surface);border-radius:0 6px 6px 0"><b style="color:#8b5cf6">${t.ts}</b> <span style="font-weight:500">${t.msg}</span>${t.detail?'<br><span style="color:var(--text-muted);font-size:12px">'+t.detail+'</span>':''}</div>`});
+      html+=`</div></div>`;
+    }
+    if(actionSteps.length){
+      html+=`<div class="drawer-section"><h3>Actions (${actionSteps.length} steps)</h3><div style="font-size:13px;color:var(--text-secondary)">`;
+      actionSteps.forEach(t=>{html+=`<div style="margin-bottom:6px;padding:6px;border-left:3px solid #22c55e;background:var(--bg-surface);border-radius:0 6px 6px 0"><b style="color:#22c55e">${t.ts}</b> <span style="font-weight:500">${t.msg}</span>${t.detail?'<br><span style="color:var(--text-muted);font-size:12px">'+t.detail+'</span>':''}</div>`});
+      html+=`</div></div>`;
+    }
+    html+=`<div class="drawer-section"><h3>Full Trail (${p.trail.length} steps)</h3><div class="drawer-trail">`;
     p.trail.forEach(e=>{
-      html+=`<div class="trail-item t-${e.step}" style="cursor:pointer" onclick="var d=this.querySelector('.trail-detail');if(d)d.style.display=d.style.display==='none'?'block':'none'"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail" style="display:none">'+e.detail+'</div>':''}</div>`;
+      const isInvestigation=["investigating","checking_history","checking_status","harness_thinking","harness_start","init"].includes(e.step);
+      const borderClr=isInvestigation?"#8b5cf6":"#22c55e";
+      html+=`<div class="trail-item t-${e.step}" style="cursor:pointer;border-left-color:${borderClr}" onclick="var d=this.querySelector('.trail-detail');if(d)d.style.display=d.style.display==='none'?'block':'none'"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail" style="display:block;margin-top:4px">'+e.detail+'</div>':''}</div>`;
     });
     html+=`</div></div>`;
   }
@@ -1890,13 +2463,73 @@ def graph_page():
 def simulate_scenario(scenario: str):
     import random
     payment_id = f"pay_sim_{random.randint(1000, 9999)}"
-    customer = {"email": "customer@example.com", "contact": "+919876543210", "name": "Simulated User"}
 
+    # Full scenario context — no hardcoded frontend values
     scenarios = {
-        "degradation": (4999.0, "Gateway timeout during payment processing", "degradation", "gateway_timeout", "gateway", "payment_authorization"),
-        "abandonment": (2999.0, "Customer closed tab during checkout", "abandonment", "customer_cancelled", "customer", "payment_initiation"),
-        "card_expiry": (12999.0, "Card expiry date is in the past", "card_expiry", "card_expired", "customer", "payment_authentication"),
-        "voice_call": (8500.0, "High-value mandate failure requiring voice intervention", "voice_call", "mandate_revoked", "bank", "payment_authorization"),
+        "degradation": {
+            "amount": 4999.0,
+            "reason": "Gateway timeout during payment processing",
+            "scenario_type": "degradation",
+            "failure_code": "gateway_timeout",
+            "error_source": "gateway",
+            "error_step": "payment_authorization",
+            "customer": {"name": "Rahul Kumar", "email": "rahul@example.com", "contact": "+919876543210"},
+            "biz_name": "SaaS Subscription Platform",
+            "biz_detail": "Annual Pro Plan",
+            "badge": "Gateway 504 Degradation",
+            "item_name": "Pro Subscription Plan (Annual)",
+            "card_last4": "4242",
+            "card_expiry": "08/29",
+            "card_holder": "RAHUL KUMAR",
+        },
+        "abandonment": {
+            "amount": 2999.0,
+            "reason": "Customer closed tab during checkout",
+            "scenario_type": "abandonment",
+            "failure_code": "customer_cancelled",
+            "error_source": "customer",
+            "error_step": "payment_initiation",
+            "customer": {"name": "Priya Sharma", "email": "priya@example.com", "contact": "+919876543211"},
+            "biz_name": "E-Commerce Magic Checkout",
+            "biz_detail": "Premium Audio Gear",
+            "badge": "Cart Abandonment",
+            "item_name": "Noise-Cancelling Headphones",
+            "card_last4": "8901",
+            "card_expiry": "12/26",
+            "card_holder": "PRIYA SHARMA",
+        },
+        "card_expiry": {
+            "amount": 12999.0,
+            "reason": "Card expiry date is in the past",
+            "scenario_type": "card_expiry",
+            "failure_code": "card_expired",
+            "error_source": "customer",
+            "error_step": "payment_authentication",
+            "customer": {"name": "Amit Patel", "email": "amit@example.com", "contact": "+919876543212"},
+            "biz_name": "Recurring Auto-Debit Membership",
+            "biz_detail": "Enterprise Cloud Infrastructure",
+            "badge": "Card Expiry Failure",
+            "item_name": "Enterprise Cloud Infrastructure",
+            "card_last4": "5678",
+            "card_expiry": "03/24",
+            "card_holder": "AMIT PATEL",
+        },
+        "voice_call": {
+            "amount": 8500.0,
+            "reason": "High-value mandate failure requiring voice intervention",
+            "scenario_type": "voice_call",
+            "failure_code": "mandate_revoked",
+            "error_source": "bank",
+            "error_step": "payment_authorization",
+            "customer": {"name": "Neha Gupta", "email": "neha@example.com", "contact": "+919876543213"},
+            "biz_name": "B2B Enterprise Invoice Gateway",
+            "biz_detail": "Quarterly API License",
+            "badge": "High-Value Voice AI",
+            "item_name": "Quarterly API Gateway License",
+            "card_last4": "3456",
+            "card_expiry": "11/27",
+            "card_holder": "NEHA GUPTA",
+        },
     }
 
     if scenario not in scenarios and scenario != "batch":
@@ -1914,10 +2547,11 @@ def simulate_scenario(scenario: str):
             "recovered_amount": result.recovered_amount,
         })
 
-    amount, reason, stype, fail_code, err_source, err_step = scenarios[scenario]
+    ctx = scenarios[scenario]
+    customer = ctx["customer"]
     store.save_payment(payment_id, {
         "payment_id": payment_id,
-        "amount": amount,
+        "amount": ctx["amount"],
         "status": "recovering",
         "attempts": 0,
         "last_action": "",
@@ -1928,22 +2562,112 @@ def simulate_scenario(scenario: str):
         "penalties_prevented": 0,
     })
 
-    socketio.start_background_task(run_agent_for_payment, payment_id, amount, reason, customer, stype, fail_code, err_source, err_step)
-    return jsonify({"status": "simulating", "scenario": scenario, "payment_id": payment_id, "amount": amount, "reason": reason})
+    socketio.start_background_task(run_agent_for_payment, payment_id, ctx["amount"], ctx["reason"], customer, ctx["scenario_type"], ctx["failure_code"], ctx["error_source"], ctx["error_step"])
+    return jsonify({
+        "status": "simulating",
+        "scenario": scenario,
+        "payment_id": payment_id,
+        "amount": ctx["amount"],
+        "reason": ctx["reason"],
+        "customer": customer,
+        "biz_name": ctx["biz_name"],
+        "biz_detail": ctx["biz_detail"],
+        "badge": ctx["badge"],
+        "item_name": ctx["item_name"],
+        "card_last4": ctx["card_last4"],
+        "card_expiry": ctx["card_expiry"],
+        "card_holder": ctx["card_holder"],
+    })
 
 @app.route("/api/create-order", methods=["POST"])
 def create_order():
     data = request.json
     amount = data.get("amount", 2999)
     payment_id = data.get("payment_id", "pay_unknown")
+    def _record_order(order_id_value: str) -> None:
+        """Attach the new order WITHOUT destroying an in-flight recovery.
+
+        This used to call `store.save_payment`, which REPLACES the whole record —
+        so a second "Pay" click on the same page wiped the case: trail, customer,
+        status, recovered amount, all of it. A recovery that had already been
+        confirmed against Razorpay (INR 37,990.50 on pay_k3jofbz4j) was reset to
+        `pending` with an empty trail, which is why it looked as though the agent
+        had not caught the payment.
+        """
+        if store.has_payment(payment_id):
+            # `order_id` is later reused to hold the RECOVERY link, so the
+            # original checkout order has to live under its own key or it is lost
+            # — and with it any way to reconcile the two sides in Razorpay.
+            store.update_payment(payment_id, order_id=order_id_value, amount=amount,
+                                 original_order_id=order_id_value)
+        else:
+            store.save_payment(payment_id, {
+                "payment_id": payment_id, "amount": amount, "status": "pending",
+                "order_id": order_id_value, "original_order_id": order_id_value,
+                "attempts": 0, "last_action": "", "last_detail": "", "trail": [],
+            })
+        store.flush()
+
     if razorpay_client.is_configured:
         order = razorpay_client.create_order(amount=amount, notes={"payment_id": payment_id})
         if "error" not in order:
-            store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "pending", "order_id": order["id"], "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
+            _record_order(order["id"])
             return jsonify({"order_id": order["id"], "amount": order["amount"], "currency": order["currency"], "key_id": razorpay_client.key_id})
     order_id = f"order_sim_{payment_id}"
-    store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "pending", "order_id": order_id, "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
+    _record_order(order_id)
     return jsonify({"order_id": order_id, "amount": int(amount * 100), "currency": "INR", "key_id": razorpay_client.key_id or "rzp_test_demo"})
+
+@app.route("/api/payment-succeeded", methods=["POST"])
+def payment_succeeded():
+    """The checkout page reports that Razorpay's inline handler fired.
+
+    This route did not exist. The `handler` callback in startPayment() only
+    painted the button green, so a customer who paid through the agent's own
+    push notification — the first and cheapest rung of the ladder, and the one
+    with no payment link, so its CTA reopens the inline checkout — was invisible
+    to the backend. The money landed in Razorpay and the case sat in
+    `awaiting_customer` until it timed out.
+
+    The browser's word is NOT taken for it. A POST here is only a hint that
+    something happened; the payment is fetched from Razorpay and must come back
+    captured, for this case's own order, before a rupee is recorded.
+    """
+    data = request.get_json(silent=True) or {}
+    payment_id = str(data.get("payment_id") or "")
+    rzp_payment_id = str(data.get("razorpay_payment_id") or "")
+    rzp_order_id = str(data.get("razorpay_order_id") or "")
+    if not payment_id or not rzp_payment_id:
+        return jsonify({"error": "payment_id and razorpay_payment_id required"}), 400
+    if not store.has_payment(payment_id):
+        return jsonify({"error": "unknown case"}), 404
+
+    if not razorpay_client.is_configured:
+        return jsonify({"status": "unverified", "note": "razorpay not configured"}), 503
+
+    try:
+        pay = razorpay_client.client.payment.fetch(rzp_payment_id)
+    except Exception as exc:
+        push_event(payment_id, "verification_failed", {
+            "detail": f"Could not verify {rzp_payment_id}: {exc}"})
+        return jsonify({"status": "unverified", "note": str(exc)}), 502
+
+    if pay.get("status") != "captured":
+        return jsonify({"status": "not_captured", "payment_status": pay.get("status")}), 409
+
+    known = {store.get_payment(payment_id).get(k, "") for k in
+             ("original_order_id", "order_id")}
+    claimed_order = pay.get("order_id") or rzp_order_id
+    if claimed_order and known - {""} and claimed_order not in known:
+        # A real capture, but not for this case. Recording it here would credit
+        # one case with another's money.
+        return jsonify({"status": "order_mismatch", "order_id": claimed_order}), 409
+
+    amount = pay.get("amount", 0) / 100
+    recorded = _mark_recovered(payment_id, amount, rzp_payment_id, 0,
+                               "customer paid on the checkout page")
+    return jsonify({"status": "recovered" if recorded else "already_recorded",
+                    "amount": amount, "payment_id": rzp_payment_id})
+
 
 @app.route("/api/payment-failed", methods=["POST"])
 def payment_failed():
@@ -1961,6 +2685,7 @@ def payment_failed():
     if not store.has_payment(payment_id):
         store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
     store.update_payment(payment_id, status="recovering")
+
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)
     return jsonify({"status": "recovery_started"})
 
@@ -2073,17 +2798,36 @@ def webhook_forward():
         payment_entity = payload.get("payment", {}).get("entity", {})
         payment_id = payment_entity.get("id", "")
         amount = payment_entity.get("amount", 0) / 100
+        notes = payment_entity.get("notes", {})
+
+        # Resolve payment link → original payment ID.
+        # When customer pays via a recovery link, Razorpay creates a NEW payment.
+        # The original_payment note on the link ties the new payment back to our case.
+        original_payment_id = notes.get("original_payment", "")
+        if original_payment_id and store.has_payment(original_payment_id):
+            payment_id = original_payment_id
 
         if store.has_pending(payment_id):
             store.remove_pending(payment_id)
 
         if store.has_payment(payment_id):
-            store.update_payment(payment_id, status="recovered", recovered_amount=amount)
+            p = store.get_payment(payment_id)
+            p["status"] = "recovered"
+            p["recovered_amount"] = amount
+            p["recovered_payment_id"] = payment_entity.get("id", "")
+            p.setdefault("trail", []).append({
+                "step": "recovery_confirmed",
+                "msg": f"Payment captured: INR {amount:,.2f}",
+                "detail": f"Captured via payment link. Original: {original_payment_id or payment_id} | Actual: {payment_entity.get('id', '')}",
+                "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            })
 
         push_event(payment_id, "webhook_captured", {
             "status": "recovered",
             "amount": amount,
             "payment_id": payment_id,
+            "original_payment_id": original_payment_id,
+            "captured_payment_id": payment_entity.get("id", ""),
         })
         store.flush()
 

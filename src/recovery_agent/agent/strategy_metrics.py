@@ -17,7 +17,6 @@ import random
 import sqlite3
 import threading
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 

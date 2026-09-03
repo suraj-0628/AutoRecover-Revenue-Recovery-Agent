@@ -1,10 +1,10 @@
-"""Diagnosis engine — real-time LLM diagnostic reflection with LlamaIndex RAG.
+"""Diagnosis engine — 4-layer cascade with LLM as last resort.
 
-Uses LLM (Nemotron via OmniRoute) as the PRIMARY diagnosis method.
-The LLM performs structured reflection over raw payment failure payloads,
-customer history, bank health signals, AND RAG-retrieved knowledge base context.
-
-Cascade: LLM + RAG grounded context → Razorpay API data → Rule-based fallback
+Cascade:
+1. Razorpay API data (fastest, highest confidence)
+2. Rule-based failure code lookup
+3. RAG-retrieved knowledge base context with keyword matching
+4. LLM structured reflection (slowest, used when above paths return unknown)
 
 Source: Reflection pattern from Agentic AI (Andrew Ng), Module 2
         Router decomposition from Evaluating AI Agents

@@ -14,11 +14,22 @@ from pydantic import BaseModel, Field
 
 
 class CaseStatus(str, Enum):
+    """Operational state of a recovery case.
+
+    Each state answers one question: *what is the system waiting on?*
+    OPEN/DIAGNOSING/DIAGNOSED/ACTING wait on the agent; AWAITING_CUSTOMER waits
+    on a human; SCHEDULED waits on a clock; the rest are terminal.
+
+    SCHEDULED and AWAITING_CUSTOMER are deliberately distinct: the sensor polls
+    the latter, the scheduler wakes the former. Conflating them is why the old
+    retry subsystem had nowhere to live (AUDIT-FINDINGS S1-1).
+    """
     OPEN = "open"
     DIAGNOSING = "diagnosing"
     DIAGNOSED = "diagnosed"
     ACTING = "acting"
-    AWAITING_CUSTOMER = "awaiting_customer"
+    AWAITING_CUSTOMER = "awaiting_customer"   # waiting on a person
+    SCHEDULED = "scheduled"                   # waiting on a timer (silent retry)
     RECOVERED = "recovered"
     STOPPED = "stopped"
     ESCALATED = "escalated"

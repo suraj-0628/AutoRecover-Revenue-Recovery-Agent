@@ -26,6 +26,60 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5002")
 
 # --- Retry Execution ---
 
+def register_retry_job(
+    payment_id: str,
+    amount: float,
+    target_timestamp: str,
+    action: str = "retry_payment",
+    method: str = "card",
+    customer: dict[str, Any] | None = None,
+    reason: str = "",
+    confidence: float = 0.5,
+) -> dict[str, Any]:
+    """Queue a scheduled retry for this worker to execute.
+
+    This function did not exist. `frontend.py` imported it whenever the agent
+    scheduled a silent retry, so the whole case died with
+
+        Agent Execution Error: cannot import name 'register_retry_job'
+
+    right after the agent had done the correct thing. `StateStore.schedule_job`
+    was already written and had zero callers — the two halves of the silent-retry
+    path were never joined, so Tier 1 could not complete even once.
+    """
+    from recovery_agent.state_store import StateStore
+
+    store = StateStore()
+    job_id = f"job_{payment_id}_{int(time.time())}"
+    metadata = {
+        "amount": float(amount or 0),
+        "method": method,
+        "customer": customer or {},
+        "reason": reason,
+        "confidence": float(confidence or 0),
+    }
+    store.schedule_job(
+        job_id=job_id,
+        payment_id=payment_id,
+        target_time=target_timestamp,
+        action=action,
+        metadata=metadata,
+    )
+    store.flush()
+
+    print(f"[daemon] registered {job_id} for {payment_id} at {target_timestamp}", flush=True)
+    return {
+        "status": "scheduled",
+        "job_id": job_id,
+        "payment_id": payment_id,
+        "target_timestamp": target_timestamp,
+        "action": action,
+        "amount": float(amount or 0),
+        "reason": reason,
+        "confidence": float(confidence or 0),
+    }
+
+
 def execute_retry(job: dict[str, Any]) -> dict[str, Any]:
     """Execute a retry job via the Razorpay SDK."""
     from recovery_agent.razorpay_client import RazorpayClient

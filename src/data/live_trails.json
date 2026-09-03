@@ -1,0 +1,305 @@
+{
+  "pay_ntm39ql90": [
+    {
+      "step": "init",
+      "msg": "Case Initialized: pay_ntm39ql90",
+      "detail": "Amount: INR 3,999.00 | Reason: Payment cancelled by customer | Customer: surajra0628@gmail.com",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": {
+        "customer_id": "surajra0628@gmail.com",
+        "payday_window": false,
+        "promise_to_pay": null
+      },
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:16"
+    },
+    {
+      "step": "agent_start",
+      "msg": "Launching ReAct Agent \u2014 LLM will reason, call tools, and adapt",
+      "detail": "Loop: agent \u2192 tools \u2192 agent \u2192 ... \u2192 END",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:16"
+    },
+    {
+      "step": "agent_thinking",
+      "msg": "[AGENT] Calling tool: check_payment_status",
+      "detail": "Args: {\"payment_id\": \"pay_ntm39ql90\"}",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:26"
+    },
+    {
+      "step": "agent_thinking",
+      "msg": "[AGENT] Calling tool: diagnose_payment_failure",
+      "detail": "Args: {\"failure_code\": \"customer_cancelled\", \"failure_reason\": \"Payment cancelled by customer\", \"amount\": 399900, \"customer_id\": \"surajra0628@gmail.com\", \"payment_id\": \"pay_ntm39ql90\"}",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:26"
+    },
+    {
+      "step": "agent_thinking",
+      "msg": "[AGENT] Calling tool: get_customer_payment_history",
+      "detail": "Args: {\"customer_id\": \"surajra0628@gmail.com\"}",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:26"
+    },
+    {
+      "step": "agent_thinking",
+      "msg": "[AGENT] Calling tool: search_memory",
+      "detail": "Args: {\"query\": \"surajra0628@gmail.com payment preferences opt-out recovery\"}",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:26"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] check_payment_status: {\"status\": \"error\", \"message\": \"The id provided does not exist\"}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:30"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] diagnose_payment_failure: {\"root_cause\": \"user_dropoff\", \"confidence\": 0.9, \"reasoning\": \"Failure code 'customer_cancelled' maps to user_dropoff\", \"category\": \"payment_failure_user_dropoff\"}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:30"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] get_customer_payment_history: {\"status\": \"ok\", \"customer_id\": \"surajra0628@gmail.com\", \"total_payments\": 0, \"successful_count\": 0, \"method_success_rates\": {}, \"recent_payments\": [], \"last_successful_method\": null}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:30"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] search_memory: []",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:30"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] None: {\"status\": \"error\", \"message\": \"The id provided does not exist\"}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:30"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] None: {\"root_cause\": \"user_dropoff\", \"confidence\": 0.9, \"reasoning\": \"Failure code 'customer_cancelled' maps to user_dropoff\", \"category\": \"payment_failure_user_dropoff\"}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:30"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] None: {\"status\": \"ok\", \"customer_id\": \"s***@gmail.com\", \"total_payments\": 0, \"successful_count\": 0, \"method_success_rates\": {}, \"recent_payments\": [], \"last_successful_method\": null}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:30"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] None: []",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:30"
+    },
+    {
+      "step": "agent_thinking",
+      "msg": "[AGENT] Calling tool: discover_recovery_rail",
+      "detail": "Args: {\"customer_id\": \"surajra0628@gmail.com\", \"preferred_channel\": \"email\", \"failure_code\": \"customer_cancelled\", \"failure_reason\": \"Payment cancelled by customer\", \"amount\": 3999}",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:37"
+    },
+    {
+      "step": "agent_thinking",
+      "msg": "[AGENT] Calling tool: query_knowledge_base",
+      "detail": "Args: {\"query\": \"customer_cancelled payment recovery best practices retry policy silent tier\"}",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:32:37"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] discover_recovery_rail: {\"status\": \"ok\", \"recommended\": \"payment_link\", \"process_order\": [\"card_gateway\", \"escrow_route\", \"payment_link\", \"upi_autopay\", \"optimizer_smart_router\"], \"rail_count\": 5, \"rails\": [{\"rail\": \"card_gateway\", \"similarity\": 0.216, \"label\": \"Card Gateway\", \"api\": \"/payments\", \"description\": \"Standard c",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:10"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] query_knowledge_base: {\"status\": \"ok\", \"answer\": \"[PSP] What is the failure protocol for payment method 'unknown' with provider 'unknown' and error description 'customer_cancelled payment recovery best practices retry policy silent tier'? Error code: customer_cancelled payment recovery best practices retry policy silent ",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:10"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] None: {\"status\": \"ok\", \"recommended\": \"payment_link\", \"process_order\": [\"card_gateway\", \"escrow_route\", \"payment_link\", \"upi_autopay\", \"optimizer_smart_router\"], \"rail_count\": 5, \"rails\": [{\"rail\": \"card_gateway\", \"similarity\": 0.216, \"label\": \"Card Gateway\", \"api\": \"/payments\", \"description\": \"Standard c",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:10"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] None: {\"status\": \"ok\", \"answer\": \"[PSP] What is the failure protocol for payment method 'unknown' with provider 'unknown' and error description 'customer_cancelled payment recovery best practices retry policy silent tier'? Error code: customer_cancelled payment recovery best practices retry policy silent ",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:10"
+    },
+    {
+      "step": "agent_thinking",
+      "msg": "[AGENT] Calling tool: generate_recovery_payment_link",
+      "detail": "Args: {\"allowed_rails\": \"upi,card,netbanking,wallet\", \"payment_id\": \"pay_ntm39ql90\", \"amount\": 3999}",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:17"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] generate_recovery_payment_link: {\"status\": \"error\", \"message\": \"test mode limit of 30 reached for payment_link\"}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:18"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] None: {\"status\": \"error\", \"message\": \"test mode limit of 30 reached for payment_link\"}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:18"
+    },
+    {
+      "step": "agent_thinking",
+      "msg": "[AGENT] Calling tool: diagnose_payment_failure",
+      "detail": "Args: {\"customer_id\": \"surajra0628@gmail.com\", \"payment_id\": \"pay_ntm39ql90\", \"failure_code\": \"customer_cancelled\", \"failure_reason\": \"Payment cancelled by customer\", \"amount\": 399900}",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:32"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] diagnose_payment_failure: {\"root_cause\": \"user_dropoff\", \"confidence\": 0.9, \"reasoning\": \"Failure code 'customer_cancelled' maps to user_dropoff\", \"category\": \"payment_failure_user_dropoff\"}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:53"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] get_customer_payment_history: {\"status\": \"ok\", \"customer_id\": \"surajra0628@gmail.com\", \"total_payments\": 0, \"successful_count\": 0, \"method_success_rates\": {}, \"recent_payments\": [], \"last_successful_method\": null}",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:53"
+    },
+    {
+      "step": "tool_result",
+      "msg": "[TOOL] search_memory: []",
+      "detail": "",
+      "tool_call": null,
+      "guardrail": null,
+      "memory": null,
+      "ui_morph": null,
+      "ui_spec": null,
+      "ts": "05:33:53"
+    }
+  ]
+}

@@ -26,6 +26,40 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# --- Pre-flight: Verify critical imports work in venv ---
+echo "Verifying critical imports..."
+.venv/bin/python3 -c "
+import sys
+fails = []
+for mod in [
+    'langchain.tools',
+    'langchain_core.messages',
+    'langgraph.graph',
+    'langgraph.prebuilt',
+    'langgraph.checkpoint.memory',
+    'pydantic',
+    'flask',
+    'flask_socketio',
+    'razorpay',
+    'networkx',
+]:
+    try:
+        __import__(mod)
+    except ImportError as e:
+        fails.append(f'  {mod}: {e}')
+if fails:
+    print('FATAL: Missing dependencies:')
+    for f in fails:
+        print(f)
+    print('Run: .venv/bin/pip install -e .')
+    sys.exit(1)
+print('All critical imports OK')
+" 2>&1
+if [ $? -ne 0 ]; then
+    echo "ERROR: Pre-flight import check failed. Install missing deps with: .venv/bin/pip install -e ."
+    exit 1
+fi
+
 echo "Starting Revenue Recovery Agent services..."
 
 # Kill any existing instances

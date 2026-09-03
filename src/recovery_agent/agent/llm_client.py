@@ -90,7 +90,15 @@ def get_llm(
     max_tokens: int = 512,
     model_name: str | None = None,
 ) -> ChatOpenAI:
-    """Get or create the shared LLM client instance."""
+    """Get or create the shared LLM client instance.
+
+    MANDATE 1: Uses ChatOpenAI(cache=True) — langchain_core.caches.InMemoryCache
+    to avoid redundant LLM calls for identical prompts.
+    """
+    from langchain_core.globals import set_llm_cache
+    from langchain_core.caches import InMemoryCache
+    set_llm_cache(InMemoryCache())  # safe to call multiple times
+
     base_url = os.getenv("LLM_BASE_URL", "http://localhost:20128/v1")
     model = model_name or os.getenv("LLM_MODEL", "antigravity/gemini-2.5-flash")
     api_key = os.getenv("LLM_API_KEY", "dummy")
@@ -101,6 +109,7 @@ def get_llm(
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=LLM_TIMEOUT,
+        cache=True,  # MANDATE 1: langchain_core.caches.InMemoryCache
     )
 
 
@@ -169,52 +178,25 @@ def invoke_llm(
 
         model_timeout = min(per_model_timeout, remaining)
 
-        try:
-            llm = get_llm(temperature=temperature, max_tokens=max_tokens, model_name=model)
-            messages = []
-            if system:
-                messages.append(SystemMessage(content=system))
-            messages.append(HumanMessage(content=prompt))
-            response = _invoke_with_timeout(llm, messages, deadline)
-            if response is not None and response.content:
-                return response.content.strip()
-        except Exception as e:
-            print(f"[LLM ERROR with model {model}]: {e}")
-            continue
+        for attempt in range(2):
+            try:
+                llm = get_llm(temperature=temperature, max_tokens=max_tokens, model_name=model)
+                messages = []
+                if system:
+                    messages.append(SystemMessage(content=system))
+                messages.append(HumanMessage(content=prompt))
+                response = _invoke_with_timeout(llm, messages, deadline)
+                if response is not None and response.content:
+                    return response.content.strip()
+            except Exception as e:
+                err_str = str(e).lower()
+                if attempt == 0 and ("400" in str(e) or "bad request" in err_str or "invalid_argument" in err_str):
+                    time.sleep(1)
+                    continue
+                print(f"[LLM ERROR with model {model}]: {e}")
+                break
 
     return None
-
-
-async def invoke_llm_async(
-    prompt: str,
-    system: str = "",
-    temperature: float = 0,
-    max_tokens: int = 512,
-) -> str | None:
-    """Non-blocking LLM invocation via thread pool executor."""
-    import asyncio
-    from functools import partial
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, partial(invoke_llm, prompt=prompt, system=system,
-                      temperature=temperature, max_tokens=max_tokens)
-    )
-
-
-async def invoke_llm_json_async(
-    prompt: str,
-    system: str = "",
-    temperature: float = 0,
-    max_tokens: int = 512,
-) -> dict[str, Any] | None:
-    """Non-blocking LLM JSON invocation via thread pool executor."""
-    import asyncio
-    from functools import partial
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, partial(invoke_llm_json, prompt=prompt, system=system,
-                      temperature=temperature, max_tokens=max_tokens)
-    )
 
 
 def invoke_llm_json(
