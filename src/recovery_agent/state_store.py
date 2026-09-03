@@ -18,11 +18,46 @@ from typing import Any
 _DATA_DIR = Path(os.getenv("STATE_DIR", "data"))
 
 
+_INSTANCES: dict[Path, "StateStore"] = {}
+_INSTANCES_LOCK = threading.Lock()
+
+
 class StateStore:
-    """Thread-safe, file-backed store for live payment state."""
+    """Thread-safe, file-backed store for live payment state.
+
+    ONE instance per directory, per process. This is not an optimisation — a
+    second instance silently destroys the first one's writes.
+
+    Every writer here holds the whole state in memory and `flush()` rewrites the
+    files wholesale. The frontend keeps a long-lived store; tools were each
+    building their own, writing, and flushing. The tool's write landed on disk,
+    then the frontend's next flush — from an instance that had loaded before the
+    tool ran — wrote its stale copy back over it.
+
+    Live, that made the entire recovery ladder inert: `send_recovery_notification`
+    returned `"rung": "offer"`, proving the rung had been recorded, while the
+    case record read `ladder: []`. Escalation gating reads that record, so it
+    could never see a rung as climbed.
+
+        a = StateStore(); b = StateStore()
+        b.update_payment("x", ladder={...}); b.flush()   # on disk
+        a.flush()                                        # gone
+    """
+
+    def __new__(cls, data_dir: Path | None = None) -> "StateStore":
+        key = Path(data_dir or _DATA_DIR).resolve()
+        with _INSTANCES_LOCK:
+            inst = _INSTANCES.get(key)
+            if inst is None:
+                inst = super().__new__(cls)
+                inst._initialised = False
+                _INSTANCES[key] = inst
+            return inst
 
     def __init__(self, data_dir: Path | None = None) -> None:
-        self._dir = data_dir or _DATA_DIR
+        if getattr(self, "_initialised", False):
+            return                      # already loaded; do not wipe live state
+        self._dir = Path(data_dir or _DATA_DIR)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
@@ -32,6 +67,13 @@ class StateStore:
         self._jobs: dict[str, dict] = {}
 
         self._load()
+        self._initialised = True
+
+    @classmethod
+    def reset_instances(cls) -> None:
+        """Drop the cache. For tests that need a store to reload from disk."""
+        with _INSTANCES_LOCK:
+            _INSTANCES.clear()
 
     # ── persistence ──────────────────────────────────────────────
 

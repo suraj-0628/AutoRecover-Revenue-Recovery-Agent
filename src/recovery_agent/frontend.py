@@ -867,6 +867,24 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         )
 
         try:
+            # Only THIS run's messages count.
+            #
+            # Nodes return the whole message list and the checkpointer restores
+            # earlier runs into it, so `all_messages` was the entire case
+            # history. Two things came out wrong on every closing run: the
+            # summary shown was the previous run's ("Waiting on the customer"
+            # printed after the money had already arrived), and the primary
+            # action was the previous run's too — a run that called only
+            # manage_memory reported "Agent executed: wait_for_customer,
+            # Primary action: page_push".
+            prior_ids: set[str] = set()
+            try:
+                snap = agent.graph.get_state(config)
+                prior_ids = {m.id for m in (snap.values or {}).get("messages", [])
+                             if getattr(m, "id", None)}
+            except Exception:
+                pass
+
             all_messages = []
             seen_events = set()
             if len(_emitted_tool_events) > _EMITTED_CASES_MAX:
@@ -887,7 +905,8 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                             "phase": current_phase,
                             "node": node_name,
                         })
-                    msgs = state_update.get("messages", [])
+                    msgs = [m for m in state_update.get("messages", [])
+                            if getattr(m, "id", None) not in prior_ids]
                     all_messages.extend(msgs)
                     for msg in msgs:
                         # Only emit for AIMessage and ToolMessage — skip Human/System
