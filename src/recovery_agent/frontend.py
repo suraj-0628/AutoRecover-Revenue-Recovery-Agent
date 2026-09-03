@@ -390,6 +390,29 @@ def _notify_agent_of_recovery(payment_id: str, amount: float, recovery_payment_i
     # push it toward waiting a day instead of sending the link that actually
     # worked.
     arrival = _how_it_arrived(how)
+
+    # Name the surfaces the link went out on, and say we cannot tell them apart.
+    #
+    # The same URL is put on the page banner, in the email and in the SMS.
+    # Razorpay reports that the LINK was paid; it does not report which surface
+    # the click came from. Told only "they paid the link", the agent filled the
+    # gap and wrote "full recovery via email/SMS channel" into a permanent
+    # lesson — while a discount banner with that same link sat on the page in
+    # front of the customer. A guess is not a finding, and this one would push
+    # the next recovery toward email when the page may have done the work.
+    surfaces = []
+    for a in (p.get("actions_tried") or []):
+        if a.startswith("page_offer:"):
+            surfaces.append("the offer banner on the page")
+        elif a.startswith("notify:"):
+            channels = a.split(":", 2)[1].replace("+", " and ") if ":" in a else "email"
+            surfaces.append(f"{channels}")
+    ambiguous = "link" in (how or "") and len(surfaces) > 1
+    if ambiguous:
+        arrival += (f" — and that link was on {len(surfaces)} surfaces at once "
+                    f"({', '.join(surfaces)}), so which one they clicked is not "
+                    f"recorded anywhere")
+
     pending_retry = ""
     if (p.get("scheduled_job") or {}).get("target_timestamp") and "link" in (how or ""):
         pending_retry = (" A background retry was scheduled and has NOT fired; it "
@@ -400,10 +423,13 @@ def _notify_agent_of_recovery(payment_id: str, amount: float, recovery_payment_i
         f"RECOVERED. INR {amount:,.2f} is in "
         f"({recovery_payment_id or 'payment id unavailable'}), {seconds}s after "
         f"{what}{offer_note}. HOW IT ARRIVED: {arrival}.{pending_retry} "
-        f"Attribute the win to that channel and nothing else — the lesson you "
-        f"store here is permanent, and a wrong one will send the next recovery "
-        f"down the wrong path. Close the case with close_case, outcome "
-        f"'recovered'. Do NOT contact the customer again.",
+        + (f"Credit the OFFER, which is what you can see worked — naming a "
+           f"channel here would be a guess. "
+           if ambiguous else
+           f"Attribute the win to that channel and nothing else. ")
+        + f"The lesson you store is permanent, and a wrong one will send the "
+        f"next recovery down the wrong path. Close the case with close_case, "
+        f"outcome 'recovered'. Do NOT contact the customer again.",
         scenario="recovered",
     )
 

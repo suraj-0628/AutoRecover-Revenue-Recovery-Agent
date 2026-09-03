@@ -40,9 +40,9 @@ def test_an_unknown_route_does_not_invent_one():
 
 def test_the_observation_carries_the_attribution():
     i = FRONTEND.index("HOW IT ARRIVED")
-    body = FRONTEND[i - 1200:i + 700]
+    body = FRONTEND[i - 2600:i + 900]
     assert "arrival = _how_it_arrived(how)" in body
-    assert "the lesson you" in body and "permanent" in body
+    assert "The lesson you store is permanent" in body
 
 
 def test_a_pending_retry_is_explicitly_ruled_out_when_a_link_was_paid():
@@ -74,3 +74,55 @@ def test_the_recorded_reason_matches_the_agents_decision():
     24-hour job the agent had chosen deliberately."""
     i = FRONTEND.index("agent scheduled a retry in")
     assert "delay_hours" in FRONTEND[i - 200:i + 300]
+
+
+# ── do not name a channel that cannot be seen ───────────────────────────
+
+def _observation(actions, how, tmp_path):
+    from recovery_agent import state_store
+    state_store._DATA_DIR = tmp_path
+    state_store.StateStore.reset_instances()
+    from recovery_agent.state_store import StateStore
+    import recovery_agent.frontend as F
+    s = StateStore()
+    s.save_payment("p", {"payment_id": "p", "amount": 1299.0, "status": "recovered",
+                         "recovered_amount": 1234.05, "customer": {"email": "a@b.com"},
+                         "last_action": "send_notification",
+                         "actions_tried": actions})
+    s.flush()
+    seen = {}
+    real_handoff, real_store = F._handoff_to_agent, F.store
+    F._handoff_to_agent = lambda pid, obs, scenario: seen.update(obs=obs)
+    F.store = s
+    try:
+        F._notify_agent_of_recovery("p", 1234.05, "pay_X", 20, how)
+    finally:
+        F._handoff_to_agent, F.store = real_handoff, real_store
+        state_store.StateStore.reset_instances()
+    return seen["obs"]
+
+
+def test_a_link_on_several_surfaces_is_not_credited_to_one(tmp_path):
+    """The same URL goes on the page banner, in the email and in the SMS.
+    Razorpay reports the LINK was paid, never which surface the click came from.
+    Told only "they paid the link", the agent wrote "full recovery via email/SMS
+    channel" into a permanent lesson — while a banner carrying that same link
+    sat on the page in front of the customer."""
+    obs = _observation(["page_offer:1234.05", "notify:email+sms:https://rzp.io/x"],
+                       "link plink_A paid (poll)", tmp_path)
+    assert "2 surfaces at once" in obs
+    assert "not recorded anywhere" in obs
+    assert "naming a channel here would be a guess" in obs
+    assert "Attribute the win to that channel" not in obs, "would contradict itself"
+
+
+def test_a_single_surface_is_still_credited_plainly(tmp_path):
+    obs = _observation([], "customer paid on the checkout page", tmp_path)
+    assert "Attribute the win to that channel" in obs
+    assert "surfaces at once" not in obs
+
+
+def test_one_surface_only_is_not_treated_as_ambiguous(tmp_path):
+    obs = _observation(["notify:email:https://rzp.io/x"],
+                       "link plink_A paid (poll)", tmp_path)
+    assert "surfaces at once" not in obs
