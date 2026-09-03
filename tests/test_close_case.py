@@ -190,3 +190,14 @@ def test_the_prompt_pairs_escalation_with_the_ending():
     body = GRAPH[i:i + 700]
     assert "close_case" in body
     assert "abandoned, not delegated" in body
+
+
+def test_the_executed_tool_line_names_the_action_not_the_last_call():
+    """A run whose agent closed the case reported "Agent executed:
+    manage_memory" — the self-critique node's own reflection write, which the
+    agent did not do. It sat directly above "Primary action: close_case" and
+    contradicted it."""
+    i = FRONTEND.index("_ACTION_TOOL = {")
+    body = FRONTEND[i:i + 600]
+    assert '"close_case": "close_case"' in body
+    assert '"send_notification": "send_recovery_notification"' in body

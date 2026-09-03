@@ -1116,7 +1116,23 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             # available, never the most severe one.
             action_val, sdk_res = "none", {}
 
-        tool_name_str = list(tool_calls_made.keys())[-1] if tool_calls_made else "agent"
+        # Name the tool that DID the thing, not whichever ran last.
+        #
+        # This took the last key in call order, so a run whose agent closed the
+        # case reported "Agent executed: manage_memory" — the self-critique
+        # node's own reflection write, which is not something the agent did at
+        # all. The line sat directly above "Primary action: close_case" and
+        # contradicted it.
+        _ACTION_TOOL = {
+            "close_case": "close_case",
+            "escalate_to_human": "escalate_to_human",
+            "page_push": "send_page_push",
+            "send_notification": "send_recovery_notification",
+            "wait_and_retry": "retry_in_hours",
+        }
+        tool_name_str = (_ACTION_TOOL.get(action_val)
+                         or (list(tool_calls_made.keys())[-1] if tool_calls_made
+                             else "agent"))
         act_span.set_attribute("action", action_val)
         act_span.set_attribute("strategy_source", strategy_source)
 
