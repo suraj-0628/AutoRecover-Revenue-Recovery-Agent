@@ -100,3 +100,40 @@ def test_the_approval_refusal_states_its_headroom():
 def test_the_refusal_still_works_without_headroom_details():
     from recovery_agent.agent.graph import _approval_refusal
     assert _approval_refusal(None)["status"] == "blocked"
+
+
+# ── A settled case must survive a failed run ────────────────────────────
+
+def test_a_failed_run_does_not_overwrite_a_settled_case():
+    """pay_f6qrbnlez was recovered for real — INR 2,374.05 captured. The CLOSING
+    run, whose only job was to write a memory, hit an LLM 404 and rewrote the
+    case to `failed`. A recovery became a recorded loss because the agent could
+    not talk about it afterwards."""
+    i = FRONTEND.index('step="llm_unavailable"')
+    body = FRONTEND[i - 1500:i + 1800]
+    assert 'settled in ("recovered", "escalated")' in body
+    assert "if not terminal:" in body, "only a non-terminal case may be marked failed"
+
+
+def test_the_failure_message_does_not_claim_a_fallback_that_does_not_run():
+    i = FRONTEND.index('step="llm_unavailable"')
+    body = FRONTEND[i:i + 700]
+    assert "Thompson bandit" not in body, (
+        "no bandit runs on this path; the case is simply over"
+    )
+
+
+# ── The HUD must not replay earlier runs ────────────────────────────────
+
+def test_tool_events_are_deduped_across_runs_not_just_within_one():
+    """`mask_tool_outputs_node` returns the whole message list and the
+    checkpointer restores earlier runs into it, so a hand-off run re-streamed
+    every previous tool call. The giveaway was "created memory 22463f71-..."
+    printing twice with the identical id."""
+    assert "_emitted_tool_events" in FRONTEND
+    i = FRONTEND.index("for s in agent.graph.stream(")
+    body = FRONTEND[i - 600:i + 3500]
+    assert "shown = _emitted_tool_events.setdefault" in body
+    assert 'sig = f"thinking:{tc.get(\'id\') or tc[\'name\']}"' in body, (
+        "dedup by tool_call id, so a genuine repeat still shows"
+    )

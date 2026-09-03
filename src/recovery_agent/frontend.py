@@ -479,6 +479,23 @@ def push_response():
 active_agent_payments: set[str] = set()
 
 
+# What each case has already shown on the HUD, keyed by tool_call id.
+#
+# `mask_tool_outputs_node` returns the WHOLE message list as its update, and the
+# checkpointer restores the previous runs' messages into it — so a hand-off run
+# streamed every earlier tool call again. Live, run 2 of a case re-printed run
+# 1's push, diagnosis and history verbatim, and re-printed
+# "created memory 22463f71-..." with the identical id, which is what gave it
+# away: the agent had not called anything twice, the HUD had shown it twice.
+# It made a correct agent look like it was looping, and made a guard that had
+# refused a repeated push look like it had never fired.
+#
+# Per-run dedup cannot fix this — the duplicates arrive in a later run. Keyed by
+# tool_call id, which is unique per real call, so a genuine repeat still shows.
+_emitted_tool_events: dict[str, set[str]] = {}
+_EMITTED_CASES_MAX = 500
+
+
 def push_event(payment_id: str, event_type: str, data: dict):
     payload = {"payment_id": payment_id, "event": event_type, "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"), **data}
     socketio.emit("agent_event", payload)
@@ -852,6 +869,9 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         try:
             all_messages = []
             seen_events = set()
+            if len(_emitted_tool_events) > _EMITTED_CASES_MAX:
+                _emitted_tool_events.clear()
+            shown = _emitted_tool_events.setdefault(payment_id, set())
             current_phase = "initializing"
             for s in agent.graph.stream(initial_state, config=config, context=context, stream_mode="updates"):
                 if not s:
@@ -876,20 +896,20 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                         # Dedup by content signature to handle copies from mask_outputs
                         if isinstance(msg, AIMessage) and msg.tool_calls:
                             for tc in msg.tool_calls:
-                                sig = f"thinking:{tc['name']}:{json.dumps(tc['args'], default=str)[:100]}"
-                                if sig in seen_events:
+                                sig = f"thinking:{tc.get('id') or tc['name']}"
+                                if sig in shown:
                                     continue
-                                seen_events.add(sig)
+                                shown.add(sig)
                                 emit_thought(
                                     step="agent_thinking",
                                     thought=f"[AGENT] Calling tool: {tc['name']}",
                                     detail=f"Args: {json.dumps(tc['args'], default=str)[:200]}",
                                 )
                         elif isinstance(msg, ToolMessage):
-                            sig = f"result:{msg.name}:{msg.tool_call_id}"
-                            if sig in seen_events:
+                            sig = f"result:{msg.tool_call_id}"
+                            if sig in shown:
                                 continue
-                            seen_events.add(sig)
+                            shown.add(sig)
                             content = msg.content[:300] if msg.content else "(empty)"
                             emit_thought(
                                 step="tool_result",
@@ -918,24 +938,36 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             # Graph error or LLM unavailable — surface the real error
             print(f"[Frontend] Graph stream error for {payment_id}: {type(e).__name__}: {e}", flush=True)
             import traceback as _tb; _tb.print_exc()
+            # Say what actually happened. There is no bandit fallback here and
+            # never was — the run is simply over. Claiming "using empirical data
+            # for decisions" described a recovery that was not being attempted.
+            settled = (store.get_payment(payment_id) or {}).get("status") \
+                if store.has_payment(payment_id) else None
+            terminal = settled in ("recovered", "escalated")
             emit_thought(
                 step="llm_unavailable",
-                thought="LLM UNAVAILABLE — Using Thompson bandit + heuristic fallback",
-                detail=f"Error: {e}. Agent will use empirical data for decisions.",
+                thought=("AGENT RUN FAILED — the case keeps its settled outcome"
+                         if terminal else
+                         "AGENT RUN FAILED — no recovery action was taken"),
+                detail=f"Error: {e}",
             )
-            store.update_payment(payment_id,
-                status="failed",
-                strategy_reasoning=str(e),
-                strategy_source="graph_error",
-                tier="ERROR",
-                ts=datetime.now(timezone.utc).strftime("%H:%M:%S"),
-            )
+            # A failed run must NOT overwrite a settled case. `pay_f6qrbnlez` was
+            # recovered for real — INR 2,374.05 captured — and the CLOSING run,
+            # whose only job was to write a memory, hit an LLM 404 and rewrote
+            # the case to `failed`. A recovery became a recorded loss because
+            # the agent could not talk about it afterwards.
+            fields = dict(strategy_reasoning=str(e), strategy_source="graph_error",
+                          last_error=str(e)[:300],
+                          ts=datetime.now(timezone.utc).strftime("%H:%M:%S"))
+            if not terminal:
+                fields.update(status="failed", tier="ERROR")
+            store.update_payment(payment_id, **fields)
             _do_flush()
             _emit_status_summary()
             return {
-                "status": "failed",
+                "status": settled if terminal else "failed",
                 "strategy_reasoning": str(e),
-                "tier": "ERROR",
+                "tier": "SETTLED" if terminal else "ERROR",
             }
 
       # ── EXTRACT RESULTS FROM REACT AGENT ──
