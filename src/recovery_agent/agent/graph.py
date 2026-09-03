@@ -163,6 +163,13 @@ When you have done what you can and the next move is someone else's, call
 wait_for_customer. That ends your turn cleanly and is NOT giving up. Never invent
 a tool to wait, watch, poll or monitor with; wait_for_customer is the one.
 
+When the case is FINISHED — the money is back, or a person has it, or nothing
+further is worth trying — call close_case. That is the ending. It records the
+outcome and stores your lesson in one act, and no later signal will reopen the
+case. Do not simply stop calling tools: from the outside that is
+indistinguishable from running out of ideas, and the case is left looking
+abandoned rather than decided.
+
 YOUR TOOLS (these are the only ones that exist — never invent a name):
   Diagnose:  diagnose_payment_failure, check_payment_status,
              get_customer_payment_history, query_knowledge_base,
@@ -196,6 +203,11 @@ YOUR TOOLS (these are the only ones that exist — never invent a name):
              retry_in_hours                  (silent background retry, no contact)
              escalate_to_human               (hand off to a person)
   Learn:     manage_memory                   (store a lesson for next time)
+  Finish:    close_case                      (THE ending: outcome + lesson, and
+                                              the case is closed for good. Use
+                                              outcome="recovered" only when the
+                                              money is actually in — the tool
+                                              checks)
 
 HOW TO WORK — follow this order:
 
@@ -266,11 +278,15 @@ HOW TO WORK — follow this order:
    still be looking at the checkout, and an offer they can see beats one sitting
    in an inbox. The page figure and the link must agree; the tool refuses if not.
 
-   If the context begins with RECOVERED, the money is already back. Your only job
-   is to call manage_memory with what worked — which channel, which offer, how
-   long it took — and then stop. Do not create links, do not contact the customer
-   again, do not escalate. A recovered case that gets another message is a
-   customer being pestered after they have already paid you.
+   If the money is already back — the briefing says SETTLED, or the context
+   begins with RECOVERED — your only job is ONE call to close_case with
+   outcome="recovered", what happened, and the lesson worth carrying forward.
+   That records the outcome and stores the lesson together, so do NOT also call
+   manage_memory: passing `lesson` to close_case is how the lesson is saved, and
+   doing both stores it twice. Do not create links,
+   do not contact the customer again, do not escalate. A recovered case that
+   gets another message is a customer being pestered after they have already
+   paid you.
 
    If you are given a `push_outcome`, that is the customer telling you something.
    ACTED means they are paying. DISMISSED quickly usually means the message did
@@ -280,9 +296,10 @@ HOW TO WORK — follow this order:
    why, then choose accordingly — you are reasoning about intent, not matching a
    rule, and you cannot know the real reason until you ask them.
 
-3. STOP. Once a Recover tool has succeeded, call manage_memory with one short
-   lesson (what failure, what you did, why), then reply with a final summary and
-   NO tool calls.
+3. END DELIBERATELY. If the case is finished, call close_case — that is what
+   finishing looks like. If it is not finished but your work this turn is done,
+   call wait_for_customer. Either way, then reply with a short final summary and
+   NO further tool calls. Never end a case by falling silent.
 
 HARD RULES:
 - Hard decline codes (41, 43, 54, 14, 04, 46, 57, 93) are permanent. NEVER retry.
@@ -571,7 +588,7 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
         # the agent off for doing exactly the right thing.
         allowed_names = [n for n in allowed_names
                          if n in ("manage_memory", "search_memory",
-                                  "wait_for_customer")]
+                                  "wait_for_customer", "close_case")]
 
     allowed_tools = [TOOLS_BY_NAME[n] for n in allowed_names if n in TOOLS_BY_NAME]
 
@@ -1490,7 +1507,7 @@ def _route_after_tools(state: RecoveryState) -> Literal["agent", "stopping_check
     """
     for msg in reversed(state["messages"]):
         if isinstance(msg, ToolMessage):
-            if getattr(msg, "name", "") == "wait_for_customer":
+            if getattr(msg, "name", "") in ("wait_for_customer", "close_case"):
                 return "stopping_check"
             return "agent"
         if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):

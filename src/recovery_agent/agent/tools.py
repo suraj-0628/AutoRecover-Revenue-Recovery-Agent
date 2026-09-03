@@ -567,6 +567,138 @@ def wait_for_customer(
 
 
 @tool
+def close_case(
+    payment_id: str,
+    outcome: str,
+    what_happened: str,
+    lesson: str = "",
+    runtime=None,
+) -> str:
+    """Declare this case finished and stop working it. The last thing you call.
+
+    Stopping used to be something the agent did by simply not calling another
+    tool — indistinguishable, from the outside, from running out of ideas or
+    hitting a limit. Nothing recorded that the agent had *decided* the case was
+    over, so nothing could tell a deliberate ending from a stalled one, and the
+    case's outcome had to be inferred from which tools happened to run last.
+
+    This is the explicit ending. It writes the outcome to the case record and
+    the lesson to long-term memory in one act, and closes the case so no later
+    signal reopens it.
+
+    Args:
+        payment_id: The payment you are closing
+        outcome: One of "recovered" (the money is in), "escalated" (a person has
+            it now), or "unrecoverable" (nothing further is worth trying and no
+            person can help either)
+        what_happened: One or two sentences a colleague could read cold
+        lesson: What you would want to know facing this customer or this failure
+            again. Stored for future cases; leave empty only if there is nothing
+            worth carrying forward.
+
+    Returns:
+        Confirmation the case is closed. Your turn is over — call nothing else.
+    """
+    from recovery_agent.agent.perception import ground_truth
+
+    outcome = str(outcome or "").strip().lower()
+    if outcome not in ("recovered", "escalated", "unrecoverable"):
+        return json.dumps({
+            "status": "error",
+            "reason": f"unknown outcome {outcome!r}",
+            "guidance": "Use recovered, escalated, or unrecoverable.",
+        })
+
+    facts = ground_truth(payment_id, verify=True)
+
+    # A claim of victory is checked against the money, not taken on trust. The
+    # agent writes the summary; whether the payment happened is not its to
+    # assert.
+    if outcome == "recovered" and not facts.get("settled"):
+        return json.dumps({
+            "status": "blocked",
+            "reason": "no payment is recorded for this case, so it cannot be "
+                      "closed as recovered",
+            "outstanding": facts.get("outstanding"),
+            "guidance": "Call check_payment_status to see where this stands. If "
+                        "the money genuinely is not back, keep working the "
+                        "ladder or close it with a different outcome.",
+        })
+
+    if outcome == "unrecoverable":
+        from recovery_agent.agent import ladder as _lad
+        try:
+            from recovery_agent.state_store import StateStore
+            rec = StateStore().get_payment(payment_id) or {}
+        except Exception:
+            rec = {}
+        if rec and not _lad.exhausted(rec) and not _lad.pursuit_barred(rec):
+            nxt = _lad.next_rung(rec)
+            return json.dumps({
+                "status": "blocked",
+                "reason": "the ladder is not exhausted, so this is not "
+                          "unrecoverable yet",
+                "next_rung": nxt["rung"] if nxt else None,
+                "guidance": (f"Try {nxt['what']} first." if nxt else
+                             "Escalate to a human instead."),
+            })
+
+    closed = {
+        "outcome": outcome,
+        "what_happened": str(what_happened or "")[:600],
+        "at": datetime.now(timezone.utc).isoformat(),
+        "amount_recovered": facts.get("received", 0.0),
+    }
+    try:
+        from recovery_agent.state_store import StateStore
+        store = StateStore()
+        if store.get_payment(payment_id) is not None:
+            fields = {"closed": closed, "closing_summary": closed["what_happened"]}
+            if outcome == "recovered":
+                fields["status"] = "recovered"
+            elif outcome == "escalated":
+                fields["status"] = "escalated"
+            else:
+                fields["status"] = "unrecoverable"
+            store.update_payment(payment_id, **fields)
+            store.flush()
+    except Exception as exc:
+        return json.dumps({"status": "error",
+                           "message": f"could not record the closure: {exc}"})
+
+    # The lesson goes in here rather than being a second call the agent has to
+    # remember — closing and learning are one act, and a lesson that depends on
+    # a follow-up tool is a lesson that gets lost when the turn ends first.
+    stored = ""
+    if lesson.strip():
+        try:
+            from recovery_agent.agent.graph import get_memory_store
+            import uuid as _uuid
+            cust = (facts.get("customer_email")
+                    or (StateStore().get_payment(payment_id) or {}).get("customer_email")
+                    or "unknown")
+            key = str(_uuid.uuid4())
+            get_memory_store().put(("recovery", ns_safe(cust)), key, {
+                "content": f"[{outcome}] {lesson.strip()[:800]}",
+                "payment_id": payment_id,
+                "amount_recovered": facts.get("received", 0.0),
+            })
+            stored = key
+        except Exception as exc:
+            stored = f"(not stored: {exc})"
+
+    return json.dumps({
+        "status": "closed",
+        "payment_id": payment_id,
+        "outcome": outcome,
+        "amount_recovered": facts.get("received", 0.0),
+        "lesson_stored": stored,
+        "note": "This case is closed. Your turn is over — call nothing else, "
+                "and reply with a short final summary.",
+    })
+
+
+@tool
 def send_page_push(
     payment_id: str,
     headline: str,
@@ -1501,6 +1633,7 @@ RECOVERY_TOOLS = [
     send_page_push,
     show_page_offer,
     wait_for_customer,
+    close_case,
     send_recovery_notification,
     retry_in_hours,
     escalate_to_human,

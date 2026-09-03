@@ -419,6 +419,15 @@ def _handoff_to_agent(payment_id: str, observation: str, scenario: str) -> None:
     # point of telling the agent it worked.
     if scenario != "recovered" and p.get("status") in ("recovered", "escalated"):
         return
+    # The agent said this case was over. A closure it declared explicitly is a
+    # decision, not a side effect of running out of tools, and a late timer or a
+    # stray push outcome must not restart it.
+    if p.get("closed"):
+        push_event(payment_id, "handoff_blocked", {
+            "detail": f"case closed as {(p['closed'] or {}).get('outcome')} — "
+                      f"not reopening",
+        })
+        return
     # One hand-off per OCCURRENCE, not per kind.
     #
     # Keyed on the scenario alone, a customer could only ever be listened to
@@ -1075,8 +1084,15 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         retry_res = _ok("retry_in_hours") or _ok("schedule_retry")
         notify_res = _ok("send_recovery_notification")
         escalate_res = (tool_calls_made.get("escalate_to_human") or {}).get("result") or {}
+        close_res = (tool_calls_made.get("close_case") or {}).get("result") or {}
+        if close_res.get("status") == "closed":
+            # The run that closes a case reported "Primary action: none",
+            # because closing was not an action anything recognised.
+            action_val, sdk_res = "close_case", close_res
 
-        if escalate_res:
+        if close_res.get("status") == "closed":
+            pass                        # already chosen above; it outranks the rest
+        elif escalate_res:
             action_val, sdk_res = "escalate_to_human", escalate_res
         elif push_res and not (link_res or notify_res):
             # A push on its own is the silent first rung. The case is waiting on
@@ -1218,6 +1234,16 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                 thought=f"Background Retry Scheduled: {sdk_res.get('job_id', 'N/A')}",
                 detail=f"Target: {sdk_res.get('target_timestamp', 'N/A')} | Confidence: {sdk_res.get('confidence', 0):.0%} | Reason: {sdk_res.get('reason', '')}",
                 ui_morph="SCHEDULED_RETRY",
+            )
+        elif action_val == "close_case":
+            emit_thought(
+                step="stopping",
+                thought=f"Case closed: {sdk_res.get('outcome', 'unknown').upper()}"
+                        + (f" — INR {float(sdk_res.get('amount_recovered') or 0):,.2f} recovered"
+                           if sdk_res.get("outcome") == "recovered" else ""),
+                detail=(tool_calls_made.get("close_case", {}).get("args", {})
+                        .get("what_happened", "")),
+                ui_morph="RECOVERED" if sdk_res.get("outcome") == "recovered" else "ESCALATED",
             )
         elif action_val == "escalate_to_human":
             emit_thought(

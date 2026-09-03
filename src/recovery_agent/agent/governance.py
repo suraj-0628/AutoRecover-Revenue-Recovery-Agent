@@ -70,6 +70,9 @@ class ToolAccessPolicy(BaseModel):
         "retry_in_hours",
         "escalate_to_human",
         "wait_for_customer",
+        # A settled case must always be closable, whatever tier it is in.
+        # Withholding the ending is how a finished case ends up merely stopping.
+        "close_case",
     ])
     active_tools: list[str] = Field(default_factory=lambda: [
         "send_page_push",
