@@ -207,13 +207,26 @@ def test_the_banner_can_be_acted_on_and_turned_down():
     assert 'reportPush("acted"' in body and 'reportPush("dismissed"' in body
 
 
-def test_no_push_once_an_offer_is_on_the_page():
+def test_there_is_only_ever_one_push_per_case():
+    """Two guards used to exist — "already dismissed" and "an offer is already
+    on the page" — and both prevented the same thing. The rung is the simpler
+    statement of it: once a push has been delivered, the silent rung is spent,
+    whatever the customer did with it."""
     TOOLS = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
              / "agent" / "tools.py").read_text()
     i = TOOLS.index("def send_page_push")
     body = TOOLS[i:i + 4000]
-    assert 'ladder.climbed(live, "offer")' in body
-    assert "noise, not another chance" in body
+    assert 'ladder.climbed(live, "page_push")' in body
+    assert "there is no second one" in body
+    assert 'climbed(live, "offer")' not in body, "one rule, not three"
+
+
+def test_nothing_supersedes_a_notification_any_more():
+    """The replacement machinery existed only because a second push could take
+    the place of a first."""
+    FRONTEND_SRC = (pathlib.Path(__file__).resolve().parents[1] / "src"
+                    / "recovery_agent" / "frontend.py").read_text()
+    assert "superseded" not in FRONTEND_SRC
 
 
 def test_the_plain_push_cannot_carry_a_link_or_an_offer():

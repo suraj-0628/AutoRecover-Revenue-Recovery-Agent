@@ -267,7 +267,7 @@ def _record_push_outcome(payment_id: str, action: str, seconds_shown: float = 0.
         return
     p = store.get_payment(payment_id)
     prior = p.get("push_outcome") or {}
-    if prior and prior.get("action") != "superseded":
+    if prior:
         return                          # first real outcome wins; never double-handle
 
     push = p.get("pending_push") or {}
@@ -275,7 +275,6 @@ def _record_push_outcome(payment_id: str, action: str, seconds_shown: float = 0.
         "action": action,                       # acted | dismissed | ignored
         "seconds_shown": round(float(seconds_shown or 0), 1),
         "headline": push.get("headline", ""),
-        "offer_text": push.get("offer_text", ""),
         "detail": detail,
         "at": datetime.now(timezone.utc).isoformat(),
     }
@@ -293,12 +292,6 @@ def _record_push_outcome(payment_id: str, action: str, seconds_shown: float = 0.
         socketio.start_background_task(_watch_for_recovery, payment_id, 420)
         return
 
-    if action == "superseded":
-        # The agent replaced its own message. That is not the customer telling us
-        # anything, so it is recorded but must not trigger another hand-off —
-        # doing so would have the agent react to itself.
-        return
-
     # Hand the observation to the agent. Deliberately NOT interpreted here — the
     # agent is told what the customer did and reasons about why, and about which
     # channel that implies. Encoding "dismissed => send email" in this function
@@ -307,7 +300,6 @@ def _record_push_outcome(payment_id: str, action: str, seconds_shown: float = 0.
         payment_id,
         f"In-page notification outcome: the customer {action.upper()} it after "
         f"{outcome['seconds_shown']:.0f}s. Shown: {push.get('headline','(none)')!r}"
-        + (f" with offer {push.get('offer_text')!r}" if push.get("offer_text") else " with no offer")
         + f". {detail} Work out what that behaviour implies about their intent, "
           f"then choose the channel most likely to recover this payment. Do not "
           f"repeat a channel that has already failed.",
@@ -617,9 +609,9 @@ def push_response():
     data = request.get_json(silent=True) or {}
     payment_id = str(data.get("payment_id") or "")
     action = str(data.get("action") or "").lower()
-    if not payment_id or action not in ("acted", "dismissed", "superseded"):
+    if not payment_id or action not in ("acted", "dismissed"):
         return jsonify({
-            "error": "payment_id and action (acted|dismissed|superseded) required"
+            "error": "payment_id and action (acted|dismissed) required"
         }), 400
     _record_push_outcome(payment_id, action,
                          seconds_shown=data.get("seconds_shown", 0),
@@ -2142,13 +2134,11 @@ socket.on("agent_push", function(d) {
     });
   };
   const old = document.getElementById("agent-push");
-  if (old) {
-    /* A newer notification is taking its place. Removing it silently made it
-       look like the message disappeared on its own after a few seconds, and the
-       customer's non-response to it was lost — so report it honestly first. */
-    reportPush("superseded", "Replaced by a newer notification.");
-    old.remove();
-  }
+  /* Nothing replaces a notification any more: there is one push, and an offer
+     arrives as a banner. If the plain card is still up when the banner lands,
+     it goes quietly — the banner's own outcome becomes the case's outcome, so
+     nothing is lost by not reporting a handover that no longer happens. */
+  if (old) old.remove();
   _pushShownAt = Date.now(); _pushReported = false;
 
   /* Coupon banner: the offer is not just described in the notification, it is

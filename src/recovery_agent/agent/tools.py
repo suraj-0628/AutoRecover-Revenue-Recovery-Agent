@@ -844,51 +844,34 @@ def send_page_push(
         `no_active_session` means the customer already left.
     """
     case = getattr(getattr(runtime, "context", None), "case", None) if runtime else None
-    meta = (case.payment.metadata if case is not None else {}) or {}
 
-    # A plain nudge is the SILENT rung. Once the customer has dismissed one, that
-    # channel has already failed, and sending another changes nothing — except on
-    # screen, where the plain notification appears moments before the offer banner
-    # and looks as though the plain one carried the discount.
-    # Read the LIVE record, not the snapshot taken when this run started. The
+    # ONE push per case, ever.
+    #
+    # This used to be two guards — one for "the customer already dismissed a
+    # plain notification", one for "an offer is already on the page" — and both
+    # existed to stop the same thing: a second notification. The rung itself is
+    # the simpler statement of it. If a push has been delivered for this case,
+    # the silent rung is spent, whatever the customer did with it.
+    #
+    # Read the LIVE record, not the snapshot taken when this run started: the
     # metadata copy is written once at case construction, so anything the
     # customer did after that — including the dismissal that triggered this very
-    # run — can be missing from it. Live in a real run the agent sent a second
-    # plain push to a customer who had already dismissed one, because the
-    # snapshot said there had been no outcome.
-    prior = meta.get("push_outcome") or {}
+    # run — can be missing from it.
     live: dict = {}
     try:
         from recovery_agent.state_store import StateStore
         live = StateStore().get_payment(payment_id) or {}
-        prior = live.get("push_outcome") or prior
     except Exception:
         pass
 
-    if prior.get("action") in ("dismissed", "ignored"):
+    if ladder.climbed(live, "page_push"):
+        outcome = (live.get("push_outcome") or {}).get("action") or "no response"
         return json.dumps({
             "status": "blocked",
-            "reason": f"the customer already {prior['action']} a plain notification "
-                      f"on this page; repeating it will not work",
-            "guidance": "Use show_page_offer with an authorised discount, or reach "
-                        "them on another channel.",
-        })
-
-    # One notification per customer, and this is it.
-    #
-    # Once the offer rung is reached the on-page channel belongs to the discount
-    # banner, which carries its own price, countdown and button. A push as well
-    # means two things stacked on one checkout for someone who has already read
-    # the first — and the second is a worse version of the banner sitting right
-    # above it.
-    if ladder.climbed(live, "offer"):
-        return json.dumps({
-            "status": "blocked",
-            "reason": "an offer is already on this page; a second notification "
-                      "on top of it is noise, not another chance",
-            "guidance": "The banner carries the offer, the price and the button. "
-                        "If the customer has not taken it, change channel — do "
-                        "not add to the page.",
+            "reason": f"this customer has already had the one in-page "
+                      f"notification ({outcome}); there is no second one",
+            "guidance": "The page has had its turn. Put an authorised discount "
+                        "on it with show_page_offer, or reach them off-page.",
         })
 
     # No link and no offer line. The button reopens the checkout the customer is
