@@ -276,7 +276,20 @@ def test_the_agent_no_longer_rewrites_the_checkout():
     assert "function applyGenerativeUISpec" not in FRONTEND
 
 
-def test_the_spec_still_drives_the_merchant_hud():
-    """Only the customer-facing application is removed; the merchant view still
-    shows what the agent decided."""
-    assert FRONTEND.count("ui_spec") > 10
+def test_the_generative_ui_spec_is_gone_from_the_agent_too():
+    """It was never generative: `ui_type` was a dict lookup, `subtext` was the
+    internal label "Recovery strategy: ...", `tone` was always "supportive",
+    and `hinglish_voice_script` was a canned sentence nothing read. Its
+    docstring promised "no hardcoded if/else branches"."""
+    MODELS = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+              / "models" / "__init__.py").read_text()
+    assert "GenerativeUISpec" not in MODELS
+    for token in ("ui_spec=", "ui_morph=", "GenerativeUISpec("):
+        assert token not in FRONTEND, token
+
+
+def test_the_case_facts_still_reach_the_merchant_hud():
+    """Tier, decline strategy and penalties are facts about the case; they used
+    to travel inside the fake spec and now travel as themselves."""
+    assert "case_state={" in FRONTEND
+    assert "data.case_state && data.case_state.recovery_tier" in INDEX

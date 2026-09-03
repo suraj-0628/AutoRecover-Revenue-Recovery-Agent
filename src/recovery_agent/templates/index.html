@@ -1234,7 +1234,6 @@
     const toolArgs = document.getElementById("tool-args");
     const toolKv = document.getElementById("tool-kv");
     const toolStatus = document.getElementById("tool-status");
-    const morphContainer = document.getElementById("morph-container");
     const voiceWidget = document.getElementById("voice-widget");
 
     let activePaymentId = "";
@@ -1500,25 +1499,8 @@
       } catch(e) { console.error('logThoughtWithTier error:', e); }
     }
 
-    function submitCardExpiryFix(event, pid) {
-      if (event) event.preventDefault();
-      const val = document.getElementById("expiry-input")?.value || "MM/YY";
-      fetch("/api/customer-responded", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ payment_id: pid || activePaymentId, updated_expiry: val })
-      })
-      .then(r => r.json())
-      .then(data => {
-        morphContainer.innerHTML = `
-          <div style="background:#f0fdf4; color:#166534; border:1px solid #bbf7d0; padding:12px; border-radius:4px; margin-top:12px; text-align:center; font-weight:600;">
-            Card Expiry (${val}) Updated & Payment Captured (Razorpay API Verified)
-          </div>`;
-        document.getElementById("p-recovered").className = "step-pill active-recovered";
-        document.getElementById("progress-status-label").textContent = "RECOVERED";
-        fetchMetrics();
-      });
-    }
+    /* `submitCardExpiryFix` lived here. Its only caller was the CARD_EXPIRY_FIXER
+       branch of the removed morph panel, so it became unreachable with it. */
 
     function startPaymentFromCanvas(scenarioReason) {
       const ctx = currentScenario || { amount: 2999, customer: { name: "Customer", email: "" }, item_name: "Order" };
@@ -1736,7 +1718,7 @@
       streamingPid = data.payment_id || null;
       if (data.payment_id) {
         const sess = sessionFor(data.payment_id);
-        const amt = data.amount || (data.ui_spec && data.ui_spec.amount) ||
+        const amt = data.amount || (data.case_state && data.case_state.amount) ||
                     (data.trail_amount) || null;
         if (amt) sess.amount = "INR " + Number(amt).toLocaleString("en-IN");
         if (data.status) sess.status = data.status;
@@ -1745,11 +1727,11 @@
         else renderTabs();
       }
 
-      // Extract tier info from guardrail or ui_spec
-      const tier = (data.guardrail && data.guardrail.recovery_tier) || (data.ui_spec && data.ui_spec.recovery_tier) || "active";
-      const strategy = (data.guardrail && data.guardrail.decline_strategy) || (data.ui_spec && data.ui_spec.decline_strategy) || "";
-      const penalties = (data.guardrail && data.guardrail.penalties_prevented) || (data.ui_spec && data.ui_spec.penalties_prevented) || 0;
-      const payday = (data.guardrail && data.guardrail.payday_target) || (data.ui_spec && data.ui_spec.payday_target) || "";
+      // Extract tier info from the guardrail or the case facts
+      const tier = (data.guardrail && data.guardrail.recovery_tier) || (data.case_state && data.case_state.recovery_tier) || "active";
+      const strategy = (data.guardrail && data.guardrail.decline_strategy) || (data.case_state && data.case_state.decline_strategy) || "";
+      const penalties = (data.guardrail && data.guardrail.penalties_prevented) || (data.case_state && data.case_state.penalties_prevented) || 0;
+      const payday = (data.guardrail && data.guardrail.payday_target) || (data.case_state && data.case_state.payday_target) || "";
 
       // Update compact status bar
       if (tier) {
@@ -1933,67 +1915,13 @@
         }
       }
 
-      // 3. Generative UI Morphing
-      const uiType = data.ui_morph || (data.ui_spec ? data.ui_spec.ui_type : null);
-      if (uiType) {
-        const spec = data.ui_spec || {};
-        const headline = spec.headline || "Razorpay Smart Intervention Active";
-        const subtext = spec.subtext || "Auto-detected failure pattern. Switching recovery rail.";
-        const cta = spec.primary_cta || "Complete Payment";
-        const discount = spec.discount_incentive ? `<div style="font-size:0.75rem; color:#166534; margin-top:4px;">Incentive: ${spec.discount_incentive}</div>` : "";
-
-        if (uiType === "SMART_FAILOVER_BANNER" || uiType === "PAYMENT_LINK_MODAL") {
-          morphContainer.innerHTML = `
-            <div class="gen-morph-box morph-failover">
-              <strong style="color:var(--accent-blue);">${headline}</strong><br/>
-              <span style="font-size:0.78rem; color:var(--text-muted);">${subtext}</span>
-              ${discount}
-              <button style="margin-top:8px; width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:8px; border-radius:4px; font-weight:600; font-family:var(--font-mono); cursor:pointer;" onclick="triggerScenario('degradation')">
-                ${cta}
-              </button>
-            </div>`;
-        } else if (uiType === "CARD_EXPIRY_FIXER") {
-          morphContainer.innerHTML = `
-            <form onsubmit="submitCardExpiryFix(event, '${data.payment_id || activePaymentId}')" class="gen-morph-box morph-expiry">
-              <strong style="color:var(--accent-amber);">${headline}</strong><br/>
-              <span style="font-size:0.78rem; color:var(--text-muted);">${subtext}</span>
-              ${discount}
-              <input type="text" id="expiry-input" placeholder="MM/YY" style="width:100%; margin-top:8px; padding:8px; border-radius:4px; border:1px solid var(--accent-amber); background:#0d1117; color:var(--text-bright); font-family:var(--font-mono);" value=""/>
-              <button type="submit" style="margin-top:8px; width:100%; background:#d29922; color:#0d1117; border:none; padding:8px; border-radius:4px; font-weight:600; font-family:var(--font-mono); cursor:pointer;">
-                ${cta}
-              </button>
-            </form>`;
-        } else if (uiType === "ABANDONMENT_WHATSAPP_OVERLAY") {
-          const cust = (currentScenario && currentScenario.customer) || { name: "Customer", contact: "" };
-          morphContainer.innerHTML = `
-            <div class="gen-morph-box morph-whatsapp">
-              <strong style="color:var(--accent-green);">${headline}</strong><br/>
-              <span style="font-size:0.78rem; color:var(--text-muted);">${subtext}</span>
-              <div class="wa-bubble">
-                <strong style="color:var(--accent-green);">WhatsApp Magic Link (${escapeHtml(cust.contact)}):</strong><br/>
-                "Hi ${escapeHtml(cust.name)}! We saved your cart. Complete purchase in 5 mins for instant cashback."
-                <button style="margin-top:8px; width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:8px; border-radius:4px; font-weight:600; font-family:var(--font-mono); cursor:pointer;" onclick="triggerScenario('abandonment')">
-                  Complete Purchase via Magic Link
-                </button>
-              </div>
-              ${discount}
-            </div>`;
-        } else if (uiType === "HINGLISH_VOICE_CALL") {
-          voiceWidget.classList.add("active");
-          const cust = (currentScenario && currentScenario.customer) || { name: "Customer" };
-          const vScript = spec.hinglish_voice_script || `Namaste ${cust.name} ji! Aapka Razorpay payment decline ho gaya hai. Tap karein to auto retry payment.`;
-          document.getElementById("voice-transcript").textContent = `"${vScript}"`;
-          speakHinglish(vScript);
-        } else if (uiType === "RECOVERY_SUCCESS") {
-          morphContainer.innerHTML = `
-            <div style="background:rgba(46,160,67,0.12); color:var(--accent-green); border:1px solid var(--accent-green); padding:12px; border-radius:4px; margin-top:12px; text-align:center; font-weight:600; font-family:var(--font-mono);">
-              Revenue Recovered & Payment Captured (Razorpay API Verified)
-            </div>`;
-          document.getElementById("p-recovered").className = "step-pill active-recovered";
-          document.getElementById("progress-status-label").textContent = "RECOVERED";
-          fetchMetrics();
-        }
-      }
+      /* The "Generative UI Morphing" panel is gone with the spec that fed it.
+         It rendered a mock of a customer screen — falling back to invented
+         copy like "Razorpay Smart Intervention Active", a canned Hinglish
+         voice line, and buttons wired to demo triggers — so it showed a page
+         no customer was ever on. The agent reaches customers through its one
+         notification and the offer banner, and both are visible in the live
+         view for what they actually are. */
     });
 
     let silentBannerShown = false;

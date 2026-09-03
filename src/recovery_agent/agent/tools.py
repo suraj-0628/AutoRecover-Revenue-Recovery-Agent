@@ -630,6 +630,18 @@ def show_page_offer(
         case.payment.metadata["page_offer"] = payload["offer"]
 
     if result.get("status") == "delivered":
+        # On the durable record too, not only the Case. A Case is rebuilt each
+        # run, so the discount that was shown vanished the moment the run ended
+        # — which is why the recovery observation's "after a 5% offer" note
+        # could never fire.
+        try:
+            from recovery_agent.state_store import StateStore
+            st = StateStore()
+            if st.get_payment(payment_id) is not None:
+                st.update_payment(payment_id, page_offer=payload["offer"])
+                st.flush()
+        except Exception:
+            pass
         ladder.record_rung(payment_id, "offer", payload["offer_text"])
         ladder.record_action(payment_id, f"page_offer:{payable_amount}", is_rung=True)
 

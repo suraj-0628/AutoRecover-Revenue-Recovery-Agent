@@ -370,7 +370,9 @@ def _notify_agent_of_recovery(payment_id: str, amount: float, recovery_payment_i
     what = p.get("last_action") or ""
     if what in ("", "none"):
         what = "your last recovery attempt"
-    offer = (p.get("ui_spec") or {}).get("offer") or {}
+    # `ui_spec` never had an `offer` field, so this read was always empty and
+    # the note it built never appeared. The offer tool records the real one.
+    offer = p.get("page_offer") or {}
     offer_note = (f" after a {offer.get('discount_pct')}% offer"
                   if offer.get("discount_pct") else "")
 
@@ -826,7 +828,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
     from recovery_agent.agent.memory import CustomerMemoryStore
 
 
-    from recovery_agent.models import Case, CaseStatus, PaymentEvent, GenerativeUISpec
+    from recovery_agent.models import Case, CaseStatus, PaymentEvent
     from recovery_agent.retry_scheduler import get_retry_windows, get_next_retry_time
 
     tracer = _get_tracer()
@@ -874,7 +876,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
       trail = list((store.get_payment(payment_id) or {}).get("trail") or []) \
           if store.has_payment(payment_id) else []
 
-      def emit_thought(step: str, thought: str, detail: str = "", tool_call: dict = None, guardrail: dict = None, memory: dict = None, ui_morph: str = None, ui_spec: dict = None):
+      def emit_thought(step: str, thought: str, detail: str = "", tool_call: dict = None, guardrail: dict = None, memory: dict = None, case_state: dict = None):
           entry = {
               "step": step,
               "msg": thought,
@@ -882,8 +884,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
               "tool_call": tool_call,
               "guardrail": guardrail,
               "memory": memory,
-              "ui_morph": ui_morph,
-              "ui_spec": ui_spec,
+              "case_state": case_state,
               "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
           }
           trail.append(entry)
@@ -1306,33 +1307,6 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                 agent_final_text = msg.content
                 break
 
-        from recovery_agent.models import GenerativeUISpec
-        ui_type_map = {
-            "card_expired": "CARD_EXPIRY_FIXER",
-            "network_timeout": "SMART_FAILOVER_BANNER",
-            "bank_declined": "BANK_DECLINED_RECOVERY",
-            "insufficient_funds": "INSUFFICIENT_FUNDS_SCHEDULER",
-            "mandate_revoked": "MANDATE_REAUTH_MODAL",
-            "risk_block": "RISK_VERIFICATION_FLOW",
-        }
-        ui_spec_dict = GenerativeUISpec(
-            ui_type=ui_type_map.get(cause, "PAYMENT_LINK_MODAL"),
-            headline=agent_final_text[:120] if agent_final_text else f"Payment of INR {amount:,.2f} needs attention",
-            subtext=f"Recovery strategy: {action_val.replace('_', ' ').title()}",
-            primary_cta_text="Complete Payment" if action_val != "escalate_to_human" else "Contact Support",
-            discount_incentive="",
-            target_rail=case.payment.metadata.get("recommended_rail", "payment_link"),
-            hinglish_voice_script=f"Namaste {customer.get('name', '')} ji! Aapka payment fail ho gaya hai. Hum aapki help karenge.",
-            tone="supportive",
-        )
-        emit_thought(
-            step="ui_spec",
-            thought=f"UI Spec: {ui_spec_dict.ui_type} ({ui_spec_dict.tone} tone)",
-            detail=f"Headline: {ui_spec_dict.headline}",
-            ui_morph=ui_spec_dict.ui_type,
-            ui_spec=ui_spec_dict.model_dump(),
-        )
-
         emit_thought(
             step="acting",
             thought=f"Agent executed: {tool_name_str}",
@@ -1342,9 +1316,11 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                 "args": {"payment_id": payment_id, "amount_in_paise": int(amount * 100), "currency": "INR", "customer": customer_email},
                 "raw_razorpay_response": sdk_res,
             },
-            ui_morph=ui_spec_dict.ui_type,
-            ui_spec={
-                **ui_spec_dict.model_dump(),
+            # The facts about the case, stated as facts. These used to travel
+            # inside a "GenerativeUISpec" — a dataclass whose docstring promised
+            # LLM-generated UI and delivered a dict lookup, a canned Hinglish
+            # line nothing read, and `tone="supportive"` on every case.
+            case_state={
                 "recovery_tier": recovery_tier,
                 "decline_strategy": cause,
                 "penalties_prevented": case.penalties_prevented,
@@ -1359,7 +1335,6 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                 step="stopping",
                 thought=f"Background Retry Scheduled: {sdk_res.get('job_id', 'N/A')}",
                 detail=f"Target: {sdk_res.get('target_timestamp', 'N/A')} | Confidence: {sdk_res.get('confidence', 0):.0%} | Reason: {sdk_res.get('reason', '')}",
-                ui_morph="SCHEDULED_RETRY",
             )
         elif action_val == "close_case":
             emit_thought(
@@ -1369,14 +1344,12 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                            if sdk_res.get("outcome") == "recovered" else ""),
                 detail=(tool_calls_made.get("close_case", {}).get("args", {})
                         .get("what_happened", "")),
-                ui_morph="RECOVERED" if sdk_res.get("outcome") == "recovered" else "ESCALATED",
             )
         elif action_val == "escalate_to_human":
             emit_thought(
                 step="stopping",
                 thought=f"Escalated to Human: {sdk_res.get('ticket_id', 'N/A')}",
                 detail=f"Reason: {sdk_res.get('reason', failure_reason)}",
-                ui_morph="ESCALATED",
             )
         elif action_val == "send_notification" and sdk_res.get("link_url"):
             store.save_pending(payment_id, {
@@ -1386,7 +1359,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                 "trail": trail,
                 "amount": amount,
             })
-            push_event(payment_id, "waiting_for_customer", {"action": action_val, "detail": f"Payment link sent: {sdk_res['link_url']}", "ui_morph": ui_spec_dict.ui_type})
+            push_event(payment_id, "waiting_for_customer", {"action": action_val, "detail": f"Payment link sent: {sdk_res['link_url']}"})
             socketio.start_background_task(_watch_for_recovery, payment_id, 300)
 
         # Determine final status from Case.status (graph is source of truth)
@@ -1429,7 +1402,6 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         p["last_action"] = action_val
         p["last_detail"] = sdk_res.get("message", "")
         p["trail"] = trail
-        p["ui_spec"] = ui_spec_dict.model_dump()
         if sdk_res.get("link_id"):
             p["recovery_link_id"] = sdk_res["link_id"]
         p["order_id"] = sdk_res.get("link_id", "") or p.get("order_id", "")
@@ -2432,7 +2404,7 @@ tr:hover{background:var(--bg-surface)}
 .trail{max-height:500px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border-subtle) transparent}
 .trail-item{padding:12px;border-left:3px solid var(--border-subtle);margin-bottom:4px;border-radius:0 10px 10px 0;background:var(--bg-surface);font-size:12px;transition:background .15s}
 .trail-item:hover{background:var(--brand-blue-light)}
-.trail-item.t-detecting{border-left-color:var(--brand-blue)}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8B5CF6}.trail-item.t-deciding{border-left-color:var(--warning)}.trail-item.t-acting,.trail-item.t-acted{border-left-color:var(--success)}.trail-item.t-waiting{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-observed{border-left-color:#6366F1}.trail-item.t-stopping{border-left-color:var(--error)}.trail-item.t-init{border-left-color:var(--brand-blue)}.trail-item.t-harness_start{border-left-color:#8B5CF6}.trail-item.t-harness_turn{border-left-color:#6366F1}.trail-item.t-llm_unavailable{border-left-color:var(--error);background:rgba(220,38,38,0.05)}.trail-item.t-stopped{border-left-color:var(--error)}.trail-item.t-ui_spec{border-left-color:#10B981}.trail-item.t-approval_needed{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-approval_denied{border-left-color:var(--error)}.trail-item.t-waiting_for_customer{border-left-color:var(--warning)}.trail-item.t-complete{border-left-color:var(--success)}
+.trail-item.t-detecting{border-left-color:var(--brand-blue)}.trail-item.t-diagnosing,.trail-item.t-diagnosed{border-left-color:#8B5CF6}.trail-item.t-deciding{border-left-color:var(--warning)}.trail-item.t-acting,.trail-item.t-acted{border-left-color:var(--success)}.trail-item.t-waiting{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-observed{border-left-color:#6366F1}.trail-item.t-stopping{border-left-color:var(--error)}.trail-item.t-init{border-left-color:var(--brand-blue)}.trail-item.t-harness_start{border-left-color:#8B5CF6}.trail-item.t-harness_turn{border-left-color:#6366F1}.trail-item.t-llm_unavailable{border-left-color:var(--error);background:rgba(220,38,38,0.05)}.trail-item.t-stopped{border-left-color:var(--error)}.trail-item.t-approval_needed{border-left-color:var(--warning);background:var(--warning-light)}.trail-item.t-approval_denied{border-left-color:var(--error)}.trail-item.t-waiting_for_customer{border-left-color:var(--warning)}.trail-item.t-complete{border-left-color:var(--success)}
 .trail-time{color:var(--text-muted);font-size:10px;font-weight:500}.trail-msg{color:var(--text-primary);margin-top:3px;font-weight:500}.trail-detail{color:var(--text-secondary);margin-top:3px;font-size:11px;line-height:1.5}
 
 /* Toast */
@@ -2730,11 +2702,6 @@ function renderTrail(trail){
   if(!trail||trail.length===0){el.innerHTML='<div class="empty">Waiting for agent activity...</div>';return}
   el.innerHTML=trail.map(e=>{
     let specHtml='';
-    if(e.ui_spec){
-      specHtml=`<div class="trail-detail" style="margin-top:6px;padding:8px;border-radius:6px;border-left:3px solid #8B5CF6;background:var(--bg-surface)">
-        <strong style="color:#8B5CF6">UI Spec:</strong> ${e.ui_spec.headline||''} — ${e.ui_spec.primary_cta_text||''}
-      </div>`;
-    }
     return `<div class="trail-item t-${e.step}"><div class="trail-time">${e.ts}</div><div class="trail-msg">${e.msg}</div>${e.detail?'<div class="trail-detail">'+e.detail+'</div>':''}${specHtml}</div>`;
   }).join('');
 }
@@ -3023,7 +2990,6 @@ def customer_responded():
                 "step": "stopping",
                 "msg": f"Card Expiry Updated ({updated_expiry}) & Payment Recovered!",
                 "detail": f"Updated expiry: {updated_expiry}. Charge verified via Razorpay API Capture.",
-                "ui_morph": "RECOVERY_SUCCESS",
                 "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             }
             p.setdefault("trail", []).append(trail_entry)
@@ -3036,7 +3002,6 @@ def customer_responded():
                 "step": "stopping",
                 "msg": "Customer clicked complete, but Razorpay capture not found",
                 "detail": f"Order {order_id} status: not paid. Awaiting Razorpay capture webhook.",
-                "ui_morph": "AWAITING_CAPTURE",
                 "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             }
             p.setdefault("trail", []).append(trail_entry)

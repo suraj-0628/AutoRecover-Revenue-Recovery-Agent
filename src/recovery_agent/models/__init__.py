@@ -280,17 +280,3 @@ class CustomerProfile(BaseModel):
 
 # --- Generative UI Spec ---
 
-class GenerativeUISpec(BaseModel):
-    """LLM-generated UI morphing specification sent over WebSocket.
-
-    The frontend reads these fields to dynamically render the customer
-    checkout page — no hardcoded if/else branches.
-    """
-    ui_type: str = "PAYMENT_LINK_MODAL"
-    headline: str = ""
-    subtext: str = ""
-    primary_cta_text: str = "Retry Payment"
-    discount_incentive: str = ""
-    target_rail: str = "payment_link"
-    hinglish_voice_script: str = ""
-    tone: str = "supportive"
