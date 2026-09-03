@@ -98,14 +98,13 @@ def ground_truth(payment_id: str, verify: bool = False) -> dict:
     # decline is a plumbing problem; offering money off does not fix plumbing.
     # Live, the agent reached for a 5% discount on a `bank_declined` while the
     # customer's own history showed netbanking succeeding 2 times out of 2.
-    code = str(rec.get("failure_code") or "").lower()
-    reason = str(rec.get("failure_reason") or "").lower()
-    blob = f"{code} {reason}"
-    if any(w in blob for w in ("declin", "insufficient", "expired", "invalid",
-                               "issuer", "card", "bank", "authentication", "cvv")):
-        facts["failure_kind"] = "method"
-    elif any(w in blob for w in ("cancel", "dropoff", "drop_off", "abandon")):
-        facts["failure_kind"] = "dropoff"
+    # One definition of what kind of failure this is, shared with the batch
+    # view. Two copies would drift, and a case would be a bank decline in one
+    # place and a drop-off in the other.
+    from recovery_agent.agent.classify import failure_kind
+    kind = failure_kind(rec)
+    if kind in ("method", "funds", "dropoff", "risk"):
+        facts["failure_kind"] = kind
     facts["failure_code"] = rec.get("failure_code") or ""
     facts["refusals"] = rec.get("refusals") or {}
 
@@ -166,7 +165,12 @@ def as_briefing(facts: dict) -> str:
                  "this case now.")
 
     kind = facts.get("failure_kind")
-    if kind == "method":
+    if kind == "funds":
+        head += ("\n  The account was short at the time. That is a timing "
+                 "problem, not a price one — a discount does not put money in "
+                 "their account. A retry aimed at when they are likely to be "
+                 "paid is the move.")
+    elif kind == "method":
         head += (
             "\n  This failed at the BANK, not on price. The customer tried to "
             "pay and the instrument was refused, so a discount does not address "

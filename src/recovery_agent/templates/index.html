@@ -842,9 +842,89 @@
     .step-pill.active-recovered { background: #1f3d26; color: var(--accent-green); border-color: var(--accent-green); }
 
     @keyframes fadeIn { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* ── Left rail ────────────────────────────────────────────────
+       Fixed rather than a grid column, so the existing workspace is
+       shifted rather than restructured — the live view stays exactly
+       as it was. */
+    .railnav {
+      position: fixed; top: 0; left: 0; bottom: 0; width: 62px; z-index: 60;
+      background: var(--panel-bg); border-right: 1px solid var(--border-color);
+      display: flex; flex-direction: column; align-items: center;
+      padding: 10px 0; gap: 4px;
+    }
+    .rail-mark {
+      width: 30px; height: 30px; border-radius: 8px; margin-bottom: 10px;
+      background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+      color: #0d1117; font-weight: 700; font-size: 13px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .rail-btn {
+      width: 50px; padding: 8px 2px; border: 0; border-radius: 8px; cursor: pointer;
+      background: transparent; color: var(--text-muted);
+      font-family: var(--font-mono); font-size: 9px; line-height: 1.25;
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      transition: background .15s, color .15s;
+    }
+    .rail-btn .ico { font-size: 15px }
+    .rail-btn:hover { background: rgba(88,166,255,.08); color: var(--text-main) }
+    .rail-btn.active { background: rgba(88,166,255,.14); color: var(--accent-blue) }
+    .rail-count {
+      min-width: 16px; padding: 0 4px; border-radius: 7px; font-size: 8.5px;
+      background: var(--accent-amber); color: #0d1117; font-weight: 700;
+    }
+    header, .workspace { margin-left: 62px }
+
+    /* ── Batch view ─────────────────────────────────────────────── */
+    .batchview {
+      margin-left: 62px; padding: 14px; overflow-y: auto; flex: 1;
+      display: none;
+    }
+    .batchview.on { display: block }
+    .batch-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 4px }
+    .batch-head h2 { font-size: 15px; color: var(--text-bright); font-weight: 600 }
+    .batch-sub { font-size: 11px; color: var(--text-muted); margin-bottom: 14px;
+                 max-width: 760px; line-height: 1.55 }
+    .batch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+                  gap: 12px }
+    .batch-card { background: var(--panel-bg); border: 1px solid var(--border-color);
+                  border-radius: 10px; padding: 13px 14px; display: flex;
+                  flex-direction: column; gap: 9px }
+    .batch-card.empty { opacity: .5 }
+    .batch-card-top { display: flex; align-items: center; gap: 9px }
+    .batch-ico { font-size: 15px; color: var(--accent-blue) }
+    .batch-title { font-size: 12.5px; font-weight: 600; color: var(--text-bright); flex: 1 }
+    .batch-n { font-size: 11px; color: var(--text-muted) }
+    .batch-what { font-size: 10.5px; color: var(--text-muted); line-height: 1.6 }
+    .batch-value { font-size: 16px; color: var(--accent-amber); font-weight: 600 }
+    .batch-cases { max-height: 148px; overflow-y: auto; border-top: 1px solid var(--border-color);
+                   padding-top: 8px; display: flex; flex-direction: column; gap: 5px }
+    .batch-case { display: flex; justify-content: space-between; gap: 8px; font-size: 10px;
+                  color: var(--text-muted) }
+    .batch-case b { color: var(--text-main); font-weight: 500 }
+    .btn-batch { align-self: flex-start; padding: 6px 13px; border-radius: 7px;
+                 border: 1px solid var(--accent-blue); background: transparent;
+                 color: var(--accent-blue); font-family: var(--font-mono);
+                 font-size: 10.5px; font-weight: 600; cursor: pointer }
+    .btn-batch:hover:enabled { background: var(--accent-blue); color: #0d1117 }
+    .btn-batch:disabled { opacity: .35; cursor: not-allowed; border-color: var(--border-color);
+                          color: var(--text-muted) }
+    .batch-note { font-size: 10px; color: var(--accent-amber); min-height: 13px }
   </style>
 </head>
 <body>
+
+  <!-- Left rail: the live view is one place to be, batches are another -->
+  <nav class="railnav">
+    <div class="rail-mark">R</div>
+    <button class="rail-btn active" id="rail-live" onclick="showView('live')">
+      <span class="ico">&#9673;</span>LIVE
+    </button>
+    <button class="rail-btn" id="rail-batches" onclick="showView('batches')">
+      <span class="ico">&#9776;</span>BATCH
+      <span class="rail-count" id="rail-batch-count" style="display:none">0</span>
+    </button>
+  </nav>
 
   <!-- Top Navigation Header -->
   <header>
@@ -2012,6 +2092,115 @@
         _vaPaymentId = null;
       });
     }
-  </script>
+  
+/* ── Views ─────────────────────────────────────────────────────────
+   The live workspace is untouched; this only hides it. */
+function showView(which) {
+  const live = document.querySelector(".workspace");
+  const batches = document.getElementById("view-batches");
+  const hdr = document.querySelector("header");
+  const isBatch = which === "batches";
+  if (live) live.style.display = isBatch ? "none" : "";
+  if (hdr) hdr.style.display = isBatch ? "none" : "";
+  batches.classList.toggle("on", isBatch);
+  document.getElementById("rail-live").classList.toggle("active", !isBatch);
+  document.getElementById("rail-batches").classList.toggle("active", isBatch);
+  if (isBatch) loadBatches();
+}
+
+function inr(n) {
+  return "INR " + Number(n || 0).toLocaleString("en-IN", {minimumFractionDigits: 2,
+                                                          maximumFractionDigits: 2});
+}
+function esc(t) {
+  return String(t == null ? "" : t).replace(/[&<>"']/g, function (c) {
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+  });
+}
+
+function loadBatches() {
+  fetch("/api/batches").then(r => r.json()).then(d => {
+    const badge = document.getElementById("rail-batch-count");
+    badge.textContent = d.total_cases;
+    badge.style.display = d.total_cases ? "" : "none";
+    document.getElementById("batch-total").textContent =
+      d.total_cases + " cases \u00b7 " + inr(d.total_at_risk) + " at risk";
+
+    document.getElementById("batch-grid").innerHTML = d.batches.map(function (b) {
+      /* An empty batch is kept and dimmed: it says that class of failure is not
+         happening, and hiding it makes the page rearrange on every refresh. */
+      const runnable = b.count > 0 && b.key !== "awaiting_retry" &&
+                       b.key !== "escalated" && b.key !== "unreachable" &&
+                       b.key !== "risk";
+      const cases = b.payments.slice(0, 30).map(function (p) {
+        return '<div class="batch-case"><b>' + esc(p.payment_id) + '</b><span>' +
+               inr(p.amount) + '</span></div>';
+      }).join("");
+      return '<div class="batch-card' + (b.count ? '' : ' empty') + '">' +
+        '<div class="batch-card-top"><span class="batch-ico">' + b.icon + '</span>' +
+          '<span class="batch-title">' + esc(b.title) + '</span>' +
+          '<span class="batch-n">' + b.count + '</span></div>' +
+        '<div class="batch-value">' + inr(b.value) + '</div>' +
+        '<div class="batch-what">' + esc(b.what) + '</div>' +
+        (cases ? '<div class="batch-cases">' + cases + '</div>' : '') +
+        '<button class="btn-batch" id="run-' + b.key + '" ' +
+          (runnable ? '' : 'disabled ') +
+          'onclick="runBatch(\'' + b.key + '\')">Run this batch</button>' +
+        '<div class="batch-note" id="note-' + b.key + '"></div>' +
+      '</div>';
+    }).join("");
+  }).catch(function () {});
+}
+
+function runBatch(key) {
+  const btn = document.getElementById("run-" + key);
+  const note = document.getElementById("note-" + key);
+  btn.disabled = true; note.textContent = "starting...";
+  fetch("/api/batches/" + key + "/run", {method: "POST",
+        headers: {"Content-Type": "application/json"}, body: "{}"})
+    .then(r => r.json()).then(function (d) {
+      if (d.error) { note.textContent = d.error; btn.disabled = false; return; }
+      /* Say plainly when a run was capped, or a partial run reads as a whole one. */
+      let msg = "started " + d.started.length + " of " + d.total_in_batch;
+      if (d.total_in_batch > d.started.length) {
+        msg += " (limit " + d.limit + " per run)";
+      }
+      note.textContent = msg + " \u2014 watch LIVE";
+      setTimeout(loadBatches, 4000);
+    }).catch(function () { note.textContent = "could not start"; btn.disabled = false; });
+}
+
+/* Keep the rail badge honest even while you are on the live view. */
+setInterval(function () {
+  fetch("/api/batches").then(r => r.json()).then(function (d) {
+    const badge = document.getElementById("rail-batch-count");
+    if (!badge) return;
+    badge.textContent = d.total_cases;
+    badge.style.display = d.total_cases ? "" : "none";
+  }).catch(function () {});
+}, 15000);
+loadBatches();
+
+</script>
+
+  <!-- ── BATCH VIEW ────────────────────────────────────────────────
+       Revenue that cannot be recovered while the customer is still on
+       the page. Sorted before the agent sees it, because a declined
+       card needs a different rail and an empty account needs a
+       different day — worked in one queue, the agent re-derives that
+       for every case. -->
+  <section class="batchview" id="view-batches">
+    <div class="batch-head">
+      <h2>Revenue at risk, by what went wrong</h2>
+      <span class="batch-n" id="batch-total"></span>
+    </div>
+    <div class="batch-sub">
+      These are cases the real-time ladder could not close while the customer was
+      still there. Each batch shares a cause, so it shares a fix. Running one
+      opens a separate agent session per payment — never two on the same case.
+    </div>
+    <div class="batch-grid" id="batch-grid"></div>
+  </section>
+
 </body>
 </html>

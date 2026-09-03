@@ -517,6 +517,81 @@ from recovery_agent import push_bus as _push_bus
 _push_bus.register_delivery(deliver_page_push)
 
 
+@app.route("/api/batches", methods=["GET"])
+def api_batches():
+    """Revenue still at risk, sorted into batches that share a fix."""
+    from recovery_agent.agent.classify import summarise
+    batches = summarise(list(store.payment_values()))
+    return jsonify({
+        "batches": batches,
+        "total_at_risk": round(sum(b["value"] for b in batches), 2),
+        "total_cases": sum(b["count"] for b in batches),
+        "running": sorted(active_agent_payments),
+    })
+
+
+#: How many cases one batch run will work. A batch can hold hundreds; a run that
+#: quietly worked all of them would send hundreds of emails and burn the payment
+#: link quota in one click. The cap is visible in the UI and in the response, so
+#: a partial run never reads as a complete one.
+BATCH_RUN_LIMIT = int(os.getenv("BATCH_RUN_LIMIT", "5"))
+
+
+@app.route("/api/batches/<key>/run", methods=["POST"])
+def api_run_batch(key: str):
+    """Work a batch: one agent session per payment, never two on one case."""
+    from recovery_agent.agent.classify import BATCH_BY_KEY, classify
+    meta = BATCH_BY_KEY.get(key)
+    if not meta:
+        return jsonify({"error": f"unknown batch {key!r}"}), 404
+
+    data = request.get_json(silent=True) or {}
+    limit = max(1, min(int(data.get("limit") or BATCH_RUN_LIMIT), 50))
+
+    candidates = [r for r in store.payment_values() if classify(r) == key]
+    started, skipped = [], []
+    for rec in candidates:
+        pid = rec.get("payment_id") or ""
+        if not pid:
+            continue
+        if len(started) >= limit:
+            skipped.append({"payment_id": pid, "why": "over this run's limit"})
+            continue
+        # Sessions are per payment. A case the real-time agent is already
+        # working must not get a second run — that is the one rule the whole
+        # session model rests on.
+        if pid in active_agent_payments:
+            skipped.append({"payment_id": pid, "why": "already being worked"})
+            continue
+        customer = {k: v for k, v in (rec.get("customer") or {}).items() if v} or {
+            k: v for k, v in {"email": rec.get("customer_email", ""),
+                              "name": rec.get("customer_name", ""),
+                              "contact": rec.get("customer_phone", "")}.items() if v}
+        if not (customer.get("email") or customer.get("contact")):
+            skipped.append({"payment_id": pid, "why": "no way to contact them"})
+            continue
+
+        # The batch is the context. The agent is told what this group has in
+        # common and what that implies, so it does not re-derive the category
+        # for every case — which is the whole reason for sorting them first.
+        socketio.start_background_task(
+            run_agent_for_payment, pid, float(rec.get("amount") or 0),
+            f"BATCH: {meta['title']}. {meta['what']} "
+            f"This payment is one of {len(candidates)} in that batch. Work it on "
+            f"its own merits — the batch says what kind of problem it is, not "
+            f"what to do about this particular customer.",
+            customer, f"batch_{key}",
+            rec.get("failure_code", "") or "",
+        )
+        started.append(pid)
+
+    push_event("batch", "batch_started", {"batch": key, "started": len(started),
+                                          "skipped": len(skipped)})
+    return jsonify({"batch": key, "title": meta["title"],
+                    "started": started, "skipped": skipped,
+                    "limit": limit, "total_in_batch": len(candidates)})
+
+
 @app.route("/api/escalations", methods=["GET"])
 def api_escalations():
     """The batch a human works. Open by default."""
