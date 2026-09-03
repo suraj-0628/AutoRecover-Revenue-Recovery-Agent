@@ -49,9 +49,32 @@ def _still_worth_doing(payment_id: str, what: str) -> str:
 
     Returns a JSON refusal, or "" to proceed.
     """
+    def _remember_refusal(why: str) -> None:
+        """A refusal the next run can see.
+
+        `tool_call_history` resets each run, so a plan refused in one run looked
+        brand new in the next. Live, the agent proposed the same blocked link
+        three runs running — and said so itself, "third consecutive mid-payment
+        block observed" — because nothing carried the refusal forward.
+        """
+        try:
+            from recovery_agent.state_store import StateStore
+            store = StateStore()
+            rec = store.get_payment(payment_id)
+            if rec is None:
+                return
+            refusals = dict(rec.get("refusals") or {})
+            key = f"{what}: {why}"
+            refusals[key] = int(refusals.get(key, 0)) + 1
+            store.update_payment(payment_id, refusals=refusals)
+            store.flush()
+        except Exception:
+            pass
+
     from recovery_agent.agent.perception import ground_truth
     facts = ground_truth(payment_id)
     if facts.get("settled"):
+        _remember_refusal("the case is already settled")
         return json.dumps({
             "status": "blocked",
             "reason": f"this case is already settled — INR "
@@ -63,7 +86,23 @@ def _still_worth_doing(payment_id: str, what: str) -> str:
     rec = _live_record(payment_id)
     push = rec.get("pending_push") or {}
     outcome = rec.get("push_outcome") or {}
-    if push.get("sent_at") and outcome.get("action") == "acted":
+
+    # "Mid-payment" is a WINDOW, not a state. A click means someone is paying
+    # right now; ten minutes later it means nothing, and a click that ended in a
+    # decline means less than nothing. Left unbounded this froze a live case:
+    # three consecutive runs refused every action because of one click that had
+    # already failed at the bank.
+    fresh = False
+    if outcome.get("action") == "acted" and outcome.get("at"):
+        try:
+            clicked = datetime.fromisoformat(str(outcome["at"]).replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - clicked).total_seconds() / 60
+            fresh = age < float(os.getenv("MID_PAYMENT_WINDOW_MINUTES", "4"))
+        except (ValueError, TypeError):
+            fresh = False
+
+    if push.get("sent_at") and fresh:
+        _remember_refusal("the customer was mid-payment")
         return json.dumps({
             "status": "blocked",
             "reason": "the customer has just acted on your notification and is "

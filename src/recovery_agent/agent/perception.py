@@ -94,6 +94,21 @@ def ground_truth(payment_id: str, verify: bool = False) -> dict:
         "escalated": status == "escalated",
     })
 
+    # What KIND of failure this is decides which lever is even relevant. A bank
+    # decline is a plumbing problem; offering money off does not fix plumbing.
+    # Live, the agent reached for a 5% discount on a `bank_declined` while the
+    # customer's own history showed netbanking succeeding 2 times out of 2.
+    code = str(rec.get("failure_code") or "").lower()
+    reason = str(rec.get("failure_reason") or "").lower()
+    blob = f"{code} {reason}"
+    if any(w in blob for w in ("declin", "insufficient", "expired", "invalid",
+                               "issuer", "card", "bank", "authentication", "cvv")):
+        facts["failure_kind"] = "method"
+    elif any(w in blob for w in ("cancel", "dropoff", "drop_off", "abandon")):
+        facts["failure_kind"] = "dropoff"
+    facts["failure_code"] = rec.get("failure_code") or ""
+    facts["refusals"] = rec.get("refusals") or {}
+
     try:
         from recovery_agent.agent import ladder
         st = ladder.state(rec)
@@ -149,6 +164,27 @@ def as_briefing(facts: dict) -> str:
         head += (f"\n  Next rung: {nxt}" if nxt else
                  "\n  Every rung has been tried. escalate_to_human will accept "
                  "this case now.")
+
+    kind = facts.get("failure_kind")
+    if kind == "method":
+        head += (
+            "\n  This failed at the BANK, not on price. The customer tried to "
+            "pay and the instrument was refused, so a discount does not address "
+            "what went wrong — a different payment method does. Check "
+            "get_customer_payment_history for a rail that has worked for this "
+            "customer before, and offer that."
+        )
+    elif kind == "dropoff":
+        head += ("\n  The customer chose not to complete. Nothing is broken, so "
+                 "the question is what would make them come back.")
+
+    repeated = {k: n for k, n in (facts.get("refusals") or {}).items() if n >= 2}
+    if repeated:
+        head += "\n  You have already been refused these, more than once:"
+        for k, n in repeated.items():
+            head += f"\n    - {k} ({n}x)"
+        head += ("\n  Proposing them again will be refused again. Something about "
+                 "your plan has to change, not just your wording.")
 
     if facts.get("warning"):
         head += f"\n  CAUTION: {facts['warning']}"

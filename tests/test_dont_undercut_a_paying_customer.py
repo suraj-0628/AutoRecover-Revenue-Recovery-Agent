@@ -52,8 +52,10 @@ def _call(name, **args):
 # ── mid-payment ─────────────────────────────────────────────────────────
 
 def test_no_discounted_link_while_the_customer_is_completing():
-    _case(pending_push={"sent_at": "2026-09-03T04:16:46Z"},
-          push_outcome={"action": "acted", "at": "2026-09-03T04:16:51Z"})
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    _case(pending_push={"sent_at": now},
+          push_outcome={"action": "acted", "at": now})
     r = _call("generate_recovery_payment_link", amount=94976.25,
               customer_email="a@b.com")
     assert r["status"] == "blocked"
@@ -109,3 +111,67 @@ def test_the_prompt_tells_it_to_recheck_before_spending():
     i = GRAPH.index("The ONE exception is check_payment_status")
     body = GRAPH[i:i + 500]
     assert "before you spend money or contact the customer again" in body
+
+
+# ── "mid-payment" is a window, not a state ──────────────────────────────
+
+def test_an_old_click_does_not_freeze_the_case():
+    """Live: the customer clicked, their bank declined, and for the rest of the
+    case every action was refused with "the customer is in the middle of paying"
+    — three runs in a row, blocked on a click that had already failed."""
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    _case(pending_push={"sent_at": old},
+          push_outcome={"action": "acted", "at": old})
+    r = _call("generate_recovery_payment_link", amount=2374.05,
+              customer_email="a@b.com")
+    assert "middle of paying" not in str(r.get("reason", ""))
+
+
+def test_a_new_failure_clears_the_previous_click():
+    """A new failure means the previous attempt is over."""
+    FRONTEND = (pathlib.Path(__file__).resolve().parents[1] / "src"
+                / "recovery_agent" / "frontend.py").read_text()
+    i = FRONTEND.index("def payment_failed")
+    body = FRONTEND[i:i + 2200]
+    assert "push_outcome=None" in body
+    assert "failure_code=failure_code" in body, (
+        "the code was never stored, so the record said failure_code: None and "
+        "a bank decline survived only as prose in a message"
+    )
+
+
+# ── the failure KIND decides which lever is relevant ────────────────────
+
+def test_a_bank_decline_is_named_as_a_method_problem():
+    """The agent reached for a 5% discount on a bank decline while the
+    customer's own history showed netbanking succeeding 2 times out of 2. Money
+    off does not fix plumbing."""
+    from recovery_agent.agent.perception import as_briefing, ground_truth
+    _case(failure_code="bank_declined",
+          failure_reason="declined by the bank")
+    b = as_briefing(ground_truth("p"))
+    assert "failed at the BANK, not on price" in b
+    assert "get_customer_payment_history" in b
+
+
+def test_a_cancellation_is_named_as_a_choice_not_a_fault():
+    from recovery_agent.agent.perception import as_briefing, ground_truth
+    _case(failure_code="customer_cancelled", failure_reason="cancelled")
+    assert "chose not to complete" in as_briefing(ground_truth("p"))
+
+
+# ── a refused plan is remembered into the next turn ─────────────────────
+
+def test_repeated_refusals_are_surfaced_to_the_next_run():
+    """`tool_call_history` resets each run, so a plan refused in one run looked
+    brand new in the next — the agent proposed the same blocked link three runs
+    running, and said so itself."""
+    from recovery_agent.agent.perception import as_briefing, ground_truth
+    _case(status="recovered", recovered_amount=2499.0)
+    for _ in range(2):
+        _call("generate_recovery_payment_link", amount=2374.05,
+              customer_email="a@b.com")
+    b = as_briefing(ground_truth("p"))
+    assert "already been refused" in b
+    assert "has to change" in b

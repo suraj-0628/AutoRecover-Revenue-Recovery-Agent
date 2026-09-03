@@ -354,7 +354,11 @@ def _notify_agent_of_recovery(payment_id: str, amount: float, recovery_payment_i
     recovery agent can learn, and it was being thrown away on every success.
     """
     p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
-    what = p.get("last_action", "a recovery attempt")
+    # "195s after none" — `last_action` is "none" whenever the last run took no
+    # recovery action, and it was pasted straight into the sentence.
+    what = p.get("last_action") or ""
+    if what in ("", "none"):
+        what = "your last recovery attempt"
     offer = (p.get("ui_spec") or {}).get("offer") or {}
     offer_note = (f" after a {offer.get('discount_pct')}% offer"
                   if offer.get("discount_pct") else "")
@@ -2879,7 +2883,22 @@ def payment_failed():
             return jsonify({"status": "already_recovering", "payment_id": payment_id})
     if not store.has_payment(payment_id):
         store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
-    store.update_payment(payment_id, status="recovering")
+
+    # A NEW failure means the previous attempt is over.
+    #
+    # `push_outcome` was left as "acted" from whenever the customer last clicked
+    # a notification, and the mid-payment guard reads it. Live: the customer
+    # clicked, their bank declined, and for the rest of the case every attempt
+    # to act was refused with "the customer is in the middle of paying" — three
+    # runs in a row, each one blocked on a click that had already failed.
+    #
+    # The failure code is persisted too. It was not stored at all, so the record
+    # said `failure_code: None` and the only trace of a bank decline was prose
+    # in a message — which is why the agent reached for a discount on what was
+    # a payment-method problem.
+    store.update_payment(payment_id, status="recovering", push_outcome=None,
+                         failure_code=failure_code or "",
+                         failure_reason=failure_reason or "")
 
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)
     return jsonify({"status": "recovery_started"})
