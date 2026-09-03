@@ -63,9 +63,38 @@ def test_a_batch_ending_in_another_tool_keeps_going():
     msgs = [
         AIMessage(content="", tool_calls=[
             {"name": "wait_for_customer", "args": {}, "id": "w1", "type": "tool_call"},
-            {"name": "send_page_push", "args": {}, "id": "p1", "type": "tool_call"}]),
+            {"name": "search_memory", "args": {}, "id": "s1", "type": "tool_call"}]),
         ToolMessage(content='{"status":"ok"}', tool_call_id="w1", name="wait_for_customer"),
-        ToolMessage(content='{"status":"delivered"}', tool_call_id="p1", name="send_page_push"),
+        ToolMessage(content='{"status":"ok"}', tool_call_id="s1", name="search_memory"),
+    ]
+    assert _route_after_tools({"messages": msgs}) == "agent"
+
+
+def test_a_delivered_push_ends_the_turn():
+    """The push exists to elicit a response; carrying on in the same turn
+    pre-empts the customer you just asked to act.
+
+    Live: push sent 04:16:46, customer clicked it 04:16:51, and by 04:17:02 the
+    agent had created a 5% discounted link for someone who paid full price six
+    seconds later — giving away INR 4,998.75 and one of thirty lifetime links.
+    """
+    msgs = [
+        AIMessage(content="", tool_calls=[
+            {"name": "send_page_push", "args": {}, "id": "p1", "type": "tool_call"}]),
+        ToolMessage(content='{"status":"delivered"}', tool_call_id="p1",
+                    name="send_page_push"),
+    ]
+    assert _route_after_tools({"messages": msgs}) == "stopping_check"
+
+
+def test_a_refused_push_does_not_end_the_turn():
+    """A push blocked because the customer already dismissed one is not a wait —
+    the agent still has to choose the next rung."""
+    msgs = [
+        AIMessage(content="", tool_calls=[
+            {"name": "send_page_push", "args": {}, "id": "p1", "type": "tool_call"}]),
+        ToolMessage(content='{"status":"blocked","reason":"already dismissed"}',
+                    tool_call_id="p1", name="send_page_push"),
     ]
     assert _route_after_tools({"messages": msgs}) == "agent"
 

@@ -217,7 +217,13 @@ HOW TO WORK — follow this order:
 
 1. DIAGNOSE ONCE. You may call diagnostic tools in ONE round, at the start.
    Often the failure code in the context is already enough — then skip this.
-   Never call the same diagnostic tool twice. Diagnosis does not recover money.
+   Diagnosis does not recover money, so do not linger there.
+
+   The ONE exception is check_payment_status: call it as often as it matters,
+   and ALWAYS before you spend money or contact the customer again. It reads
+   changing state — the answer is different after the customer acts — so asking
+   twice is not repetition, it is the difference between recovering a payment
+   and discounting one that was already being paid.
 
 2. THEN ACT. After at most one diagnostic round you MUST call a Recover tool.
 
@@ -226,7 +232,14 @@ HOW TO WORK — follow this order:
    only after the one before it has failed to get the money.
 
      1. page_push          A silent nudge on the checkout page. Costs nothing,
-                           gives nothing away. Always first.
+                           gives nothing away. Always first. Sending it ENDS
+                           YOUR TURN — that is the point of it. You asked the
+                           customer to act; give them the chance. You will be
+                           started again the moment they do, or when the window
+                           closes. Do not prepare the next rung "while you
+                           wait": a customer who is mid-payment does not need a
+                           discount, and offering one gives away money you were
+                           about to receive in full.
      2. offer              The discount the store policy allows: create the link
                            at that price, put it on the page with show_page_offer
                            AND email it with send_recovery_notification. Do both
@@ -853,6 +866,11 @@ def _hash_tool_args(args: dict) -> str:
     return hashlib.md5(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
+#: Tools that read state which genuinely changes between calls. Repetition is
+#: the correct behaviour for these, not a loop.
+_RECHECKABLE = {"check_payment_status"}
+
+
 def tool_repetition_guard(state: RecoveryState, config: RunnableConfig = None) -> dict:
     """Prevent the LLM from looping on the same tools.
 
@@ -929,6 +947,13 @@ def tool_repetition_guard(state: RecoveryState, config: RunnableConfig = None) -
         for tool_call in last_message.tool_calls:
             tool_name = tool_call["name"]
             args_hash = _hash_tool_args(tool_call["args"])
+
+            # Asking again whether the money has arrived is not repetition — the
+            # whole point is that the answer changes. Blocking it taught the
+            # agent that checking was a mistake, which is precisely the habit
+            # that lets it spend money on a customer who has already paid.
+            if tool_name in _RECHECKABLE:
+                continue
 
             # Check exact repetition (original behavior)
             for prev in history:
@@ -1514,8 +1539,26 @@ def _route_after_tools(state: RecoveryState) -> Literal["agent", "stopping_check
     """
     for msg in reversed(state["messages"]):
         if isinstance(msg, ToolMessage):
-            if getattr(msg, "name", "") in ("wait_for_customer", "close_case"):
+            name = getattr(msg, "name", "")
+            if name in ("wait_for_customer", "close_case"):
                 return "stopping_check"
+            # A delivered push IS a wait. Its entire purpose is to elicit a
+            # response, so carrying on in the same turn pre-empts the customer
+            # you just asked to act.
+            #
+            # Live: the push went out at 04:16:46, the customer clicked it at
+            # 04:16:51, and by 04:17:02 the agent — still in the same turn — had
+            # created a 5% discounted link for someone who paid full price six
+            # seconds later. It gave away INR 4,998.75 to a customer who was
+            # already paying, and spent one of thirty lifetime payment links to
+            # do it.
+            if name == "send_page_push":
+                try:
+                    if json.loads(str(msg.content))\
+                            .get("status") == "delivered":
+                        return "stopping_check"
+                except (ValueError, TypeError):
+                    pass
             return "agent"
         if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
             break

@@ -37,6 +37,45 @@ def _live_record(payment_id: str) -> dict:
         return {}
 
 
+def _still_worth_doing(payment_id: str, what: str) -> str:
+    """Refuse an action that costs money or reaches the customer, when the case
+    is already settled or the customer is mid-response.
+
+    Perception tells the agent the case is settled; this makes it so even when
+    the agent has not looked, and even inside a single turn where the situation
+    changed between one tool call and the next. Live, a customer clicked the
+    push at 04:16:51 and the agent created a discounted link at 04:17:02 —
+    within the same turn, so nothing had a chance to re-brief it.
+
+    Returns a JSON refusal, or "" to proceed.
+    """
+    from recovery_agent.agent.perception import ground_truth
+    facts = ground_truth(payment_id)
+    if facts.get("settled"):
+        return json.dumps({
+            "status": "blocked",
+            "reason": f"this case is already settled — INR "
+                      f"{facts.get('received', 0):,.2f} has been received, so "
+                      f"{what} would reach a customer who has already paid",
+            "guidance": "Call close_case with outcome='recovered'.",
+        })
+
+    rec = _live_record(payment_id)
+    push = rec.get("pending_push") or {}
+    outcome = rec.get("push_outcome") or {}
+    if push.get("sent_at") and outcome.get("action") == "acted":
+        return json.dumps({
+            "status": "blocked",
+            "reason": "the customer has just acted on your notification and is "
+                      "in the middle of paying; interrupting now risks charging "
+                      "or discounting someone who is already completing",
+            "guidance": "Call wait_for_customer and let them finish. You will be "
+                        "started again with the outcome.",
+        })
+    return ""
+
+
+
 
 # ═══════════════════════════════════════════════════════════════
 # CONTEXT SCHEMA — passed to every tool via ToolRuntime
@@ -289,6 +328,10 @@ def generate_recovery_payment_link(
     Returns:
         JSON with link_url, link_id, allowed_rails
     """
+    _stop = _still_worth_doing(payment_id, "creating a payment link")
+    if _stop:
+        return _stop
+
     from recovery_agent.razorpay_client import RazorpayClient
 
     client = RazorpayClient()
@@ -444,6 +487,10 @@ def show_page_offer(
     Returns:
         JSON with delivery status.
     """
+    _stop = _still_worth_doing(payment_id, "showing a discount")
+    if _stop:
+        return _stop
+
     case = getattr(getattr(runtime, "context", None), "case", None) if runtime else None
     meta = (case.payment.metadata if case is not None else {}) or {}
     original = float(getattr(getattr(case, "payment", None), "amount", 0) or 0)
@@ -893,6 +940,10 @@ def send_recovery_notification(
     Returns:
         JSON with channels_dispatched, results
     """
+    _stop = _still_worth_doing(payment_id, "sending a message")
+    if _stop:
+        return _stop
+
     # The message is the model's to write — tone and wording are exactly what it
     # is good at. What it must not do is promise a price the link will not
     # charge. This happened live: the agent created the link at full price,
@@ -1188,6 +1239,10 @@ def initiate_voice_call(
     Returns:
         JSON with call status and campaign_id
     """
+    _stop = _still_worth_doing(payment_id, "placing a call")
+    if _stop:
+        return _stop
+
     if os.getenv("PYTEST_CURRENT_TEST") or "pytest" in sys.modules:
         return json.dumps({"status": "skipped", "reason": "test_environment"})
 
