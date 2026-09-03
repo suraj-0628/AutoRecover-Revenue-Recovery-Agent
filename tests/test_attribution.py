@@ -126,3 +126,51 @@ def test_one_surface_only_is_not_treated_as_ambiguous(tmp_path):
     obs = _observation(["notify:email:https://rzp.io/x"],
                        "link plink_A paid (poll)", tmp_path)
     assert "surfaces at once" not in obs
+
+
+# ── the agent must see failures, not only successes ─────────────────────
+
+def test_history_joins_on_the_phone_because_links_anonymise_the_email():
+    """Razorpay rewrites the email to void@razorpay.com on every payment made
+    through a payment LINK, so matching on email hides exactly the payments this
+    agent creates. Live it reported netbanking {success: 1, failed: 0} for a
+    customer whose account held three netbanking failures — and the agent then
+    routed the recovery back into the rail that had just declined them."""
+    TOOLS = (Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "tools.py").read_text()
+    i = TOOLS.index("def get_customer_payment_history")
+    body = TOOLS[i:i + 4000]
+    assert "customer_phone" in body
+    assert "void@razorpay.com" in body
+    assert "wanted_phone in phones" in body
+
+
+def test_the_phone_falls_back_to_the_case_rather_than_being_dropped():
+    TOOLS = (Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "tools.py").read_text()
+    i = TOOLS.index("def get_customer_payment_history")
+    body = TOOLS[i:i + 2000]
+    assert 'meta.get("customer_phone"' in body
+
+
+def test_a_failed_attempt_on_the_recovery_link_reaches_the_agent():
+    """The watcher only looked for a capture, so a customer declined ON the
+    recovery link produced nothing. Live, the agent would have sat out sixteen
+    minutes while they were actively trying."""
+    i = FRONTEND.index("A FAILED attempt is a signal")
+    body = FRONTEND[i:i + 3200]
+    assert 'pay.get("status") != "failed"' in body
+    assert "TRIED AND FAILED AGAIN" in body
+    assert "widen it" in body
+
+
+def test_the_same_failure_is_not_reported_twice():
+    i = FRONTEND.index("A FAILED attempt is a signal")
+    body = FRONTEND[i:i + 3200]
+    assert "seen_failed_attempts" in body
+
+
+def test_the_failure_that_started_the_case_is_not_mistaken_for_a_new_one():
+    i = FRONTEND.index("A FAILED attempt is a signal")
+    body = FRONTEND[i:i + 3200]
+    assert "link_created_at" in body

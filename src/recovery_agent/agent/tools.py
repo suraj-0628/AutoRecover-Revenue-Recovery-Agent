@@ -262,17 +262,31 @@ def check_payment_status(
 @tool
 def get_customer_payment_history(
     customer_id: str,
+    customer_phone: str = "",
     runtime=None,
 ) -> str:
     """Fetch the customer's past payment attempts and outcomes from Razorpay.
 
+    Includes FAILED attempts, which are the more useful half: a rail that has
+    just declined someone is not the rail to route them back into.
+
     Args:
         customer_id: Customer identifier (email or ID)
+        customer_phone: Their phone. Pass it — Razorpay anonymises the email on
+            every payment made through a payment link, so the phone is the only
+            join that sees the recoveries this agent itself created.
 
     Returns:
         JSON with total_payments, successful_count, method_success_rates, recent_payments
     """
     from recovery_agent.razorpay_client import RazorpayClient
+
+    # Fall back to the case if the model did not pass a phone, rather than
+    # silently searching on the email alone.
+    if not customer_phone:
+        case = getattr(getattr(runtime, "context", None), "case", None) if runtime else None
+        meta = (case.payment.metadata if case is not None else {}) or {}
+        customer_phone = meta.get("customer_phone", "") or ""
 
     client = RazorpayClient()
     if not client.is_configured:
@@ -296,6 +310,24 @@ def get_customer_payment_history(
             if len(batch) < 100:
                 break
 
+        # Match on the phone as well as the email.
+        #
+        # Razorpay anonymises the email on any payment made through a payment
+        # LINK — every one of them comes back as `void@razorpay.com`. Matching on
+        # email alone therefore hides exactly the payments this agent creates:
+        # every recovery link it has ever sent, paid or failed.
+        #
+        # Live, that produced `netbanking {success: 1, failed: 0}` for a customer
+        # whose account held three netbanking failures — so the agent read the
+        # rail that had just declined them as their most reliable one, and routed
+        # the recovery straight back into it.
+        #
+        # The phone survives anonymisation, so it is the join that works.
+        def _digits(v: str) -> str:
+            return "".join(ch for ch in str(v or "") if ch.isdigit())[-10:]
+
+        wanted_phone = _digits(customer_phone) or _digits(wanted)
+
         customer_payments = []
         for p in items:
             notes = p.get("notes") or {}
@@ -306,7 +338,9 @@ def get_customer_payment_history(
                 str(p.get("contact", "")).lower(),
                 str(p.get("customer_id", "")).lower(),
             }
-            if wanted in candidates:
+            phones = {_digits(p.get("contact")), _digits(notes.get("customer_phone"))}
+            phones.discard("")
+            if wanted in candidates or (wanted_phone and wanted_phone in phones):
                 customer_payments.append({
                     "payment_id": p.get("id", ""),
                     "amount": p.get("amount", 0) / 100,

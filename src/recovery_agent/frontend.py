@@ -101,6 +101,7 @@ def _watch_for_recovery(payment_id: str, max_wait_seconds: int = 300):
         return
 
     start_ts = time.time()
+    link_created_at = int(start_ts)      # anything earlier predates this watch
     while time.time() - start_ts < max_wait_seconds:
         time.sleep(15)
         try:
@@ -137,6 +138,67 @@ def _watch_for_recovery(payment_id: str, max_wait_seconds: int = 300):
                                 return
                 except Exception as e:
                     pass  # Payment link fetch failed, try next strategy
+
+            # A FAILED attempt is a signal, and a strong one.
+            #
+            # The watcher only ever looked for a capture, so a customer who
+            # clicked the recovery link and was declined on it produced nothing
+            # at all. Live: the agent routed a INR 59,985 case to netbanking,
+            # the customer tried it on the link at 10:40:57 and was declined,
+            # and the agent learned nothing — it would have sat out its
+            # sixteen-minute window while the customer was actively struggling.
+            # They happened to retry on their own 58 seconds later.
+            #
+            # Someone who clicks and tries is the most engaged a customer ever
+            # gets. If the rail we chose fails them, that is the moment to
+            # widen it — not a quarter of an hour later.
+            try:
+                phone = "".join(ch for ch in str(
+                    (p.get("customer") or {}).get("contact")
+                    or p.get("customer_phone") or "") if ch.isdigit())[-10:]
+                owed = round(float(p.get("amount") or 0), 2)
+                seen_failures = set(p.get("seen_failed_attempts") or [])
+                if phone and owed:
+                    for pay in client.client.payment.all(
+                            {"count": 20}).get("items", []):
+                        if pay.get("status") != "failed":
+                            continue
+                        if pay.get("id") in seen_failures:
+                            continue
+                        if round(pay.get("amount", 0) / 100, 2) != owed:
+                            continue
+                        digits = "".join(c for c in str(pay.get("contact") or "")
+                                         if c.isdigit())[-10:]
+                        if digits != phone:
+                            continue
+                        if pay.get("created_at", 0) < link_created_at:
+                            continue          # the failure that started the case
+
+                        seen_failures.add(pay["id"])
+                        store.update_payment(
+                            payment_id,
+                            seen_failed_attempts=sorted(seen_failures))
+                        store.flush()
+                        method = pay.get("method") or "that method"
+                        push_event(payment_id, "attempt_failed", {
+                            "detail": f"Customer tried {method} and was declined "
+                                      f"({pay.get('error_description') or 'no reason given'})",
+                        })
+                        _handoff_to_agent(
+                            payment_id,
+                            f"THE CUSTOMER JUST TRIED AND FAILED AGAIN. They "
+                            f"acted on your recovery link and were declined on "
+                            f"{method}: "
+                            f"{pay.get('error_description') or 'no reason given'}. "
+                            f"They are engaged and trying right now — this is the "
+                            f"best moment you will get. The rail you chose is not "
+                            f"working for them, so widen it or offer a different "
+                            f"one. Do not wait out the window.",
+                            scenario=f"attempt_failed:{pay['id']}",
+                        )
+                        break
+            except Exception:
+                pass
 
             # Strategy 2: the ORIGINAL checkout order. When the agent's push has
             # no link, its CTA reopens Razorpay on the page against this order —
