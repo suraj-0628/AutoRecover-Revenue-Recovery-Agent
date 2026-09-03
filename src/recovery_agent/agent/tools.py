@@ -637,14 +637,26 @@ def show_page_offer(
         if remaining > 0:
             minutes = min(minutes, remaining)
 
+    # A zero-discount "offer" on a method failure is a RAIL SWITCH, not a
+    # promotion: the customer tried to pay and the instrument was refused, so
+    # the banner's job is another route at the same price. "% OFF" dressing on
+    # a bank problem reads as a bribe for our own decline — the surface must
+    # say what the situation is.
+    from recovery_agent.agent.classify import failure_kind
+    rail_switch = (not discount_pct
+                   and failure_kind(_live_record(payment_id)) == "method")
+
     payload = {
         "payment_id": payment_id,
         "headline": headline[:120],
         "body": body[:400],
         "cta_text": cta_text[:40],
         "payment_link": payment_link or _last_recovery_link(runtime, payment_id),
+        "mode": "rail_switch" if rail_switch else "offer",
         "offer_text": (f"{float(discount_pct):.0f}% off — pay INR {payable:,.2f}"
-                       if discount_pct else f"Pay INR {payable:,.2f}"),
+                       if discount_pct else
+                       (f"Pay INR {payable:,.2f} — try another payment method"
+                        if rail_switch else f"Pay INR {payable:,.2f}")),
         "wait_minutes": minutes,
         "offer": {
             "original_rupees": round(original, 2) if original else None,
@@ -1038,6 +1050,16 @@ def get_recovery_offer(
         tried_full_price = any(
             a.startswith("link:") and a.endswith(f":{owed:.2f}")
             for a in (rec.get("actions_tried") or []))
+        # INCENTIVES ARE ALLOWLISTED, not blocklisted. Only a confirmed
+        # drop-off — the customer choosing not to pay — is a price problem,
+        # so only "dropoff" unlocks a discount outright. Everything else must
+        # try the full amount on another route first. The old shape (refuse
+        # method and transient, allow the rest) meant an UNCLASSIFIED failure
+        # defaulted to "discount legal": live, a bank decline whose code got
+        # blurred at ingress was offered 5% for a payment the customer had
+        # been trying to MAKE at full price. Fail closed: when we do not know
+        # why it failed, we do not pay the customer to tell us.
+
         # A transient failure is never a price objection, at any stage. The
         # gateway timed out; the customer's intent was fine and their card was
         # fine. Discounting here pays someone to forgive our own outage.
@@ -1054,6 +1076,15 @@ def get_recovery_offer(
                                    f"offer is authorised.",
             })
 
+        if kind == "risk":
+            return json.dumps({
+                "status": "not_indicated",
+                "allowed": False,
+                "reason": "this case looks like risk or fraud; it is not to be "
+                          "pursued, let alone incentivised.",
+                "do_this_instead": "escalate_to_human.",
+            })
+
         if kind == "method" and not tried_full_price:
             return json.dumps({
                 "status": "not_indicated",
@@ -1066,6 +1097,32 @@ def get_recovery_offer(
                                    f"(see get_customer_payment_history). If that "
                                    f"also fails, ask again and an offer is "
                                    f"authorised.",
+            })
+
+        if kind == "funds" and not tried_full_price:
+            return json.dumps({
+                "status": "not_indicated",
+                "allowed": False,
+                "reason": "the account was short at the time — a timing problem, "
+                          "not a price one. A discount does not put money in "
+                          "their account.",
+                "do_this_instead": f"Schedule a retry aimed at when they are "
+                                   f"likely to be paid, or offer the full INR "
+                                   f"{owed:,.2f} on another rail. If a full-price "
+                                   f"attempt fails again, ask here once more.",
+            })
+
+        if kind not in ("dropoff", "method", "funds") and not tried_full_price:
+            return json.dumps({
+                "status": "not_indicated",
+                "allowed": False,
+                "reason": f"this failure is unclassified ({kind}), so there is no "
+                          f"evidence price was the problem. Incentives are "
+                          f"reserved for confirmed drop-offs.",
+                "do_this_instead": f"Offer the full INR {owed:,.2f} again — a "
+                                   f"page push or a full-price link on another "
+                                   f"rail. If that is refused or ignored, ask "
+                                   f"here again and an offer is authorised.",
             })
 
     try:
@@ -1178,6 +1235,23 @@ def send_recovery_notification(
             amount=amount,
             attempt_count=attempt_count,
         )
+        # A rung is a claim that the customer was reached. dispatch() reports
+        # only channels that genuinely delivered; when none did, nothing was
+        # tried as far as the ladder is concerned — recording it anyway turns
+        # "already tried: the offer email" into a false memory, and the next
+        # run skips a rung the customer never saw.
+        if result.get("status") != "dispatched":
+            why = "; ".join(f"{ch}: {reason}" for ch, reason in
+                            (result.get("undelivered") or {}).items()) \
+                  or "no channel was available"
+            return json.dumps({
+                "status": "error",
+                "message": f"the message could not be delivered ({why})",
+                "guidance": "The customer has NOT been contacted and this rung "
+                            "is not climbed. Put the offer on the page with "
+                            "show_page_offer, or take another route — do not "
+                            "assume they saw anything.",
+            })
         # Which rung an email is depends on what came before it: the first one
         # carries the offer, one sent after a call is the follow-up the call
         # agreed to. Same tool, different place on the ladder.
@@ -1200,59 +1274,12 @@ def send_recovery_notification(
 
 
 @tool
-def schedule_retry(
-    payment_id: str,
-    target_iso_timestamp: str,
-    runtime=None,
-) -> str:
-    """Schedule a background retry at a specific future timestamp.
-
-    Args:
-        payment_id: Payment ID to retry
-        target_iso_timestamp: ISO 8601 timestamp for when to retry (e.g., '2026-09-01T12:01:00+05:30')
-
-    Returns:
-        JSON with job_id, target_time, delay_hours
-    """
-    from recovery_agent.state_store import StateStore
-
-    try:
-        target_time = datetime.fromisoformat(target_iso_timestamp)
-        now = datetime.now(timezone.utc)
-        if target_time.tzinfo is None:
-            target_time = target_time.replace(tzinfo=timezone.utc)
-        delay_seconds = (target_time - now).total_seconds()
-
-        if delay_seconds <= 0:
-            return json.dumps({"status": "error", "message": "Target time is in the past. Use retry_in_hours instead."})
-
-        store = StateStore()
-        job_id = f"job_{payment_id}_{int(target_time.timestamp())}"
-        store.schedule_job(
-            job_id=job_id,
-            payment_id=payment_id,
-            target_time=target_iso_timestamp,
-            action="retry_payment",
-        )
-        store.flush()
-
-        ladder.record_action(payment_id, f"retry:{round(hours, 1)}h")
-        return json.dumps({
-            "status": "scheduled",
-            "job_id": job_id,
-            "delay_hours": round(delay_seconds / 3600, 1),
-        })
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-
-@tool
 def retry_in_hours(
     payment_id: str,
     hours: float,
     runtime=None,
 ) -> str:
-    """Schedule a retry after a number of hours from now. Use this instead of schedule_retry when you don't know the exact timestamp.
+    """Schedule a silent background retry after a number of hours from now.
 
     Args:
         payment_id: Payment ID to retry
@@ -1393,6 +1420,16 @@ def escalate_to_human(
     })
 
 
+#: Statuses that mean a voice call genuinely went out. `superu_client` returns
+#: "call_initiated" on success — a status this check did not accept, so a
+#: successful PAID call recorded nothing: the voice rung stayed unclimbed and
+#: the same customer could be rung again. The tool-status vocabulary is an
+#: implicit protocol; keep the one success status the client actually speaks
+#: in a named set the tests can pin against the client itself.
+VOICE_CALL_OK_STATUSES = frozenset(
+    {"call_initiated", "ok", "initiated", "queued", "success"})
+
+
 @tool
 def initiate_voice_call(
     payment_id: str,
@@ -1489,7 +1526,7 @@ def initiate_voice_call(
         recovery_link=_last_recovery_link(runtime, payment_id),
     )
 
-    if result.get("status") in ("ok", "initiated", "queued", "success"):
+    if result.get("status") in VOICE_CALL_OK_STATUSES:
         ladder.record_rung(payment_id, "voice_call",
                            f"called {customer_phone}")
         ladder.record_action(payment_id, f"voice:{customer_phone}", is_rung=True)
@@ -1562,85 +1599,6 @@ def query_knowledge_base(
         "groundedness_score": round(response.groundedness_score, 3),
         "sources": sorted({c.source_file for c in response.retrieved_chunks}),
     })
-
-
-# ═══════════════════════════════════════════════════════════════
-# PLANNER TOOL — calls pydantic-ai Agent for structured planning
-# ═══════════════════════════════════════════════════════════════
-
-@tool
-def get_recovery_plan(
-    payment_id: str,
-    failure_code: str,
-    failure_reason: str,
-    customer_id: str,
-    amount: float,
-    attempt: int,
-    max_attempts: int,
-    runtime=None,
-) -> str:
-    """Get a structured recovery plan from the planning agent.
-
-    Uses pydantic-ai Agent to generate a typed RecoveryPlan with steps.
-    The LLM reasons about the failure and creates an ordered action plan.
-
-    Args:
-        payment_id: The Razorpay payment ID
-        failure_code: The error code from Razorpay
-        failure_reason: The human-readable failure reason
-        customer_id: Customer identifier
-        amount: Payment amount in INR
-        attempt: Current attempt number
-        max_attempts: Maximum allowed attempts
-
-    Returns:
-        JSON with plan (failure_type, root_cause, steps, reasoning)
-    """
-    from recovery_agent.agent.planner import generate_plan
-    from recovery_agent.models import Case, PaymentEvent, RecoveryTier
-
-    case = Case(
-        payment=PaymentEvent(
-            event_type="payment_failed",
-            payment_id=payment_id,
-            amount=amount,
-            currency="INR",
-            failure_code=failure_code,
-            failure_reason=failure_reason,
-            customer_id=customer_id,
-        ),
-        attempt_count=attempt,
-    )
-
-    # Pass guardrails from runtime context if available
-    guardrail_engine = None
-    if runtime and hasattr(runtime, 'context') and runtime.context:
-        guardrail_engine = getattr(runtime.context, 'guardrail_engine', None)
-
-    try:
-        plan = generate_plan(case, guardrail_engine=guardrail_engine)
-        return json.dumps({
-            "status": "ok",
-            "plan": {
-                "failure_type": plan.failure_type,
-                "root_cause": plan.root_cause,
-                "confidence": plan.confidence,
-                "steps": [
-                    {
-                        "step_number": s.step_number,
-                        "action": s.action,
-                        "description": s.description,
-                        "reasoning": s.reasoning,
-                        "expected_outcome": s.expected_outcome,
-                    }
-                    for s in plan.steps
-                ],
-                "reasoning": plan.reasoning,
-                "estimated_recoverability": plan.estimated_recoverability,
-            },
-        })
-    except Exception as e:
-        return json.dumps({"status": "error", "message": f"Planning failed: {e}"})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1720,57 +1678,6 @@ def search_memory(query: str, limit: int = 10, config=None) -> str:
         else json.dumps({"status": "ok", "query": query, "memories": str(raw)[:2000]})
 
 
-@tool
-def search_similar_episodes(
-    failure_code: str,
-    failure_reason: str,
-    customer_id: str,
-) -> str:
-    """Search for past recovery episodes with similar failure patterns.
-
-    Use this before taking action to see what worked (or didn't) for similar failures.
-    The LLM can learn from past episodes to avoid repeating mistakes.
-
-    Args:
-        failure_code: The error code from Razorpay
-        failure_reason: The human-readable failure reason
-        customer_id: Customer identifier (used to scope episode search)
-
-    Returns:
-        JSON with list of similar episodes and their outcomes
-    """
-    try:
-        from recovery_agent.agent.graph import get_memory_store
-        store = get_memory_store()
-
-        # Search for episodes from this customer
-        results = store.search(
-            ("episodes", customer_id),
-            query=f"{failure_code} {failure_reason}",
-            limit=5,
-        )
-
-        episodes = []
-        for item in results:
-            ep = item.value
-            episodes.append({
-                "payment_id": ep.get("payment_id"),
-                "failure_code": ep.get("failure_code"),
-                "failure_reason": ep.get("failure_reason"),
-                "tool_calls": ep.get("tool_calls", []),
-                "summary": ep.get("summary", "")[:200],
-                "status": ep.get("status"),
-            })
-
-        return json.dumps({
-            "status": "ok",
-            "episode_count": len(episodes),
-            "episodes": episodes,
-        })
-    except Exception as e:
-        return json.dumps({"status": "error", "message": f"Episode search failed: {e}"})
-
-
 # ═══════════════════════════════════════════════════════════════
 # DISCOVERY TOOL — two-phase KG discovery (semantic + process)
 # ═══════════════════════════════════════════════════════════════
@@ -1827,54 +1734,6 @@ def discover_recovery_rail(
 
 
 # ═══════════════════════════════════════════════════════════════
-# FEEDBACK TOOLS — training with human feedback (CrewAI pattern)
-# ═══════════════════════════════════════════════════════════════
-
-@tool
-def store_feedback(
-    customer_id: str,
-    outcome: str,
-    feedback: str,
-    recovery_strategy: str,
-) -> str:
-    """Store human feedback about a recovery attempt for future learning.
-
-    CrewAI: "train with human feedback" — distill lessons into memory.
-    MANDATE 1: Uses langmem create_manage_memory_tool with explicit store (real SDK).
-    MANDATE 4: Verified API — action='create', store passed explicitly.
-
-    Args:
-        customer_id: The customer identifier.
-        outcome: Recovery outcome (success, partial, failed, escalated).
-        feedback: Human feedback notes about what worked or didn't.
-        recovery_strategy: The strategy that was used (e.g., retry, notify, escalate).
-    """
-    from langmem import create_manage_memory_tool
-    from recovery_agent.agent.graph import get_memory_store
-
-    store = get_memory_store()
-    # MANDATE 1: langmem create_manage_memory_tool with explicit store (real SDK)
-    # MANDATE 4: action='create' (verified API — 'store' is not valid)
-    feedback_tool = create_manage_memory_tool(
-        namespace=("recovery", "{customer_id}"),
-        store=store,
-        actions_permitted=("create",),
-    )
-    content = (
-        f"Recovery feedback for customer {customer_id}:\n"
-        f"Strategy: {recovery_strategy}\n"
-        f"Outcome: {outcome}\n"
-        f"Notes: {feedback}\n"
-        f"Store this as a lesson for future recovery attempts."
-    )
-    result = feedback_tool.invoke({
-        "content": content,
-        "action": "create",
-    })
-    return f"Feedback stored for {customer_id}: {outcome}. {result}"
-
-
-# ═══════════════════════════════════════════════════════════════
 # TOOL LIST — used by bind_tools() and ToolNode
 # ═══════════════════════════════════════════════════════════════
 
@@ -1899,43 +1758,3 @@ RECOVERY_TOOLS = [
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in RECOVERY_TOOLS}
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL SUBSETS — specialized tool groups per recovery phase (P1)
-# ═══════════════════════════════════════════════════════════════
-
-PLANNING_TOOLS = [
-    search_memory,
-    discover_recovery_rail,
-    get_recovery_plan,
-    search_similar_episodes,
-    query_knowledge_base,
-]
-
-DIAGNOSIS_TOOLS = [
-    diagnose_payment_failure,
-    check_payment_status,
-    get_customer_payment_history,
-    query_knowledge_base,
-]
-
-EXECUTION_TOOLS = [
-    generate_recovery_payment_link,
-    get_recovery_offer,
-    send_page_push,
-    show_page_offer,
-    wait_for_customer,
-    send_recovery_notification,
-    schedule_retry,
-    escalate_to_human,
-    initiate_voice_call,
-    check_payment_status,
-]
-
-
-MEMORY_TOOLS = [
-    manage_memory,
-    search_memory,
-    store_feedback,
-]

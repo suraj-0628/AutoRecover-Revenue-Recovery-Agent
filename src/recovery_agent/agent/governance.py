@@ -88,8 +88,6 @@ class ToolAccessPolicy(BaseModel):
         "initiate_voice_call",
         "wait_for_customer",
     ])
-    # Amount threshold requiring escalation (in paise)
-    escalation_threshold_paise: int = 5_000_000  # ₹50,000
 
 
 # Default policy — configurable via env vars or constructor
@@ -98,14 +96,21 @@ _DEFAULT_POLICY = ToolAccessPolicy()
 
 def get_allowed_tools(
     tier: str | AgentTier,
-    amount_paise: int = 0,
     policy: ToolAccessPolicy | None = None,
 ) -> list[str]:
-    """Return list of tool names allowed for the given tier and amount.
+    """Return list of tool names allowed for the given tier.
 
-    MANDATE 3: This is access control (acceptable guardrail), not decision-making.
-    The LLM still decides WHICH allowed tool to call.
-    MANDATE 1: pydantic validation via ToolAccessPolicy.
+    Deliberately NOT amount-gated. A "high-value orders lose
+    generate_recovery_payment_link" rule used to live here, and it was wrong
+    twice over. In intent: charging a customer what they already owe is never
+    the risk — the give-away is, and human_approval_gate caps the DISCOUNT for
+    exactly that reason (a ₹79,980 order was once refused a full-price link
+    and escalated instead of recovered). And in fact: the caller passed rupees
+    into a paise threshold, so the rule slept until 100x the intended amount —
+    a control that misfires the one time it finally fires is worse than none.
+
+    MANDATE 3: This is access control (acceptable guardrail), not
+    decision-making. The LLM still decides WHICH allowed tool to call.
     """
     p = policy or _DEFAULT_POLICY
     t = AgentTier(tier) if isinstance(tier, str) else tier
@@ -117,13 +122,6 @@ def get_allowed_tools(
 
     if t == AgentTier.ESCALATED:
         allowed.extend(p.escalated_tools)
-
-    # High-value transactions require escalated tier for financial tools
-    if amount_paise > p.escalation_threshold_paise:
-        financial_tools = {"generate_recovery_payment_link"}
-        allowed = [t for t in allowed if t not in financial_tools]
-        if "escalate_to_human" not in allowed:
-            allowed.append("escalate_to_human")
 
     return list(set(allowed))  # deduplicate
 
@@ -207,7 +205,7 @@ def mask_tool_output(tool_name: str, output: str) -> str:
         return mask_pii(output)
 
     # Knowledge/memory tools: no PII in output
-    if tool_name in ("query_knowledge_base", "search_similar_episodes",
+    if tool_name in ("query_knowledge_base",
                       "manage_memory", "search_memory", "discover_recovery_rail"):
         return output
 

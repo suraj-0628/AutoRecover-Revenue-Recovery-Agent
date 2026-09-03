@@ -193,6 +193,10 @@ def superu_call_complete():
     if payment_id:
         from recovery_agent.state_store import StateStore
         store = StateStore()
+        # This process's snapshot dates from its first request; pull the
+        # frontend's newer writes in before appending, or the flush below
+        # would push a stale trail (and stale everything else) back over them.
+        store.refresh()
         trail = store.get_trail(payment_id)
         trail.append({
             "step": "superu_call_complete",
@@ -205,49 +209,6 @@ def superu_call_complete():
         store.flush()
 
     return jsonify({"status": "received", "payment_id": payment_id}), 200
-
-
-def process_webhook_payload(payload: dict) -> dict:
-    """Process a raw webhook event dictionary programmatically.
-
-    Backward-compatible wrapper for tests and direct API usage.
-    Parses the payload and returns a result dict without forwarding to frontend.
-    """
-    event = payload.get("event", "")
-    data = payload.get("payload", {})
-
-    if event == "payment.failed":
-        payment = data.get("payment", {}).get("entity", {})
-        payment_id = payment.get("id", "")
-        amount = payment.get("amount", 0) / 100
-        error_code = payment.get("error_code", "")
-        error_reason = payment.get("error_reason", "")
-
-        return {
-            "event": event,
-            "status": "processed",
-            "payment_id": payment_id,
-            "amount": amount,
-            "error_code": error_code,
-            "error_reason": error_reason,
-            "status_code": 200,
-        }
-    elif event == "payment.captured":
-        payment = data.get("payment", {}).get("entity", {})
-        payment_id = payment.get("id", "")
-        amount = payment.get("amount", 0) / 100
-
-        return {
-            "event": event,
-            "status": "processed",
-            "payment_id": payment_id,
-            "amount": amount,
-            "status_code": 200,
-        }
-    elif "dispute" in event:
-        return {"event": event, "status": "handled", "status_code": 200}
-
-    return {"event": event, "status": "ignored", "status_code": 200}
 
 
 def main():

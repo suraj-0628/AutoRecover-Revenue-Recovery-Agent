@@ -130,7 +130,13 @@ def test_a_settled_case_can_always_close_itself():
 
 
 def test_the_hud_names_the_ending_instead_of_reporting_none():
-    assert 'action_val, sdk_res = "close_case", close_res' in FRONTEND
+    from recovery_agent.frontend import _select_primary_action
+    action, receipt, _ = _select_primary_action({
+        "close_case": {"args": {}, "result": {"status": "closed",
+                                              "outcome": "recovered"}},
+    })
+    assert action == "close_case"
+    assert receipt["outcome"] == "recovered"
     assert "Case closed:" in FRONTEND
 
 

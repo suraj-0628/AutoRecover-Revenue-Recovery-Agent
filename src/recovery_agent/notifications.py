@@ -1,7 +1,13 @@
-"""Notification dispatcher — sends real emails/SMS and logs all outbound messages.
+"""Notification dispatcher — sends email via SMTP and logs all outbound messages.
 
-Every dispatched notification is logged to data/outbox/ as a verifiable artifact.
-Emails are written as .eml files (inspectable by judges). SMS payloads are JSON.
+Every notification is logged to data/outbox/ as a verifiable artifact. Emails
+are written as .eml files (inspectable by judges); SMS payloads are JSON files
+ONLY — no SMS provider is integrated, so an SMS never reaches a phone.
+
+`dispatch` reports a channel as delivered only when it actually was: an SMTP
+send that succeeded. An .eml written beside a failed send, or an SMS payload
+no provider carries, is a record of intent — not contact — and callers that
+mark ladder rungs must not treat it as one.
 
 Usage:
     from recovery_agent.notifications import NotificationDispatcher
@@ -102,6 +108,7 @@ class NotificationDispatcher:
             "eml_path": str(eml_path),
             "smtp_sent": smtp_sent,
             "smtp_error": smtp_error,
+            "delivered": smtp_sent,
             "timestamp": timestamp.isoformat(),
         }
 
@@ -139,6 +146,9 @@ class NotificationDispatcher:
             "timestamp": timestamp.isoformat(),
             "characters": sms_payload["characters"],
             "segments": sms_payload["segments"],
+            # No provider exists. The payload is on disk; no phone rang.
+            "delivered": False,
+            "simulated": True,
         }
 
     # ── Dispatch ─────────────────────────────────────────────────
@@ -229,9 +239,24 @@ class NotificationDispatcher:
         with open(manifest_path, "a") as f:
             f.write(json.dumps(manifest_entry, default=str) + "\n")
 
+        # Only a channel that actually reached the customer counts. This used
+        # to return "dispatched" unconditionally — an .eml beside a failed SMTP
+        # send, or an SMS payload no provider carries, was reported upstream as
+        # contact, and the offer rung was recorded as climbed on the strength
+        # of a file write. Measured from this very log at the time of the fix:
+        # 49 of 87 "dispatched" emails were .eml files only.
+        delivered = [r["channel"] for r in results if r.get("delivered")]
+        undelivered = {
+            r["channel"]: (r.get("smtp_error") or
+                           ("smtp not configured" if r["channel"] == "email"
+                            else "no sms provider integrated; payload recorded only"))
+            for r in results if not r.get("delivered")
+        }
         return {
-            "status": "dispatched",
-            "channels": [r["channel"] for r in results],
+            "status": "dispatched" if delivered else "not_delivered",
+            "channels": delivered,
+            "attempted": [r["channel"] for r in results],
+            "undelivered": undelivered,
             "results": results,
             "payment_id": payment_id,
         }

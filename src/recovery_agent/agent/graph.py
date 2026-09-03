@@ -31,9 +31,7 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from recovery_agent.agent.tools import (
-    RECOVERY_TOOLS, RecoveryContext,
-    PLANNING_TOOLS, DIAGNOSIS_TOOLS, EXECUTION_TOOLS, MEMORY_TOOLS,
-    TOOLS_BY_NAME,
+    RECOVERY_TOOLS, RecoveryContext, TOOLS_BY_NAME,
 )
 from recovery_agent.agent.governance import get_allowed_tools, mask_tool_output, AGENT_VERSION
 from recovery_agent.models import CaseStatus
@@ -415,6 +413,87 @@ def _sanitize_messages_for_gemini(messages: list) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════
+# CONTEXT ASSEMBLY — what the model is shown, and what must survive
+# ═══════════════════════════════════════════════════════════════
+
+MAX_TOOL_CONTENT = 500  # chars per tool result shown to the LLM
+
+#: Tool results that must reach the model whole. check_payment_status IS the
+#: agent's perception on demand — its output carries the ground-truth briefing
+#: and is routinely longer than MAX_TOOL_CONTENT, and a briefing chopped
+#: mid-JSON is exactly the half-blindness perception.py exists to prevent.
+_NEVER_TRIM_TOOLS = frozenset({"check_payment_status"})
+
+
+def _trim_tool_results_for_llm(messages: list,
+                               max_chars: int = MAX_TOOL_CONTENT) -> list:
+    """Shorten large tool results for THIS LLM call only.
+
+    This used to assign to `msg.content`, mutating the message objects that
+    live in graph state — so a context-saving measure permanently damaged the
+    durable record. `escalate_to_human` returns 638 chars (the ticket carries
+    a full hand-over reason), was chopped at 500 mid-JSON, and every reader
+    downstream got un-parseable text: the dashboard showed
+    "Escalated to Human: N/A" and fell back to printing the observation text
+    as the reason, while the real ticket id sat correctly in the queue.
+    Copy instead of mutate — the LLM sees less, the record keeps everything.
+    """
+    trimmed = []
+    for msg in messages:
+        if (isinstance(msg, ToolMessage) and msg.content
+                and len(str(msg.content)) > max_chars
+                and (getattr(msg, "name", "") or "") not in _NEVER_TRIM_TOOLS):
+            content = str(msg.content)
+            short = content[:max_chars] + f"... [truncated, {len(content)} chars total]"
+            try:
+                msg = msg.model_copy(update={"content": short})
+            except AttributeError:          # older langchain-core
+                msg = ToolMessage(content=short, tool_call_id=msg.tool_call_id,
+                                  name=msg.name, id=msg.id)
+        trimmed.append(msg)
+    return trimmed
+
+
+def _assemble_llm_messages(briefing: list, history: list,
+                           max_messages: int = 30) -> list:
+    """System prompt + perception briefing + (truncated) history, in that order.
+
+    Truncation used to run over the ASSEMBLED list, keeping index 0 (the
+    system prompt) and the first HumanMessage. The briefing sat at index 1 —
+    so on any case longer than ~30 messages the "WHAT IS TRUE RIGHT NOW" block
+    silently fell out of the context, on exactly the long-running multi-run
+    cases most at risk of acting on stale beliefs. The head is never trimmed;
+    only the history is.
+    """
+    head = [SystemMessage(content=SYSTEM_PROMPT)] + list(briefing)
+    if len(history) <= max_messages:
+        return head + list(history)
+
+    # Keep the first HumanMessage — the case facts — plus the newest tail.
+    first_human = None
+    for i, m in enumerate(history):
+        if isinstance(m, HumanMessage):
+            first_human = i
+            break
+
+    if first_human is None:
+        tail = list(history[-max_messages:])
+    else:
+        tail_start = max(first_human + 1, len(history) - max_messages)
+        tail = list(history[tail_start:])
+    # A leading ToolMessage answers a call that fell off the slice — drop it.
+    # ONLY ToolMessages: the old rule dropped leading AIMessages too, and a
+    # tool-heavy tail (call, result, call, result, ...) drained to nothing,
+    # leaving the model the case facts and no recent history at all. An
+    # AIMessage whose results follow it in the tail is a valid opening.
+    while tail and isinstance(tail[0], ToolMessage):
+        tail.pop(0)
+    if first_human is None:
+        return head + tail
+    return head + [history[first_human]] + tail
+
+
+# ═══════════════════════════════════════════════════════════════
 # AGENT NODE — LLM with bound tools, every call traced to Phoenix
 # ═══════════════════════════════════════════════════════════════
 
@@ -562,7 +641,6 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
 
     ctx = _get_context(config)
     tier = "silent"
-    amount_paise = 0
     if ctx:
         case = ctx.case
         # `Case` has no `current_tier` — the field is `recovery_tier`. The old
@@ -571,13 +649,15 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
         # for one) was never bound. The agent could not choose what it could not
         # see.
         tier = getattr(getattr(case, "recovery_tier", None), "value", None) or "silent"
-        amount_paise = case.payment.amount
         # Update Case status — graph is source of truth
         from recovery_agent.models import CaseStatus
         if case.status == CaseStatus.OPEN:
             case.status = CaseStatus.DIAGNOSING
 
-    allowed_names = get_allowed_tools(tier=tier, amount_paise=amount_paise)
+    # No amount is passed: tool access is tier-gated only. The money control is
+    # the give-away ceiling in human_approval_gate — see get_allowed_tools for
+    # why an amount gate here was wrong twice over.
+    allowed_names = get_allowed_tools(tier=tier)
 
     # A finished case gets bookkeeping tools ONLY.
     #
@@ -637,56 +717,11 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
     except Exception:
         pass
 
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + briefing + state["messages"]
-
-    # Smart truncation: keep system prompt + first human msg + last N messages
-    # Truncate large ToolMessage content to prevent context overflow
-    MAX_MESSAGES = 30
-    MAX_TOOL_CONTENT = 500  # chars per tool result
-
-    if len(messages) > MAX_MESSAGES + 1:
-        # Keep: system prompt (index 0) + first human message + last MAX_MESSAGES
-        first_human = None
-        for i, m in enumerate(messages[1:], 1):
-            if isinstance(m, HumanMessage):
-                first_human = i
-                break
-
-        if first_human is not None:
-            tail_start = max(first_human + 1, len(messages) - MAX_MESSAGES)
-            truncated = messages[tail_start:]
-            # Ensure we don't start with orphaned AIMessage/ToolMessage
-            while truncated and isinstance(truncated[0], (AIMessage, ToolMessage)):
-                truncated = truncated[1:]
-            messages = [messages[0], messages[first_human]] + truncated
-        else:
-            truncated = messages[-(MAX_MESSAGES):]
-            while truncated and isinstance(truncated[0], (AIMessage, ToolMessage)):
-                truncated = truncated[1:]
-            messages = [messages[0]] + truncated
-
-    # Shorten large tool results for THIS LLM call only.
-    #
-    # This used to assign to `msg.content`, mutating the message objects that
-    # live in graph state — so a context-saving measure permanently damaged the
-    # durable record. `escalate_to_human` returns 638 chars (the ticket carries
-    # a full hand-over reason), was chopped at 500 mid-JSON, and every reader
-    # downstream got un-parseable text: the dashboard showed
-    # "Escalated to Human: N/A" and fell back to printing the observation text
-    # as the reason, while the real ticket id sat correctly in the queue.
-    # Copy instead of mutate — the LLM sees less, the record keeps everything.
-    trimmed = []
-    for msg in messages:
-        if isinstance(msg, ToolMessage) and msg.content and len(str(msg.content)) > MAX_TOOL_CONTENT:
-            content = str(msg.content)
-            short = content[:MAX_TOOL_CONTENT] + f"... [truncated, {len(content)} chars total]"
-            try:
-                msg = msg.model_copy(update={"content": short})
-            except AttributeError:          # older langchain-core
-                msg = ToolMessage(content=short, tool_call_id=msg.tool_call_id,
-                                  name=msg.name, id=msg.id)
-        trimmed.append(msg)
-    messages = trimmed
+    # Context assembly: the head (prompt + briefing) is never trimmed, the
+    # history is; large tool results are shortened on copies. The rules and
+    # the incidents behind them live on the two helpers.
+    messages = _trim_tool_results_for_llm(
+        _assemble_llm_messages(briefing, state["messages"]))
 
     # Rate-limit LLM calls to avoid Google upstream 502s
     # Track last call time across all agent instances

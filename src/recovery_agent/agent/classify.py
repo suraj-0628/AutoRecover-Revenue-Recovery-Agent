@@ -93,32 +93,25 @@ def failure_kind(record: dict) -> str:
 BATCHES: list[dict[str, str]] = [
     {"key": "bank_declined", "title": "Bank declined",
      "what": "The instrument was refused. These need a different rail, at full "
-             "price — the price was never the problem.",
-     "icon": "&#8635;"},
+             "price — the price was never the problem."},
     {"key": "insufficient_funds", "title": "No money at the time",
      "what": "The account was short. These need a different day, not a "
-             "different message — retry timed to when they are likely paid.",
-     "icon": "&#8986;"},
+             "different message — retry timed to when they are likely paid."},
     {"key": "transient", "title": "Failed in transit",
      "what": "The gateway or the network dropped it — nothing was wrong with "
              "the customer or the card. These want a retry, not a message and "
-             "certainly not a discount.",
-     "icon": "&#8635;"},
+             "certainly not a discount."},
     {"key": "dropoff", "title": "Chose not to complete",
      "what": "Nothing broke; they walked away. The only lever here is a reason "
-             "to come back, which is what an offer is for.",
-     "icon": "&#8599;"},
+             "to come back, which is what an offer is for."},
     {"key": "awaiting_retry", "title": "Retry already scheduled",
      "what": "A silent retry is on the clock. Nothing to do until it fires — "
-             "listed so the money is visible, not forgotten.",
-     "icon": "&#9203;"},
+             "listed so the money is visible, not forgotten."},
     {"key": "escalated", "title": "With a human",
-     "what": "The ladder was exhausted and a person has the case.",
-     "icon": "&#9755;"},
+     "what": "The ladder was exhausted and a person has the case."},
     {"key": "risk", "title": "Risk / dispute",
      "what": "Fraud, risk or a dispute. These are not chased — they go straight "
-             "to a person.",
-     "icon": "&#9940;"},
+             "to a person."},
 ]
 
 BATCH_BY_KEY = {b["key"]: b for b in BATCHES}

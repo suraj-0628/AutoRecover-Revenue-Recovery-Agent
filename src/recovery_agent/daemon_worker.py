@@ -178,6 +178,10 @@ def _process_due_jobs() -> int:
     from recovery_agent.state_store import StateStore
 
     store = StateStore()
+    # The daemon loaded its snapshot at startup; jobs the frontend scheduled
+    # since then are invisible without this. It also keeps this process's
+    # flushes from writing that startup snapshot over the frontend's work.
+    store.refresh()
     now = datetime.now(timezone.utc)
     due_jobs = store.get_due_jobs(now)
     executed_count = 0

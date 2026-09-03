@@ -884,42 +884,97 @@
       display: none;
     }
     .batchview.on { display: block }
-    .batch-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 4px }
-    .batch-head h2 { font-size: 15px; color: var(--text-bright); font-weight: 600 }
-    .batch-sub { font-size: 11px; color: var(--text-muted); margin-bottom: 14px;
-                 max-width: 760px; line-height: 1.55 }
-    .exp-arm .lab { font-size: 9.5px; color: var(--text-muted);
-                    text-transform: uppercase; letter-spacing: .06em }
-    .exp-arm .val { font-size: 19px; font-weight: 600; color: var(--text-bright) }
-    .exp-arm .sub { font-size: 10px; color: var(--text-muted) }
-    .exp-lift .val { color: var(--accent-green) }
-    .exp-verdict.weak { color: var(--accent-amber) }
-    .exp-verdict.strong { color: var(--accent-green) }
-    .batch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
-                  gap: 12px }
+    .batch-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 6px }
+    .batch-head h2 { font-size: 14px; color: var(--text-bright); font-weight: 600;
+                     letter-spacing: -0.2px }
+    .batch-sub { font-size: 11px; color: var(--text-muted); margin-bottom: 16px;
+                 max-width: 720px; line-height: 1.6 }
+
+    /* Summary strip: the three numbers that matter, before any card. */
+    .batch-stats { display: flex; gap: 32px; padding: 14px 18px; margin-bottom: 16px;
+                   background: var(--panel-bg); border: 1px solid var(--border-color);
+                   border-radius: 8px }
+    .bstat { display: flex; flex-direction: column; gap: 3px }
+    .bstat .k { font-size: 9.5px; color: var(--text-muted); text-transform: uppercase;
+                letter-spacing: .08em }
+    .bstat .v { font-size: 18px; font-weight: 600; color: var(--text-bright);
+                font-variant-numeric: tabular-nums }
+    .bstat .v.amber { color: var(--accent-amber) }
+
+    .batch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+                  gap: 14px }
     .batch-card { background: var(--panel-bg); border: 1px solid var(--border-color);
-                  border-radius: 10px; padding: 13px 14px; display: flex;
-                  flex-direction: column; gap: 9px }
-    .batch-card.empty { opacity: .5 }
-    .batch-card-top { display: flex; align-items: center; gap: 9px }
-    .batch-ico { font-size: 15px; color: var(--accent-blue) }
-    .batch-title { font-size: 12.5px; font-weight: 600; color: var(--text-bright); flex: 1 }
-    .batch-n { font-size: 11px; color: var(--text-muted) }
+                  border-radius: 8px; display: flex; flex-direction: column;
+                  transition: border-color .15s }
+    .batch-card:hover { border-color: #3d444d }
+    .batch-card-top { display: flex; align-items: center; gap: 10px;
+                      padding: 12px 14px; border-bottom: 1px solid var(--border-color) }
+    .batch-ico { width: 26px; height: 26px; border-radius: 6px; flex-shrink: 0;
+                 display: flex; align-items: center; justify-content: center;
+                 background: rgba(88,166,255,.08); color: var(--accent-blue) }
+    .batch-ico svg { width: 14px; height: 14px }
+    .batch-title { font-size: 12px; font-weight: 600; color: var(--text-bright);
+                   flex: 1; letter-spacing: -0.1px }
+    .batch-n { min-width: 20px; padding: 1px 7px; border-radius: 999px;
+               font-size: 10px; font-weight: 600; text-align: center;
+               font-variant-numeric: tabular-nums;
+               background: #21262d; color: var(--text-muted);
+               border: 1px solid var(--border-color) }
+    .batch-card:not(.empty) .batch-n { background: rgba(255,166,87,.1);
+               color: var(--accent-amber); border-color: rgba(255,166,87,.25) }
+    .batch-body { padding: 12px 14px; display: flex; flex-direction: column;
+                  gap: 10px }
+    .batch-cases { flex: 1 }
+    .batch-value { font-size: 17px; color: var(--text-bright); font-weight: 600;
+                   font-variant-numeric: tabular-nums; letter-spacing: -0.3px }
+    .batch-value .cur { font-size: 10.5px; color: var(--text-muted);
+                        font-weight: 500; margin-right: 4px }
+    .batch-value .risk-lab { font-size: 9.5px; color: var(--text-muted);
+                             font-weight: 500; text-transform: uppercase;
+                             letter-spacing: .07em; margin-left: 7px }
     .batch-what { font-size: 10.5px; color: var(--text-muted); line-height: 1.6 }
-    .batch-value { font-size: 16px; color: var(--accent-amber); font-weight: 600 }
-    .batch-cases { max-height: 148px; overflow-y: auto; border-top: 1px solid var(--border-color);
-                   padding-top: 8px; display: flex; flex-direction: column; gap: 5px }
-    .batch-case { display: flex; justify-content: space-between; gap: 8px; font-size: 10px;
-                  color: var(--text-muted) }
+    .batch-cases { border-top: 1px solid var(--border-color); margin: auto -14px 0;
+                   padding: 4px 0; max-height: 158px; overflow-y: auto }
+    .batch-case { display: flex; justify-content: space-between; align-items: center;
+                  gap: 10px; padding: 4px 14px; font-size: 10.5px }
+    .batch-case:hover { background: rgba(88,166,255,.04) }
     .batch-case b { color: var(--text-main); font-weight: 500 }
-    .btn-batch { align-self: flex-start; padding: 6px 13px; border-radius: 7px;
+    .batch-case span { color: var(--text-muted); font-variant-numeric: tabular-nums }
+    .batch-more { padding: 4px 14px; font-size: 9.5px; color: var(--text-muted) }
+    .batch-foot { display: flex; align-items: center; justify-content: space-between;
+                  gap: 10px; padding: 10px 14px;
+                  border-top: 1px solid var(--border-color) }
+    .btn-batch { padding: 5px 14px; border-radius: 6px;
                  border: 1px solid var(--accent-blue); background: transparent;
                  color: var(--accent-blue); font-family: var(--font-mono);
-                 font-size: 10.5px; font-weight: 600; cursor: pointer }
+                 font-size: 10.5px; font-weight: 600; cursor: pointer;
+                 transition: background .12s, color .12s }
     .btn-batch:hover:enabled { background: var(--accent-blue); color: #0d1117 }
-    .btn-batch:disabled { opacity: .35; cursor: not-allowed; border-color: var(--border-color);
-                          color: var(--text-muted) }
-    .batch-note { font-size: 10px; color: var(--accent-amber); min-height: 13px }
+    .btn-batch:disabled { cursor: default; border-color: var(--border-color);
+                          color: var(--text-muted); opacity: .55 }
+    .batch-note { font-size: 10px; color: var(--accent-amber); text-align: right;
+                  flex: 1 }
+
+    /* Batches with nothing in them collapse to one quiet row: still visible —
+       an empty batch says that failure class is not happening — without four
+       hollow cards claiming a third of the screen. */
+    .batch-quiet { margin-top: 14px; padding: 10px 16px; border: 1px dashed var(--border-color);
+                   border-radius: 8px; display: flex; align-items: center; gap: 8px;
+                   flex-wrap: wrap; font-size: 10.5px; color: var(--text-muted) }
+    .batch-quiet .q-lab { text-transform: uppercase; letter-spacing: .07em;
+                          font-size: 9.5px; margin-right: 4px }
+    .batch-quiet .q-item { display: inline-flex; align-items: center; gap: 6px;
+                           padding: 3px 10px; border: 1px solid var(--border-color);
+                           border-radius: 999px; background: var(--card-bg) }
+    .batch-quiet .q-item svg { width: 11px; height: 11px; opacity: .7 }
+
+    /* Native scrollbars glow white on a dark panel; the whole page needs the
+       treatment, not just the batch lists. Firefox first, then WebKit. */
+    * { scrollbar-width: thin; scrollbar-color: #30363d transparent }
+    *::-webkit-scrollbar { width: 8px; height: 8px }
+    *::-webkit-scrollbar-track { background: transparent }
+    *::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px }
+    *::-webkit-scrollbar-thumb:hover { background: #3d444d }
   </style>
 </head>
 <body>
@@ -2055,36 +2110,77 @@ function esc(t) {
   });
 }
 
+/* Feather-style stroke icons, one per failure class. Inline SVG rather than
+   an icon font or emoji: no external asset, and it inherits currentColor. */
+var BATCH_ICONS = {
+  bank_declined: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>',
+  insufficient_funds: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/></svg>',
+  transient: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>',
+  dropoff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
+  awaiting_retry: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  escalated: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+  risk: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>'
+};
+
 function loadBatches() {
   fetch("/api/batches").then(r => r.json()).then(d => {
     const badge = document.getElementById("rail-batch-count");
     badge.textContent = d.total_cases;
     badge.style.display = d.total_cases ? "" : "none";
-    document.getElementById("batch-total").textContent =
-      d.total_cases + " cases \u00b7 " + inr(d.total_at_risk) + " at risk";
 
-    document.getElementById("batch-grid").innerHTML = d.batches.map(function (b) {
-      /* An empty batch is kept and dimmed: it says that class of failure is not
-         happening, and hiding it makes the page rearrange on every refresh. */
-      const runnable = b.count > 0 && b.key !== "awaiting_retry" &&
-                       b.key !== "escalated" && b.key !== "risk";
-      const cases = b.payments.slice(0, 30).map(function (p) {
+    const active = d.batches.filter(function (b) { return b.count > 0; });
+    const quiet = d.batches.filter(function (b) { return b.count === 0; });
+
+    document.getElementById("batch-stats").innerHTML =
+      '<div class="bstat"><span class="k">At risk</span>' +
+        '<span class="v amber">' + inr(d.total_at_risk) + '</span></div>' +
+      '<div class="bstat"><span class="k">Open cases</span>' +
+        '<span class="v">' + d.total_cases + '</span></div>' +
+      '<div class="bstat"><span class="k">Failure classes active</span>' +
+        '<span class="v">' + active.length + ' of ' + d.batches.length + '</span></div>';
+
+    document.getElementById("batch-grid").innerHTML = active.map(function (b) {
+      const runnable = b.key !== "awaiting_retry" && b.key !== "escalated" &&
+                       b.key !== "risk";
+      const shown = b.payments.slice(0, 30);
+      const cases = shown.map(function (p) {
         return '<div class="batch-case"><b>' + esc(p.payment_id) + '</b><span>' +
                inr(p.amount) + '</span></div>';
-      }).join("");
-      return '<div class="batch-card' + (b.count ? '' : ' empty') + '">' +
-        '<div class="batch-card-top"><span class="batch-ico">' + b.icon + '</span>' +
+      }).join("") +
+      (b.count > shown.length
+        ? '<div class="batch-more">+ ' + (b.count - shown.length) + ' more</div>' : '');
+      return '<div class="batch-card">' +
+        '<div class="batch-card-top">' +
+          '<span class="batch-ico">' + (BATCH_ICONS[b.key] || '') + '</span>' +
           '<span class="batch-title">' + esc(b.title) + '</span>' +
           '<span class="batch-n">' + b.count + '</span></div>' +
-        '<div class="batch-value">' + inr(b.value) + '</div>' +
-        '<div class="batch-what">' + esc(b.what) + '</div>' +
-        (cases ? '<div class="batch-cases">' + cases + '</div>' : '') +
-        '<button class="btn-batch" id="run-' + b.key + '" ' +
-          (runnable ? '' : 'disabled ') +
-          'onclick="runBatch(\'' + b.key + '\')">Run this batch</button>' +
-        '<div class="batch-note" id="note-' + b.key + '"></div>' +
+        '<div class="batch-body">' +
+          '<div class="batch-value"><span class="cur">INR</span>' +
+            inr(b.value).replace("INR ", "") +
+            '<span class="risk-lab">at risk</span></div>' +
+          '<div class="batch-what">' + esc(b.what) + '</div></div>' +
+        '<div class="batch-cases">' + cases + '</div>' +
+        '<div class="batch-foot">' +
+          '<button class="btn-batch" id="run-' + b.key + '" ' +
+            (runnable ? '' : 'disabled title="Nothing to do here — these wait on a clock or a person" ') +
+            'onclick="runBatch(\'' + b.key + '\')">' +
+            (runnable ? 'Run this batch' : 'Held') + '</button>' +
+          '<span class="batch-note" id="note-' + b.key + '"></span></div>' +
       '</div>';
     }).join("");
+
+    /* Empty batches stay on the page — that a failure class is NOT happening is
+       information — but as one quiet row, not four hollow cards. */
+    const q = document.getElementById("batch-quiet");
+    if (quiet.length) {
+      q.style.display = "";
+      q.innerHTML = '<span class="q-lab">Nothing in</span>' + quiet.map(function (b) {
+        return '<span class="q-item">' + (BATCH_ICONS[b.key] || '') +
+               esc(b.title) + '</span>';
+      }).join("");
+    } else {
+      q.style.display = "none";
+    }
   }).catch(function () {});
 }
 
@@ -2128,14 +2224,15 @@ loadBatches();
   <section class="batchview" id="view-batches">
     <div class="batch-head">
       <h2>Revenue at risk, by what went wrong</h2>
-      <span class="batch-n" id="batch-total"></span>
     </div>
     <div class="batch-sub">
-      These are cases the real-time ladder could not close while the customer was
-      still there. Each batch shares a cause, so it shares a fix. Running one
-      opens a separate agent session per payment — never two on the same case.
+      Cases the real-time ladder could not close while the customer was still
+      there. Each batch shares a cause, so it shares a fix. Running one opens a
+      separate agent session per payment &mdash; never two on the same case.
     </div>
+    <div class="batch-stats" id="batch-stats"></div>
     <div class="batch-grid" id="batch-grid"></div>
+    <div class="batch-quiet" id="batch-quiet" style="display:none"></div>
   </section>
 
 </body>

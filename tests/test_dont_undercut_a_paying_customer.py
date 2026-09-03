@@ -133,7 +133,9 @@ def test_a_new_failure_clears_the_previous_click():
     FRONTEND = (pathlib.Path(__file__).resolve().parents[1] / "src"
                 / "recovery_agent" / "frontend.py").read_text()
     i = FRONTEND.index("def payment_failed")
-    body = FRONTEND[i:i + 2200]
+    # Window sized to hold the route body; the signal-precedence block sits
+    # between the def and the push_outcome reset it pins.
+    body = FRONTEND[i:i + 4200]
     assert "push_outcome=None" in body
     assert "failure_code=failure_code" in body, (
         "the code was never stored, so the record said failure_code: None and "

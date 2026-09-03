@@ -69,3 +69,4 @@ data/*.json
 data/ledger.db
 data/ledger.db-wal
 data/ledger.db-shm
+data-test/
