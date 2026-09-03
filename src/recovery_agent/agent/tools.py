@@ -360,6 +360,11 @@ def generate_recovery_payment_link(
             case.payment.metadata["recovery_link_amount"] = float(amount)
             if expire_by:
                 case.payment.metadata["recovery_link_expire_by"] = int(expire_by)
+        # A link on different rails, or at a different price, is a genuinely
+        # different route for the customer — so it counts. The same link again
+        # does not.
+        ladder.record_action(payment_id,
+                             f"link:{'+'.join(sorted(rails))}:{float(amount):.2f}")
         return json.dumps({
             "status": "ok",
             "payment_id": payment_id,
@@ -492,6 +497,7 @@ def show_page_offer(
 
     if result.get("status") == "delivered":
         ladder.record_rung(payment_id, "offer", payload["offer_text"])
+        ladder.record_action(payment_id, f"page_offer:{payable_amount}", is_rung=True)
 
     return json.dumps({
         "status": result.get("status", "unknown"),
@@ -630,6 +636,7 @@ def send_page_push(
 
     if result.get("status") == "delivered":
         ladder.record_rung(payment_id, "page_push", payload["headline"])
+        ladder.record_action(payment_id, f"page_push:{'offer' if offer_text else 'plain'}", is_rung=True)
 
     return json.dumps({
         "status": result.get("status", "unknown"),
@@ -781,6 +788,11 @@ def send_recovery_notification(
         rung = "post_call_email" if ladder.climbed(_live_record(payment_id),
                                                    "voice_call") else "offer"
         ladder.record_rung(payment_id, rung, message[:200])
+        ladder.record_action(
+            payment_id,
+            f"notify:{'+'.join(sorted(result.get('channels') or []))}:"
+            f"{payment_link or _last_recovery_link(runtime, payment_id)}",
+            is_rung=True)
         return json.dumps({
             "status": "ok",
             "rung": rung,
@@ -828,6 +840,7 @@ def schedule_retry(
         )
         store.flush()
 
+        ladder.record_action(payment_id, f"retry:{round(hours, 1)}h")
         return json.dumps({
             "status": "scheduled",
             "job_id": job_id,
@@ -870,6 +883,7 @@ def retry_in_hours(
         )
         store.flush()
 
+        ladder.record_action(payment_id, f"retry:{round(hours, 1)}h")
         return json.dumps({
             "status": "scheduled",
             "job_id": job_id,
@@ -916,6 +930,7 @@ def escalate_to_human(
             "reason": "the recovery ladder is not exhausted; escalation is the "
                       "final step, not a fallback",
             "already_tried": _ladder["climbed"] or ["nothing yet"],
+            "actions_so_far": ladder.actions_tried(_rec) or ["none"],
             "next_rung": nxt["rung"],
             "next_step": nxt["what"],
             "still_available": [r["rung"] for r in _ladder["remaining"]],
@@ -1074,6 +1089,7 @@ def initiate_voice_call(
     if result.get("status") in ("ok", "initiated", "queued", "success"):
         ladder.record_rung(payment_id, "voice_call",
                            f"called {customer_phone}")
+        ladder.record_action(payment_id, f"voice:{customer_phone}", is_rung=True)
 
     return json.dumps({
         "status": result.get("status", "unknown"),

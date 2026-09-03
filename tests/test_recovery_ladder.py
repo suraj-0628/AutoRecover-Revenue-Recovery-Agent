@@ -111,7 +111,7 @@ def test_an_opted_out_customer_is_not_chased():
 # ── the tool actually enforces it ───────────────────────────────────────
 
 def test_escalation_is_refused_while_rungs_remain(tmp_path, monkeypatch):
-    monkeypatch.setenv("RECOVERY_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STATE_DIR", str(tmp_path))
     import json
     from recovery_agent.agent.tools import TOOLS_BY_NAME
     out = json.loads(TOOLS_BY_NAME["escalate_to_human"].invoke(
@@ -128,3 +128,71 @@ def test_the_refusal_names_what_to_do_instead():
         {"payment_id": "pay_never_seen_2", "reason": "blocked"}))
     assert out["next_step"], "a refusal must name the next move"
     assert "guidance" in out
+
+
+# ── rung 5 is whatever the agent picks, so long as it is new ────────────
+
+def test_a_new_kind_of_action_after_the_offer_is_the_alternate_path(tmp_path, monkeypatch):
+    """There is no fixed tool for rung 5. Which route is worth trying after an
+    offer has failed depends on the customer and the failure, and that judgement
+    is the agent's — the ledger only notices that it did something new."""
+    from recovery_agent import state_store
+    monkeypatch.setattr(state_store, "_DATA_DIR", tmp_path)
+    from recovery_agent.state_store import StateStore
+    s = StateStore(tmp_path)
+    s.save_payment("p1", {"payment_id": "p1", "amount": 2499,
+                          "customer": {"email": "a@b.com"}, "ladder": {}})
+    s.flush()
+
+    ladder.record_rung("p1", "page_push", "")
+    ladder.record_action("p1", "page_push:plain", is_rung=True)
+    ladder.record_rung("p1", "offer", "")
+    ladder.record_action("p1", "notify:email:https://rzp.io/x", is_rung=True)
+
+    rec = StateStore(tmp_path).get_payment("p1")
+    assert not ladder.climbed(rec, "alternate_path"), (
+        "the offer email is the offer rung, not a different path"
+    )
+
+    ladder.record_action("p1", "retry:24.0h")          # agent's own choice
+    rec = StateStore(tmp_path).get_payment("p1")
+    assert ladder.climbed(rec, "alternate_path")
+
+
+def test_repeating_an_action_is_not_a_different_path(tmp_path, monkeypatch):
+    from recovery_agent import state_store
+    monkeypatch.setattr(state_store, "_DATA_DIR", tmp_path)
+    from recovery_agent.state_store import StateStore
+    s = StateStore(tmp_path)
+    s.save_payment("p2", {"payment_id": "p2", "amount": 2499,
+                          "customer": {"email": "a@b.com"}, "ladder": {}})
+    s.flush()
+    ladder.record_rung("p2", "page_push", "")
+    ladder.record_action("p2", "notify:email:https://rzp.io/x")
+    ladder.record_rung("p2", "offer", "")
+    ladder.record_action("p2", "notify:email:https://rzp.io/x")   # same again
+
+    rec = StateStore(tmp_path).get_payment("p2")
+    assert rec["actions_tried"].count("notify:email:https://rzp.io/x") == 1
+    assert not ladder.climbed(rec, "alternate_path")
+
+
+def test_the_agent_is_told_what_it_has_already_tried():
+    """"Do not repeat a channel that failed" is advice the agent cannot act on
+    unless it can see the list — and a Case is rebuilt on every hand-off run."""
+    GRAPH = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+             / "recovery_agent" / "agent" / "graph.py").read_text()
+    i = GRAPH.index("def build_initial_state")
+    body = GRAPH[i:i + 3000]
+    assert "WHERE THIS CASE STANDS ON THE LADDER" in body
+    assert "already tried" in body
+    assert "do NOT repeat any of these" in body
+
+
+def test_the_followup_context_no_longer_points_straight_at_escalation():
+    GRAPH = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+             / "recovery_agent" / "agent" / "graph.py").read_text()
+    i = GRAPH.index("FOLLOW-UP: a recovery attempt was ALREADY delivered")
+    body = GRAPH[i:i + 900]
+    assert "next rung of the" in body
+    assert "Otherwise retry_in_hours, or " not in body

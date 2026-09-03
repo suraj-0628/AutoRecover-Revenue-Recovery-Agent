@@ -88,6 +88,50 @@ def record_rung(payment_id: str, key: str, detail: str = "") -> None:
         pass                            # never let bookkeeping break a recovery
 
 
+def actions_tried(record: dict) -> list[str]:
+    return list(record.get("actions_tried") or [])
+
+
+def record_action(payment_id: str, signature: str, is_rung: bool = False) -> None:
+    """Note a recovery action that actually reached the customer.
+
+    Rung 5 is deliberately not a named tool. Which route is worth trying after an
+    offer has failed — a different rail, a silent retry timed to payday, a fresh
+    offer shape — depends on the customer and the failure, and that judgement is
+    the agent's. So the ledger does not prescribe one; it notices when the agent
+    takes an approach it has not taken before, and counts that as the rung.
+
+    The signature is what makes two attempts different. Emailing the same link
+    twice is one action; emailing a link and then scheduling a retry is two.
+    """
+    if not signature:
+        return
+    try:
+        from recovery_agent.state_store import StateStore
+        store = StateStore()
+        rec = store.get_payment(payment_id)
+        if rec is None:
+            return
+        tried = list(rec.get("actions_tried") or [])
+        if signature in tried:
+            return                      # a repeat is not a different path
+        tried.append(signature)
+        store.update_payment(payment_id, actions_tried=tried)
+        store.flush()
+
+        # Anything genuinely new AFTER the offer has been made is the alternate
+        # path. Before that, it is just the ladder being climbed normally.
+        rec = store.get_payment(payment_id) or {}
+        # An action that IS one of the named rungs cannot also be the
+        # alternate path — the offer email is the offer, not a different route.
+        if not is_rung and climbed(rec, "offer") and not climbed(rec, "alternate_path"):
+            baseline = {a for a in tried[:-1]}
+            if baseline:                # something came before it to differ from
+                record_rung(payment_id, "alternate_path", signature)
+    except Exception:
+        pass
+
+
 def state(record: dict) -> dict:
     """What has been climbed, what is left, and what is simply not possible."""
     done, remaining, impossible = [], [], []

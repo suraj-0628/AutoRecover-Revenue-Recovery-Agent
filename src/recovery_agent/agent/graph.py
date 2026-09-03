@@ -172,9 +172,12 @@ HOW TO WORK — follow this order:
                            after the offer has had ~15 minutes to work; the tool
                            refuses earlier and tells you how long is left.
      4. post_call_email    Send the link the call agreed to, by email.
-     5. alternate_path     Something genuinely different from all of the above —
-                           another rail, a scheduled retry, a different offer
-                           shape. Not a repeat of a channel that already failed.
+     5. alternate_path     Your call. Something genuinely different from
+                           everything already tried — another rail, a retry
+                           timed to a payday, a different offer shape. There is
+                           no fixed tool for this rung: whatever you choose that
+                           you have not already done counts as it. A repeat of
+                           something that already failed does not.
      6. escalate_to_human  ONLY when every rung above has been tried and the
                            money is still not back.
 
@@ -1540,15 +1543,44 @@ def build_initial_state(case) -> dict:
         context_parts.extend([
             "",
             "The first channel did not work. Repeating it will not work either.",
-            "Escalate the CHANNEL: if you have a phone number and the amount is "
-            "worth a call, use initiate_voice_call. Otherwise retry_in_hours, or "
-            "escalate_to_human. Do NOT send another email with the same link.",
+            "Escalate the CHANNEL, not the case: move to the next rung of the "
+            "ladder. Do NOT send another email with the same link, and do not "
+            "reach for escalate_to_human — it is the last rung and will refuse "
+            "you until the ones above it are done.",
         ])
 
     if payment.metadata.get("customer_email"):
         context_parts.append(f"Customer Email: {payment.metadata['customer_email']}")
     if payment.metadata.get("customer_phone"):
         context_parts.append(f"Customer Phone: {payment.metadata['customer_phone']}")
+
+    # Where this case stands on the ladder, read from the durable record rather
+    # than the Case — a Case is rebuilt on every hand-off run, so left to itself
+    # the agent starts each rung not knowing which ones it has already climbed,
+    # and "do not repeat a channel that failed" is advice it cannot act on.
+    try:
+        from recovery_agent.agent import ladder as _ladder
+        from recovery_agent.state_store import StateStore
+        rec = StateStore().get_payment(payment.payment_id) or {}
+        st = _ladder.state(rec)
+        tried = _ladder.actions_tried(rec)
+        if st["climbed"] or tried:
+            context_parts += [
+                "",
+                "WHERE THIS CASE STANDS ON THE LADDER:",
+                f"  climbed:       {', '.join(st['climbed']) or 'nothing yet'}",
+                f"  already tried: {', '.join(tried) or 'nothing yet'}"
+                f"   <- do NOT repeat any of these",
+            ]
+            nxt = st["remaining"][0] if st["remaining"] else None
+            context_parts.append(
+                f"  next rung:     {nxt['rung']} — {nxt['what']}" if nxt else
+                "  next rung:     none left; escalate_to_human is now permitted"
+            )
+            for u in st["unavailable"]:
+                context_parts.append(f"  unavailable:   {u['rung']} ({u['why_not']})")
+    except Exception:
+        pass
 
     return {
         "messages": [HumanMessage(content="\n".join(context_parts))],
