@@ -237,7 +237,6 @@ Serves:
 ```
 
 - **Unit Test Suite**: ~397 tests passing.
-- **Adversarial Chaos Gym**: 31 tests in chaos gym.
 
 ---
 
@@ -250,45 +249,15 @@ src/recovery_agent/
 │   ├── graph.py                 # LangGraph ReAct loop (StateGraph + ToolNode)
 │   ├── tools.py                 # 13 @tool functions + langmem memory tools
 │   ├── diagnosis.py             # 3-layer: error code lookup → LLM → rules
-│   ├── decision.py              # LLM strategy planner + Thompson Bandit
-│   ├── execution.py             # Observable SDK execution
 │   ├── guardrails.py            # 6 safety policies
 │   ├── governance.py            # Tier-based tool access, PII masking
 │   ├── kg_router.py             # NetworkX graph, 6 API rails, Dijkstra
-│   ├── decline_router.py        # 12 decline codes → 9 strategies
-│   ├── strategy_metrics.py      # SQLite metrics + ThompsonBandit + A/B test
 │   ├── memory.py                # CustomerMemoryStore (JSON + filelock)
-│   ├── vector_memory.py         # ChromaDB semantic search
 │   ├── agentic_rag.py           # ChromaDB + sentence-transformers
 │   ├── planner.py               # pydantic-ai structured planning
 │   ├── llm_client.py            # ChatOpenAI → OmniRoute, fallback chain
-│   ├── payday_scheduler.py      # Regional payroll cycle detection
 │   ├── stopping.py              # Tier transition logic (silent → active)
-│   ├── evaluation.py            # Batch eval from CSV
 │   └── test_generator.py        # Synthetic failure scenarios
-├── eval/
-│   ├── chaos_gym.py             # Adversarial chaos gym + gym-style step()
-│   ├── trajectory_benchmark.py  # Step/friction/compliance scoring
-│   ├── component_eval.py        # pydantic-evals
-│   ├── error_analysis.py        # arize-phoenix-evals
-│   ├── recovery_eval.py         # Custom F1 scoring
-│   ├── nat_eval.py              # nvidia-nat SDK evaluation
-│   └── phoenix_evals.py         # Phoenix evaluators
-├── razorpay_knowledge_base.py   # Razorpay API Error Catalog
-├── razorpay_client.py           # 8 async SDK wrappers
-├── frontend.py                  # Customer checkout + merchant dashboard
-├── webhook.py                   # Flask webhook listener
-├── dashboard.py                 # Analytics dashboard (port 5001)
-├── communication.py             # LLM-generated messages
-├── notifications.py             # Email + SMS dispatcher
-├── retry_scheduler.py           # Smart retry timing
-├── state_store.py               # File-backed JSON persistence
-├── daemon_worker.py             # Background retry worker
-├── config.py                    # pydantic-settings + YAML
-├── main.py                      # CLI entry point
-├── logging/                     # JSONL audit trail
-├── api/app.py                   # FastAPI REST API
-└── integrations/superu_client.py # SuperU AI voice calls
 ```
 
 ---
@@ -304,7 +273,6 @@ Based on deep-dive research on 6 production recovery systems — **Stripe, Redux
 - **Tier 2 (Active)**: Personalized email/SMS with Razorpay Payment Links. Only triggered when silent tier exhausted.
 - **Tier 3 (Voice)**: SuperU AI voice agent calls the customer. Highest-conversion channel for high-value or unresponsive cases.
 
-**Decline-Code-Specific Routing** (`decline_router.py`):
 - Code 51 (Insufficient Funds): Payday timing — retry at 12:01 AM local time on payday, "first-in-line advantage".
 - Code 05 (Do Not Honor): Metadata enrichment — optimize transaction shape, cooling-off period.
 - Code 19 (Try Again Later): Bank health monitoring — retry only when bank confirmed online.
@@ -315,8 +283,6 @@ Based on deep-dive research on 6 production recovery systems — **Stripe, Redux
 | Component | Role |
 |-----------|------|
 | `SuperUClient` | Wraps SuperU API — initiates outbound AI voice calls |
-| `execution.py` | Routes `VOICE_CALL` action type to SuperU client |
-| `decision.py` | Strategy planner selects voice when: amount > ₹1000, user dropoff, or first notification unresponsive |
 | `webhook.py` | Receives `/superu/call-complete` callback with call outcome |
 | Dashboard | Shows voice call status in activity feed + drawer trail |
 

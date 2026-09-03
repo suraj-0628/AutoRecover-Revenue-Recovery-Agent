@@ -130,15 +130,6 @@ def legacy_dashboard():
         by_type=dict(by_type), recent_cases=cases[-20:])
 
 
-@app.route("/api/run-chaos-episode", methods=["POST"])
-def api_run_chaos_episode():
-    """Run a single dynamic Red Team Chaos Gym episode and return trajectory."""
-    from recovery_agent.eval.chaos_gym import RevenueLossEnvironment
-    env = RevenueLossEnvironment()
-    episode_result = env.run_episode()
-    return jsonify(episode_result)
-
-
 @app.route("/case/<case_id>")
 def case_detail(case_id):
     cases = load_cases()

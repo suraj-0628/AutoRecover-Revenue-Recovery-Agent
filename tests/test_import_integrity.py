@@ -22,7 +22,9 @@ import pytest
 SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "recovery_agent"
 
 #: Modules we can import without side effects worth avoiding in a test run.
-_SKIP_MODULES = {"recovery_agent.eval.nat_eval", "recovery_agent.eval.component_eval"}
+#: Modules that cannot be imported in a bare test environment. Empty now
+#: that the eval tree is gone — nothing in the package needs an exception.
+_SKIP_MODULES: set[str] = set()
 
 
 def _local_imports(path: pathlib.Path):

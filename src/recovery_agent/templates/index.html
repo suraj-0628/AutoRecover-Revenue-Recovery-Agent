@@ -888,21 +888,11 @@
     .batch-head h2 { font-size: 15px; color: var(--text-bright); font-weight: 600 }
     .batch-sub { font-size: 11px; color: var(--text-muted); margin-bottom: 14px;
                  max-width: 760px; line-height: 1.55 }
-    .exp-card { background: var(--panel-bg); border: 1px solid var(--border-color);
-                border-radius: 10px; padding: 14px 16px; margin-bottom: 14px }
-    .exp-title { font-size: 12px; color: var(--text-bright); font-weight: 600;
-                 margin-bottom: 4px }
-    .exp-why { font-size: 10.5px; color: var(--text-muted); line-height: 1.6;
-               margin-bottom: 11px; max-width: 720px }
-    .exp-arms { display: flex; gap: 26px; flex-wrap: wrap; align-items: flex-end }
-    .exp-arm { display: flex; flex-direction: column; gap: 2px }
     .exp-arm .lab { font-size: 9.5px; color: var(--text-muted);
                     text-transform: uppercase; letter-spacing: .06em }
     .exp-arm .val { font-size: 19px; font-weight: 600; color: var(--text-bright) }
     .exp-arm .sub { font-size: 10px; color: var(--text-muted) }
     .exp-lift .val { color: var(--accent-green) }
-    .exp-verdict { margin-top: 11px; font-size: 10.5px; line-height: 1.6;
-                   padding-top: 10px; border-top: 1px solid var(--border-color) }
     .exp-verdict.weak { color: var(--accent-amber) }
     .exp-verdict.strong { color: var(--accent-green) }
     .batch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
@@ -958,7 +948,6 @@
       <div class="kpi-chip">Risk: <span id="kpi-risk">INR 0.00</span></div>
       <div class="kpi-chip green">Recovered: <span id="kpi-recovered">INR 0.00</span></div>
       <div class="kpi-chip blue">Yield: <span id="kpi-yield">0%</span></div>
-      <div class="kpi-chip" id="kpi-lift-chip" title="Recovery rate vs a held-back control arm">Lift: <span id="kpi-lift">—</span></div>
     </div>
 
     <!-- Demo Simulation Triggers -->
@@ -2053,7 +2042,7 @@ function showView(which) {
   batches.classList.toggle("on", isBatch);
   document.getElementById("rail-live").classList.toggle("active", !isBatch);
   document.getElementById("rail-batches").classList.toggle("active", isBatch);
-  if (isBatch) { loadBatches(); loadExperiment(); }
+  if (isBatch) loadBatches();
 }
 
 function inr(n) {
@@ -2064,53 +2053,6 @@ function esc(t) {
   return String(t == null ? "" : t).replace(/[&<>"']/g, function (c) {
     return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
   });
-}
-
-/* The experiment readout.
-   A recovery total says money arrived after the agent acted. Only a control arm
-   says the agent is why. Reported with its interval, because at these sample
-   sizes a point estimate on its own would be the same overclaim in a new
-   costume. */
-function loadExperiment() {
-  fetch("/api/experiment").then(r => r.json()).then(function (d) {
-    const chip = document.getElementById("kpi-lift");
-    const card = document.getElementById("exp-card");
-    if (!d.enabled) {
-      if (chip) chip.textContent = "off";
-      if (card) card.innerHTML = "";
-      return;
-    }
-    const t = d.treated, c = d.control;
-    const pct = n => (n * 100).toFixed(1) + "%";
-    if (chip) {
-      chip.textContent = c.n ? (d.lift_pp >= 0 ? "+" : "") + d.lift_pp + "pp" : "—";
-      chip.style.color = d.conclusive ? "var(--accent-green)" : "var(--accent-amber)";
-    }
-    if (!card) return;
-    card.innerHTML =
-      '<div class="exp-title">Did the agent cause this?</div>' +
-      '<div class="exp-why">' +
-        Math.round(d.holdout_fraction * 100) + '% of cases are held back and never ' +
-        'worked. What they recover on their own is the baseline. Everything ' +
-        'recorded before this experiment began is excluded rather than counted ' +
-        'as treated.' +
-      '</div>' +
-      '<div class="exp-arms">' +
-        '<div class="exp-arm"><span class="lab">Treated</span>' +
-          '<span class="val">' + pct(t.rate) + '</span>' +
-          '<span class="sub">' + t.recovered + ' of ' + t.n +
-            ' &middot; 95% CI ' + t.ci[0] + '–' + t.ci[1] + '%</span></div>' +
-        '<div class="exp-arm"><span class="lab">Control</span>' +
-          '<span class="val">' + pct(c.rate) + '</span>' +
-          '<span class="sub">' + c.recovered + ' of ' + c.n +
-            ' &middot; 95% CI ' + c.ci[0] + '–' + c.ci[1] + '%</span></div>' +
-        '<div class="exp-arm exp-lift"><span class="lab">Lift</span>' +
-          '<span class="val">' + (d.lift_pp >= 0 ? "+" : "") + d.lift_pp + 'pp</span>' +
-          '<span class="sub">treated &minus; control</span></div>' +
-      '</div>' +
-      '<div class="exp-verdict ' + (d.conclusive ? "strong" : "weak") + '">' +
-        (d.conclusive ? "\u2713 " : "\u26a0 ") + d.verdict + '</div>';
-  }).catch(function () {});
 }
 
 function loadBatches() {
@@ -2174,8 +2116,6 @@ setInterval(function () {
   }).catch(function () {});
 }, 15000);
 loadBatches();
-loadExperiment();
-setInterval(loadExperiment, 20000);
 
 </script>
 
@@ -2195,7 +2135,6 @@ setInterval(loadExperiment, 20000);
       still there. Each batch shares a cause, so it shares a fix. Running one
       opens a separate agent session per payment — never two on the same case.
     </div>
-    <div class="exp-card" id="exp-card"></div>
     <div class="batch-grid" id="batch-grid"></div>
   </section>
 

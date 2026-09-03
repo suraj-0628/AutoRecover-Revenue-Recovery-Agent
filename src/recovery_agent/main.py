@@ -97,83 +97,11 @@ def run_frontend():
     main()
 
 
-def run_chaos_gym(episodes: int = 10, seed: int | None = None, use_harness: bool = False):
-    """Run the Adversarial Chaos Gym evaluation with trajectory benchmarking."""
-    from recovery_agent.eval.chaos_gym import run_chaos_gym as _run_chaos_gym
-    from recovery_agent.eval.trajectory_benchmark import TrajectoryBenchmark
-
-    result = _run_chaos_gym(episodes=episodes, seed=seed, use_harness=use_harness)
-
-    # Run trajectory benchmarking on all episodes
-    benchmark = TrajectoryBenchmark()
-    all_metrics = []
-    for ep in result["episodes_data"]:
-        metrics = benchmark.evaluate_trajectory(ep.get("benchmark_trajectory", ep["trajectory"]))
-        all_metrics.append(metrics)
-    agg = benchmark.aggregate_metrics(all_metrics)
-
-    print("=" * 60)
-    print("ADVERSARIAL CHAOS GYM RESULTS")
-    print("=" * 60)
-    print(f"Episodes:            {result['episodes']}")
-    print(f"Recovered:           {result['recovered']}/{result['episodes']} ({result['recovery_rate']:.1%})")
-    print(f"Total Amount:        INR {result['total_amount']:,.2f}")
-    print(f"Recovered Amount:    INR {result['total_recovered_amount']:,.2f} ({result['recovery_amount_rate']:.1%})")
-    print(f"Avg Reward:          {result['avg_reward']}")
-    print(f"Total Reward:        {result['total_reward']}")
-    print(f"Avg Steps:           {result['avg_steps']}")
-    print(f"Friction Index:      {result['avg_friction_index']}")
-    print(f"Policy Violations:   {result['policy_violations']}")
-    print("-" * 60)
-    print("BY PERSONA:")
-    for persona, stats in result["by_persona"].items():
-        print(f"  {persona}: {stats['recovered']}/{stats['total']} recovered ({stats['recovery_rate']:.0%})")
-    print("-" * 60)
-    print("TRAJECTORY BENCHMARK:")
-    print(f"  Avg Step Efficiency:    {agg['avg_step_efficiency']:.3f}")
-    print(f"  Avg Friction Score:     {agg['avg_friction_score']:.3f}")
-    print(f"  Avg Compliance Rate:    {agg['avg_policy_compliance']:.3f}")
-    print(f"  Avg Trajectory Score:   {agg['avg_trajectory_score']:.3f}")
-    if agg.get("total_invasive_steps", 0) > 0:
-        print(f"  Total Invasive Steps:   {agg['total_invasive_steps']}")
-    print("=" * 60)
-
-
-def run_phoenix_eval(payment_id: str | None = None) -> None:
-    """Run Phoenix agent evaluations."""
-    from recovery_agent.eval.phoenix_evals import PhoenixEvaluator
-
-    evaluator = PhoenixEvaluator()
-    report = evaluator.run_evaluation(payment_id=payment_id)
-
-    print("=" * 60)
-    print("PHOENIX AGENT EVALUATION REPORT")
-    print("=" * 60)
-    print(f"Total evaluations: {report['total_evaluations']}")
-    print(f"Passed: {report['passed']}")
-    print(f"Failed: {report['failed']}")
-    print(f"Pass rate: {report['pass_rate']}")
-    print(f"Annotations written to Phoenix: {report['annotations_written']}")
-    print()
-    print("By Evaluator:")
-    for name, stats in report["by_evaluator"].items():
-        total = stats["total"]
-        passed = stats["pass"]
-        pct = (passed / total * 100) if total else 0
-        print(f"  {name}: {passed}/{total} passed ({pct:.0f}%)")
-    if report["failed_evaluations"]:
-        print()
-        print("Failures:")
-        for f in report["failed_evaluations"]:
-            print(f"  [{f['evaluator']}] {f['payment_id']}: {f['explanation']}")
-    print("=" * 60)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Revenue Recovery Agent")
     parser.add_argument(
         "command",
-        choices=["single", "batch", "webhook", "dashboard", "frontend", "retry-schedule", "communicate", "chaos-gym", "phoenix-eval"],
+        choices=["single", "batch", "webhook", "dashboard", "frontend", "retry-schedule", "communicate"],
         help="Command to run",
     )
     parser.add_argument("--cases", type=int, default=30, help="Number of cases for batch")
@@ -200,10 +128,6 @@ def main():
         run_retry_schedule(args.failure_type, args.attempt)
     elif args.command == "communicate":
         run_communicate(args.failure_type, args.channel)
-    elif args.command == "chaos-gym":
-        run_chaos_gym(args.cases, args.seed, use_harness=args.harness)
-    elif args.command == "phoenix-eval":
-        run_phoenix_eval(args.payment_id if args.payment_id != "pay_test_001" else None)
 
 
 if __name__ == "__main__":
