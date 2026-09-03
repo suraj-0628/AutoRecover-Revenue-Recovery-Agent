@@ -429,7 +429,8 @@ def _handoff_to_agent(payment_id: str, observation: str, scenario: str) -> None:
     socketio.start_background_task(
         run_agent_for_payment, payment_id, float(p.get("amount", 0) or 0),
         observation, customer, scenario,
-        p.get("decline_strategy", "") or "no_response",
+        p.get("decline_strategy", "") or "no_response", "", "",
+        True,                           # queue rather than drop — see the guard
     )
 
 
@@ -572,12 +573,38 @@ def format_reasoning_newlines(text: str) -> str:
     return "\n".join(lines)
 
 
-def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, customer: dict, scenario_type: str = "standard", failure_code: str = "", error_source: str = "", error_step: str = ""):
+def run_agent_for_payment(payment_id: str, amount: float, failure_reason: str, customer: dict, scenario_type: str = "standard", failure_code: str = "", error_source: str = "", error_step: str = "", queue_if_busy: bool = False):
     """Run agent step by step with live streaming thoughts, tool cards, guardrails, and LLM-generated UI morphing."""
-    # Bug #2: Prevent duplicate agent threads for the same payment
+    # Two agent runs on one case at the same time would interleave on the same
+    # thread_id, so only one may hold a payment. But *why* a second run arrived
+    # matters, and this used to ignore the difference.
+    #
+    # A repeat of the same trigger is noise — drop it. A hand-off is a new fact
+    # about the case, and dropping it loses the customer's action outright. A
+    # customer who dismissed the first notification 5.7s after it appeared —
+    # while the first run was still writing its summary — got nothing at all,
+    # because the hand-off was discarded and its `handoff_` flag stayed set, so
+    # nothing would ever retry it. Dismiss the same notification two minutes
+    # later and the ladder worked. The bug was a race, not a rung.
     if payment_id in active_agent_payments:
-        print(f"[Frontend] Agent thread already active for {payment_id}. Skipping duplicate trigger.")
-        return
+        if not queue_if_busy:
+            print(f"[Frontend] Agent thread already active for {payment_id}. Skipping duplicate trigger.")
+            return
+        waited = 0
+        while payment_id in active_agent_payments and waited < 180:
+            socketio.sleep(2)
+            waited += 2
+        if payment_id in active_agent_payments:
+            # Never silently swallow it: clear the flag so a later signal — the
+            # push timeout, a payment, the next hand-off — can still act.
+            store.update_payment(payment_id, **{f"handoff_{scenario_type}": False})
+            store.flush()
+            push_event(payment_id, "handoff_dropped", {
+                "detail": f"Previous run still active after {waited}s; "
+                          f"'{scenario_type}' hand-off released for retry.",
+            })
+            return
+        print(f"[Frontend] Queued '{scenario_type}' hand-off for {payment_id} ran after {waited}s.")
     active_agent_payments.add(payment_id)
 
     try:

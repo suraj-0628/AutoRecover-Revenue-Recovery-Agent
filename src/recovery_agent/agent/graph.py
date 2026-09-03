@@ -510,11 +510,28 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
                 truncated = truncated[1:]
             messages = [messages[0]] + truncated
 
-    # Truncate large tool results in-place to save context
+    # Shorten large tool results for THIS LLM call only.
+    #
+    # This used to assign to `msg.content`, mutating the message objects that
+    # live in graph state — so a context-saving measure permanently damaged the
+    # durable record. `escalate_to_human` returns 638 chars (the ticket carries
+    # a full hand-over reason), was chopped at 500 mid-JSON, and every reader
+    # downstream got un-parseable text: the dashboard showed
+    # "Escalated to Human: N/A" and fell back to printing the observation text
+    # as the reason, while the real ticket id sat correctly in the queue.
+    # Copy instead of mutate — the LLM sees less, the record keeps everything.
+    trimmed = []
     for msg in messages:
         if isinstance(msg, ToolMessage) and msg.content and len(str(msg.content)) > MAX_TOOL_CONTENT:
             content = str(msg.content)
-            msg.content = content[:MAX_TOOL_CONTENT] + f"... [truncated, {len(content)} chars total]"
+            short = content[:MAX_TOOL_CONTENT] + f"... [truncated, {len(content)} chars total]"
+            try:
+                msg = msg.model_copy(update={"content": short})
+            except AttributeError:          # older langchain-core
+                msg = ToolMessage(content=short, tool_call_id=msg.tool_call_id,
+                                  name=msg.name, id=msg.id)
+        trimmed.append(msg)
+    messages = trimmed
 
     # Rate-limit LLM calls to avoid Google upstream 502s
     # Track last call time across all agent instances
@@ -1045,6 +1062,32 @@ _APPROVAL_DISCOUNT_THRESHOLD = float(os.getenv("APPROVAL_DISCOUNT_THRESHOLD", "5
 _MONEY_MOVING_TOOLS = {"generate_recovery_payment_link"}
 
 
+def _approval_refusal(hr: tuple[float, float, float] | None) -> dict:
+    """Refuse a give-away, and say what would be allowed.
+
+    A bare "needs human approval" leaves the agent one move — escalate — even
+    when charging a few hundred rupees more would clear the ceiling outright.
+    """
+    if not hr:
+        return {
+            "status": "blocked",
+            "reason": "this action needs human approval",
+            "guidance": "Call escalate_to_human instead.",
+        }
+    given, owed, min_charge = hr
+    return {
+        "status": "blocked",
+        "reason": (f"gives away ₹{given:,.2f} on a ₹{owed:,.2f} order; "
+                   f"₹{_APPROVAL_DISCOUNT_THRESHOLD:,.2f} is the most that may be "
+                   f"given away without a human"),
+        "max_discount_rupees": round(_APPROVAL_DISCOUNT_THRESHOLD, 2),
+        "min_amount_you_may_charge": round(min_charge, 2),
+        "guidance": (f"Call this tool again charging at least "
+                     f"₹{min_charge:,.2f} if a smaller offer could still recover "
+                     f"this. Only call escalate_to_human if it could not."),
+    }
+
+
 def human_approval_gate(state: RecoveryState, config: RunnableConfig = None) -> dict:
     """Pause for human approval on high-value or risky recovery actions.
 
@@ -1070,6 +1113,7 @@ def human_approval_gate(state: RecoveryState, config: RunnableConfig = None) -> 
         action_summary = []
 
         flagged: set[str] = set()
+        headroom: dict[str, tuple[float, float, float]] = {}
         for tool_call in last_message.tool_calls:
             tool_name = tool_call["name"]
 
@@ -1099,6 +1143,14 @@ def human_approval_gate(state: RecoveryState, config: RunnableConfig = None) -> 
             if given_away > _APPROVAL_DISCOUNT_THRESHOLD:
                 needs_approval = True
                 flagged.add(tool_call["id"])
+                # Tell the agent the headroom, not just "no". On a ₹1,19,970
+                # order the policy's own 5% opening offer is ₹5,998 — over this
+                # ceiling — so the agent was refused, told to escalate, and a
+                # live case went to a human queue that a 4% offer would have
+                # cleared. A refusal that hides the number it is enforcing turns
+                # every large order into an escalation.
+                headroom[tool_call["id"]] = (given_away, owed,
+                                             owed - _APPROVAL_DISCOUNT_THRESHOLD)
                 action_summary.append(
                     f"{tool_name} (discount ₹{given_away:,.0f} on a ₹{owed:,.0f} order)")
 
@@ -1120,11 +1172,8 @@ def human_approval_gate(state: RecoveryState, config: RunnableConfig = None) -> 
             return {
                 "messages": [
                     ToolMessage(
-                        content=json.dumps({
-                            "status": "blocked",
-                            "reason": "this action needs human approval",
-                            "guidance": "Call escalate_to_human instead.",
-                        } if tc["id"] in flagged else {
+                        content=json.dumps(_approval_refusal(headroom.get(tc["id"]))
+                        if tc["id"] in flagged else {
                             "status": "not_executed",
                             "reason": "another tool in this batch needs approval",
                             "guidance": "You may call this tool again on its own.",
@@ -1132,9 +1181,10 @@ def human_approval_gate(state: RecoveryState, config: RunnableConfig = None) -> 
                         tool_call_id=tc["id"], name=tc["name"],
                     ) for tc in last_message.tool_calls
                 ] + [SystemMessage(
-                    content=f"[Guardrail] Needs human approval: "
-                            f"{'; '.join(action_summary)}. Call escalate_to_human, "
-                            f"then stop."
+                    content=f"[Guardrail] Over the give-away ceiling: "
+                            f"{'; '.join(action_summary)}. Re-quote within the "
+                            f"ceiling if a smaller offer could still work; call "
+                            f"escalate_to_human only if it could not."
                 )],
                 "phase": "guard_check",
             }
