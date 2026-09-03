@@ -2851,20 +2851,12 @@ def simulate_scenario(scenario: str):
         },
     }
 
-    if scenario not in scenarios and scenario != "batch":
+    # The "Run 30-Case Batch" button is gone, and so is what it did: a synthetic
+    # CSV evaluation of 10 fabricated cases, labelled 30. It measured nothing
+    # about this system and shared no code with real recovery. Batches are now a
+    # real view over real cases — see /api/batches.
+    if scenario not in scenarios:
         scenario = "degradation"
-
-    if scenario == "batch":
-        from recovery_agent.agent.evaluation import run_batch_evaluation
-        result = run_batch_evaluation(num_cases=10, seed=42)
-        return jsonify({
-            "status": "batch_completed",
-            "summary": result.summary(),
-            "total_cases": result.total_cases,
-            "recovered": result.recovered,
-            "yield_pct": result.recovery_rate * 100,
-            "recovered_amount": result.recovered_amount,
-        })
 
     ctx = scenarios[scenario]
     customer = ctx["customer"]
@@ -3222,9 +3214,25 @@ def daemon_retry_complete():
 @app.route("/api/payments")
 def api_payments():
     p_list = store.payment_values()
-    total_at_risk = sum(p.get("amount", 0) for p in p_list)
-    total_recovered = sum(p.get("amount", 0) for p in p_list if p.get("status") == "recovered")
-    rec_count = sum(1 for p in p_list if p.get("status") == "recovered")
+
+    # Money that came back is not at risk.
+    #
+    # This summed EVERY payment, recovered ones included, so the header read
+    # INR 9,23,031 at risk while the batch view — which counts only what is
+    # still out — read INR 5,36,960. Two numbers for the same thing on the same
+    # screen, and the larger one was wrong.
+    #
+    # `recovered` is also the amount that actually arrived, not the amount that
+    # was owed: a INR 2,499 order recovered at a 5% discount brought back INR
+    # 2,374.05, and counting the full 2,499 quietly credits the agent with the
+    # discount it gave away.
+    def _settled(p):
+        return p.get("status") == "recovered" or float(p.get("recovered_amount") or 0) > 0
+
+    total_at_risk = sum(float(p.get("amount") or 0) for p in p_list if not _settled(p))
+    total_recovered = sum(float(p.get("recovered_amount") or p.get("amount") or 0)
+                          for p in p_list if _settled(p))
+    rec_count = sum(1 for p in p_list if _settled(p))
     rate = (rec_count / len(p_list) * 100) if p_list else 0.0
     total_penalties = sum(p.get("penalties_prevented", 0) for p in p_list)
     return jsonify({

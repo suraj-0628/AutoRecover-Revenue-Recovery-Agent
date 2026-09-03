@@ -163,3 +163,24 @@ def test_the_batch_view_uses_the_existing_design_tokens():
     i = INDEX.index(".batch-card {")
     body = INDEX[i:i + 400]
     assert "var(--panel-bg)" in body and "var(--border-color)" in body
+
+
+# ── one meaning of "at risk" ────────────────────────────────────────────
+
+def test_recovered_money_is_not_counted_as_at_risk_in_the_header():
+    """The header summed EVERY payment, recovered ones included, so it read INR
+    9,23,031 at risk while the batch view — counting only what is still out —
+    read INR 5,36,960. Two numbers for the same thing on one screen, and the
+    larger one was wrong."""
+    i = FRONTEND.index("def api_payments")
+    body = FRONTEND[i:i + 1800]
+    assert "if not _settled(p)" in body
+
+
+def test_recovered_reports_what_arrived_not_what_was_owed():
+    """A INR 2,499 order recovered at 5% off brought back INR 2,374.05.
+    Counting the full 2,499 quietly credits the agent with the discount it gave
+    away."""
+    i = FRONTEND.index("def api_payments")
+    body = FRONTEND[i:i + 1800]
+    assert 'p.get("recovered_amount") or p.get("amount")' in body
