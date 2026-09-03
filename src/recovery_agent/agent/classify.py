@@ -20,27 +20,68 @@ from __future__ import annotations
 
 from typing import Any
 
-#: Words that mean "the instrument was refused" rather than "they chose not to".
-_METHOD_WORDS = ("declin", "expired", "invalid", "issuer", "bank",
+#: What each known failure type means for what to DO about it.
+#:
+#: - method    the instrument was refused. Another rail, at full price.
+#: - funds     the account was short. Another day, not another message.
+#: - transient nothing was wrong with the customer or the card; the plumbing
+#:             failed. Retry it. Do NOT apologise with money.
+#: - dropoff   they chose not to complete. The only lever is a reason to return.
+#: - risk      do not pursue; a person decides.
+_KIND_BY_TYPE = {
+    "card_expired": "method",
+    "bank_declined": "method",
+    "mandate_revoked": "method",
+    "insufficient_funds": "funds",
+    "network_timeout": "transient",
+    "risk_block": "risk",
+    "user_dropoff": "dropoff",
+}
+
+#: Fallback only, for a code the catalog has never seen. Deliberately does NOT
+#: contain "timeout": that word appears in `gateway_timeout` and `network_timeout`,
+#: and matching it as a drop-off is how a 504 came to be described to the agent as
+#: "the customer chose not to complete. Nothing is broken."
+_METHOD_WORDS = ("declin", "expired", "invalid", "issuer", "bank", "mandate",
                  "authentication", "cvv", "card_not_supported", "lost", "stolen")
 _FUNDS_WORDS = ("insufficient", "funds", "limit_exceeded", "balance")
-_DROPOFF_WORDS = ("cancel", "dropoff", "drop_off", "abandon", "timeout", "closed")
+_TRANSIENT_WORDS = ("timeout", "timed out", "network", "gateway", "unavailable",
+                    "5xx", "502", "503", "504", "connection")
+_DROPOFF_WORDS = ("cancel", "dropoff", "drop_off", "abandon", "closed")
 _RISK_WORDS = ("fraud", "risk", "dispute", "chargeback", "suspected", "frozen")
 
 
 def failure_kind(record: dict) -> str:
-    """What kind of problem this is — method, funds, dropoff, risk, or unknown.
+    """What kind of problem this is — method, funds, transient, dropoff, risk.
 
-    One definition, used by both the batch view and the agent's own briefing.
-    Two copies of this would drift, and a case would then be a bank decline in
+    One definition, used by the batch view, the agent's briefing and the offer
+    policy. Two copies would drift, and a case would then be a bank decline in
     one place and a drop-off in the other.
+
+    The catalog is consulted FIRST. It was already there — 14 codes mapped to
+    failure types in `diagnosis.FAILURE_CODE_MAP` — while this function matched
+    word fragments and disagreed with it: `gateway_timeout` came out as a
+    drop-off, `do_not_honor` and `mandate_revoked` as unknown. Substring
+    matching is the fallback for codes the catalog has never seen, not the rule.
     """
-    blob = (f"{record.get('failure_code') or ''} "
-            f"{record.get('failure_reason') or ''}").lower()
+    code = str(record.get("failure_code") or "").strip().lower()
+    try:
+        from recovery_agent.agent.diagnosis import FAILURE_CODE_MAP
+        known = FAILURE_CODE_MAP.get(code)
+        if known is not None:
+            kind = _KIND_BY_TYPE.get(getattr(known, "value", str(known)))
+            if kind:
+                return kind
+    except Exception:
+        pass
+
+    blob = f"{code} {record.get('failure_reason') or ''}".lower()
     if any(w in blob for w in _RISK_WORDS):
         return "risk"
     if any(w in blob for w in _FUNDS_WORDS):
         return "funds"
+    if any(w in blob for w in _TRANSIENT_WORDS):
+        return "transient"
     if any(w in blob for w in _METHOD_WORDS):
         return "method"
     if any(w in blob for w in _DROPOFF_WORDS):
@@ -58,6 +99,11 @@ BATCHES: list[dict[str, str]] = [
      "what": "The account was short. These need a different day, not a "
              "different message — retry timed to when they are likely paid.",
      "icon": "&#8986;"},
+    {"key": "transient", "title": "Failed in transit",
+     "what": "The gateway or the network dropped it — nothing was wrong with "
+             "the customer or the card. These want a retry, not a message and "
+             "certainly not a discount.",
+     "icon": "&#8635;"},
     {"key": "dropoff", "title": "Chose not to complete",
      "what": "Nothing broke; they walked away. The only lever here is a reason "
              "to come back, which is what an offer is for.",
@@ -125,6 +171,8 @@ def classify(record: dict) -> str | None:
 
     if kind == "funds":
         return "insufficient_funds"
+    if kind == "transient":
+        return "transient"
     if kind == "method":
         return "bank_declined"
     if kind == "dropoff":

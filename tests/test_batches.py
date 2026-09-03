@@ -293,3 +293,93 @@ def test_the_case_facts_still_reach_the_merchant_hud():
     to travel inside the fake spec and now travel as themselves."""
     assert "case_state={" in FRONTEND
     assert "data.case_state && data.case_state.recovery_tier" in INDEX
+
+
+# ── the taxonomy must agree with the catalog ────────────────────────────
+
+@pytest.mark.parametrize("code,expected", [
+    # These four were wrong, and two of them are demo buttons.
+    ("gateway_timeout", "transient"),   # "504 Degradation" -> was "dropoff"
+    ("network_timeout", "transient"),   #                      was "dropoff"
+    ("mandate_revoked", "method"),      # "Voice Call"      -> was "unknown"
+    ("do_not_honor", "method"),         # commonest decline -> was "unknown"
+    # and these must not regress
+    ("card_expired", "method"), ("insufficient_funds", "funds"),
+    ("customer_cancelled", "dropoff"), ("fraud_suspected", "risk"),
+])
+def test_every_catalogued_code_classifies_correctly(code, expected):
+    """`failure_kind` matched word fragments while `FAILURE_CODE_MAP` — 14 codes,
+    already in the repo — said something else. "timeout" appears in
+    `gateway_timeout`, so a 504 was classified as the customer walking away."""
+    assert failure_kind({"failure_code": code}) == expected
+
+
+def test_the_catalog_is_consulted_before_substrings():
+    CLS = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+           / "agent" / "classify.py").read_text()
+    i = CLS.index("def failure_kind")
+    body = CLS[i:i + 2200]
+    assert "FAILURE_CODE_MAP" in body
+    assert body.index("FAILURE_CODE_MAP") < body.index("_METHOD_WORDS"), (
+        "substring matching is the fallback, not the rule"
+    )
+
+
+def test_timeout_is_no_longer_a_dropoff_word():
+    CLS = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+           / "agent" / "classify.py").read_text()
+    i = CLS.index("_DROPOFF_WORDS")
+    assert "timeout" not in CLS[i:CLS.index("\n", i)]
+
+
+def test_a_transient_failure_is_never_discounted(tmp_path, monkeypatch):
+    """The gateway timed out. The card was fine and so was their intent — money
+    off here pays a customer to forgive our own outage."""
+    import json as _json
+    from recovery_agent import state_store
+    monkeypatch.setattr(state_store, "_DATA_DIR", tmp_path)
+    state_store.StateStore.reset_instances()
+    from recovery_agent.state_store import StateStore
+    from recovery_agent.agent.tools import TOOLS_BY_NAME
+    s = StateStore()
+    s.save_payment("p", {"payment_id": "p", "amount": 2499.0, "status": "recovering",
+                         "failure_code": "gateway_timeout",
+                         "failure_reason": "Gateway timed out",
+                         "customer": {"email": "a@b.com"},
+                         "actions_tried": ["page_push:plain"]})
+    s.flush()
+    r = _json.loads(TOOLS_BY_NAME["get_recovery_offer"].invoke(
+        {"amount": 2499.0, "stage": "ui_offer", "payment_id": "p"}))
+    state_store.StateStore.reset_instances()
+    assert r["status"] == "not_indicated"
+    assert "failed in transit" in r["reason"]
+    assert "nothing here that money fixes" in r["reason"]
+
+
+def test_the_briefing_names_a_transient_failure(tmp_path, monkeypatch):
+    from recovery_agent import state_store
+    monkeypatch.setattr(state_store, "_DATA_DIR", tmp_path)
+    state_store.StateStore.reset_instances()
+    from recovery_agent.state_store import StateStore
+    from recovery_agent.agent.perception import as_briefing, ground_truth
+    s = StateStore()
+    s.save_payment("p", {"payment_id": "p", "amount": 2499.0, "status": "recovering",
+                         "failure_code": "gateway_timeout",
+                         "failure_reason": "Gateway timed out",
+                         "customer": {"email": "a@b.com"}})
+    s.flush()
+    b = as_briefing(ground_truth("p"))
+    state_store.StateStore.reset_instances()
+    assert "did NOT fail on the customer's side" in b
+    assert "forgive our own outage" in b
+
+
+def test_the_offer_policy_shares_one_taxonomy():
+    """It re-derived the answer with its own word list, so the same case could be
+    a method failure to the offer policy and a drop-off to everything else."""
+    TOOLS = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "tools.py").read_text()
+    i = TOOLS.index("def get_recovery_offer")
+    body = TOOLS[i:i + 4000]
+    assert "from recovery_agent.agent.classify import failure_kind" in body
+    assert "method_failure = any(" not in body

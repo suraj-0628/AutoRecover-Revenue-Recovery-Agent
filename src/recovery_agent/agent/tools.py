@@ -994,17 +994,33 @@ def get_recovery_offer(
     # the discount is back on the table.
     if payment_id:
         rec = _live_record(payment_id)
-        code = str(rec.get("failure_code") or "").lower()
-        reason = str(rec.get("failure_reason") or "").lower()
-        blob = f"{code} {reason}"
-        method_failure = any(w in blob for w in (
-            "declin", "insufficient", "expired", "invalid", "issuer", "bank",
-            "authentication", "cvv"))
+        # One taxonomy, shared with the batch view and the briefing. This used
+        # to re-derive the answer with its own word list, which is how the same
+        # case could be a method failure to the offer policy and a drop-off to
+        # everything else.
+        from recovery_agent.agent.classify import failure_kind
+        kind = failure_kind(rec)
         owed = float(rec.get("amount") or amount or 0)
         tried_full_price = any(
             a.startswith("link:") and a.endswith(f":{owed:.2f}")
             for a in (rec.get("actions_tried") or []))
-        if method_failure and not tried_full_price:
+        # A transient failure is never a price objection, at any stage. The
+        # gateway timed out; the customer's intent was fine and their card was
+        # fine. Discounting here pays someone to forgive our own outage.
+        if kind == "transient":
+            return json.dumps({
+                "status": "not_indicated",
+                "allowed": False,
+                "reason": "this payment failed in transit — the gateway or the "
+                          "network dropped it, not the customer and not their "
+                          "card. There is nothing here that money fixes.",
+                "do_this_instead": f"Let them try again at the full INR "
+                                   f"{owed:,.2f}, or schedule a quiet retry. If a "
+                                   f"clean retry ALSO fails, come back and an "
+                                   f"offer is authorised.",
+            })
+
+        if kind == "method" and not tried_full_price:
             return json.dumps({
                 "status": "not_indicated",
                 "allowed": False,

@@ -103,7 +103,7 @@ def ground_truth(payment_id: str, verify: bool = False) -> dict:
     # place and a drop-off in the other.
     from recovery_agent.agent.classify import failure_kind
     kind = failure_kind(rec)
-    if kind in ("method", "funds", "dropoff", "risk"):
+    if kind in ("method", "funds", "transient", "dropoff", "risk"):
         facts["failure_kind"] = kind
     facts["failure_code"] = rec.get("failure_code") or ""
     facts["refusals"] = rec.get("refusals") or {}
@@ -165,7 +165,15 @@ def as_briefing(facts: dict) -> str:
                  "this case now.")
 
     kind = facts.get("failure_kind")
-    if kind == "funds":
+    if kind == "transient":
+        head += (
+            "\n  This did NOT fail on the customer's side. The gateway or the "
+            "network dropped it — the card was fine and so was their intent. "
+            "There is nothing to apologise for and nothing to discount: the "
+            "right move is to let them try again, or to retry it quietly. "
+            "Offering money off here pays a customer to forgive our own outage."
+        )
+    elif kind == "funds":
         head += ("\n  The account was short at the time. That is a timing "
                  "problem, not a price one — a discount does not put money in "
                  "their account. A retry aimed at when they are likely to be "
