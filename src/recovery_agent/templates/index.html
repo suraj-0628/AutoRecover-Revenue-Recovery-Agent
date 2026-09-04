@@ -1103,18 +1103,46 @@
        Razorpay sets headlines at roughly -1.9px tracking and uppercase
        micro-labels at +3px — tight figures against wide small caps. That
        rhythm is the most portable part of their system, and it costs
-       nothing but two letter-spacing values. */
-    #view-ops .batch-stats { gap: 0; padding: 0 }
-    #view-ops .bstat { flex: 1; padding: 14px 18px;
-                       border-right: 1px solid var(--border-color) }
-    #view-ops .bstat:last-child { border-right: 0 }
-    #view-ops .bstat .k { letter-spacing: .14em }
+       nothing but two letter-spacing values.
+       Shared by both views: one definition, or the two drift apart the
+       moment either changes. */
+    #view-ops .batch-stats, #view-batches .batch-stats { gap: 0; padding: 0 }
+    #view-ops .bstat, #view-batches .bstat {
+      flex: 1; padding: 14px 18px; border-right: 1px solid var(--border-color) }
+    #view-ops .bstat:last-child, #view-batches .bstat:last-child { border-right: 0 }
+    #view-ops .bstat .k, #view-batches .bstat .k { letter-spacing: .14em }
     #view-ops .bstat.lead { border-left: 2px solid var(--rzp-blue) }
     #view-ops .bstat.lead .v { font-size: 26px; letter-spacing: -1px;
                                color: var(--rzp-blue) }
-    #view-ops .bstat .sub { font-size: 9px; color: var(--text-muted);
-                            margin-top: 2px }
+    /* The batch lead is a RISK figure, so it keeps its amber — the brand
+       blue would say "this is our number" about money we have not saved. */
+    #view-batches .bstat.lead { border-left: 2px solid var(--accent-amber) }
+    #view-batches .bstat.lead .v { font-size: 26px; letter-spacing: -1px }
+    #view-ops .bstat .sub, #view-batches .bstat .sub {
+      font-size: 9px; color: var(--text-muted); margin-top: 2px }
     #view-ops .ops-table th { letter-spacing: .12em }
+
+    /* ── Batch view, same pass ──────────────────────────────────────── */
+    /* Run is the primary action on this screen, so it carries the brand
+       colour; Preview stays a ghost so the safe half never competes. */
+    .btn-batch { border-color: var(--rzp-blue); color: #9db4ff }
+    .btn-batch:hover:enabled { background: var(--rzp-blue); color: #fff }
+    /* Figures in the case lists must not wrap or drift out of column. */
+    #view-batches .batch-case span, #view-batches .batch-value {
+      font-variant-numeric: tabular-nums; white-space: nowrap }
+    #view-batches .batch-value { letter-spacing: -0.5px }
+    #view-batches .risk-lab, #view-batches .batch-quiet .q-lab {
+      letter-spacing: .14em }
+    /* A column header turns a list of ids and numbers into a table. */
+    .batch-cases-head { display: flex; justify-content: space-between;
+                        padding: 5px 14px; font-size: 8.5px;
+                        color: var(--text-muted); text-transform: uppercase;
+                        letter-spacing: .14em;
+                        border-top: 1px solid var(--border-color) }
+    #view-batches .batch-cases { border-top: 0 }
+    /* The explanatory line is worth keeping, but it was setting the card
+       height and leaving ragged rows — give it a floor so the cards align. */
+    #view-batches .batch-what { min-height: 46px }
 
     /* Spend: a stacked bar makes "95% of this is discounts" visible at a
        glance, which a table row never did. */
@@ -2442,13 +2470,30 @@ function loadBatches() {
     const active = d.batches.filter(function (b) { return b.count > 0; });
     const quiet = d.batches.filter(function (b) { return b.count === 0; });
 
+    var runnable = active.filter(function (b) { return b.runnable !== false; });
+    var meta = document.getElementById("batch-meta");
+    if (meta) {
+      meta.innerHTML =
+        '<b>Revenue still at risk</b>' +
+        '<span>sorted by what went wrong, because a cause shares a fix</span>' +
+        '<span class="sep">|</span>' +
+        '<span>' + runnable.length + ' of ' + active.length +
+          ' class(es) can be worked in bulk</span>' +
+        '<span class="sep">|</span>' +
+        '<button class="ops-help" onclick="toggleHelp(\'batch-help-body\')">' +
+        'How to read this</button>';
+    }
+
     document.getElementById("batch-stats").innerHTML =
-      '<div class="bstat"><span class="k">At risk</span>' +
-        '<span class="v amber">' + inr(d.total_at_risk) + '</span></div>' +
+      '<div class="bstat lead"><span class="k">At risk</span>' +
+        '<span class="v amber">' + inr(d.total_at_risk) + '</span>' +
+        '<span class="sub">not yet recovered, not yet written off</span></div>' +
       '<div class="bstat"><span class="k">Open cases</span>' +
-        '<span class="v">' + d.total_cases + '</span></div>' +
-      '<div class="bstat"><span class="k">Failure classes active</span>' +
-        '<span class="v">' + active.length + ' of ' + d.batches.length + '</span></div>';
+        '<span class="v">' + d.total_cases + '</span>' +
+        '<span class="sub">across ' + active.length + ' failure class(es)</span></div>' +
+      '<div class="bstat"><span class="k">Workable in bulk</span>' +
+        '<span class="v">' + runnable.length + ' of ' + active.length + '</span>' +
+        '<span class="sub">the rest wait on a clock or a person</span></div>';
 
     document.getElementById("batch-grid").innerHTML = active.map(function (b) {
       /* Whether a bucket can be worked in bulk is a property of the failure
@@ -2472,6 +2517,8 @@ function loadBatches() {
             inr(b.value).replace("INR ", "") +
             '<span class="risk-lab">at risk</span></div>' +
           '<div class="batch-what">' + esc(b.what) + '</div></div>' +
+        '<div class="batch-cases-head"><span>Case</span>' +
+          '<span>Amount</span></div>' +
         '<div class="batch-cases">' + cases + '</div>' +
         '<div class="batch-foot">' +
           (runnable ?
@@ -2639,11 +2686,19 @@ loadBatches();
     <div class="batch-head">
       <h2>Revenue at risk, by what went wrong</h2>
     </div>
-    <div class="batch-sub">
-      Cases the real-time ladder could not close while the customer was still
-      there. Each batch shares a cause, so it shares a fix: one plan per cause
-      and amount band, then every case re-checked against it before anything is
-      sent. Preview runs all of that and sends nothing.
+    <div class="ops-meta" id="batch-meta"></div>
+    <div class="ops-help-body" id="batch-help-body">
+      <b>These are the cases the real-time ladder could not close while the
+      customer was still there.</b> Each batch shares a cause, so it shares a
+      fix: one plan per cause and amount band, then every case re-checked
+      against that plan before anything is sent.<br><br>
+      <b>Preview</b> runs every one of those checks and sends nothing &mdash; it
+      answers "what would this do?" for free. <b>Run this batch</b> opens a
+      separate agent session per payment, never two on one case, and stops at a
+      per-run cap so a single click cannot empty the email allowance or the
+      payment-link quota.<br><br>
+      Batches marked <b>Held</b> are not idle &mdash; they are waiting on a
+      clock or a person, and there is nothing a bulk run could add.
     </div>
     <div class="batch-stats" id="batch-stats"></div>
     <div class="batch-grid" id="batch-grid"></div>
@@ -2729,10 +2784,11 @@ var OPS_ICONS = {
   cases: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>'
 };
 
-function toggleOpsHelp() {
-  var el = document.getElementById("ops-help-body");
+function toggleHelp(id) {
+  var el = document.getElementById(id);
   if (el) el.classList.toggle("on");
 }
+function toggleOpsHelp() { toggleHelp("ops-help-body"); }
 
 /* The two metered resources the agent has to work inside. Both fail QUIETLY
    when exhausted — the 301st email simply never arrives, and the 31st link
