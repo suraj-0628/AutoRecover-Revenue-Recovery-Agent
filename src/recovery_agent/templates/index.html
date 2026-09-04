@@ -111,37 +111,6 @@
     .kpi-chip.green span { color: var(--accent-green); }
     .kpi-chip.blue span { color: var(--accent-blue); }
 
-    .demo-bar {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      flex-shrink: 0;
-    }
-    .btn-sim {
-      background: #21262d;
-      border: 1px solid var(--border-color);
-      color: var(--text-main);
-      padding: 6px 12px;
-      border-radius: 4px;
-      font-size: 0.75rem;
-      font-weight: 500;
-      font-family: var(--font-mono);
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-    .btn-sim:hover {
-      background: #30363d;
-      border-color: var(--accent-blue);
-      color: var(--text-bright);
-    }
-    .btn-sim.primary {
-      background: #238636;
-      border-color: #2e9040;
-      color: #ffffff;
-    }
-    .btn-sim.primary:hover {
-      background: #2ea043;
-    }
 
     /* Main Split-Screen Workspace */
     .workspace {
@@ -1322,12 +1291,7 @@
     </div>
 
     <!-- Demo Simulation Triggers -->
-    <div class="demo-bar">
-      <button class="btn-sim" onclick="triggerScenario('degradation')">504 Degradation</button>
-      <button class="btn-sim" onclick="triggerScenario('card_expiry')">Expired Card</button>
-      <button class="btn-sim" onclick="triggerScenario('abandonment')">Cart Abandonment</button>
-      <button class="btn-sim" onclick="triggerScenario('voice_call')">Voice Call</button>
-    </div>
+
   </header>
 
   <!-- Main Split-Screen Workspace -->
@@ -1383,6 +1347,23 @@
           <pre class="tool-code" id="tool-args" style="display:none; max-height:200px; overflow-y:auto;">{}</pre>
         </div>
 
+        <!-- The agent's own pipeline: it reports what the AGENT is
+             doing, not what the customer sees, and belongs beside the
+             execution stream rather than inside a checkout. -->
+        <div class="recovery-progress-bar">
+          <div class="progress-title">
+            <span>Intervention Pipeline</span>
+            <span style="color:var(--accent-blue);" id="progress-status-label">IDLE</span>
+          </div>
+          <div class="progress-steps">
+            <div class="step-pill" id="p-detect">1. PERCEIVE</div>
+            <div class="step-pill" id="p-diagnose">2. REASON</div>
+            <div class="step-pill" id="p-guardrail">3. GUARD</div>
+            <div class="step-pill" id="p-morph">4. ACT</div>
+            <div class="step-pill" id="p-recovered">5. LEARN</div>
+          </div>
+        </div>
+
         <!-- Compact Status Bar -->
         <div id="status-bar" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; padding:4px 0;">
           <span class="tier-badge tier-active" id="tele-tier"><span class="tier-dot"></span> ACTIVE</span>
@@ -1401,100 +1382,17 @@
         <span class="panel-title">
           Live Customer View
         </span>
-
-        <!-- View Switcher -->
-        <div class="view-toggle-bar">
-          <button class="toggle-btn active" id="btn-view-store" onclick="switchRightPanelTab('store')">
-            Store Checkout (/pay)
-          </button>
-          <!-- Second, and named for what it is. This panel loads no SDK, opens
-               no checkout and registers no presence, so the agent's page push
-               is correctly refused against it — the recovery ladder cannot
-               start here. The real surface is the default for that reason. -->
-          <button class="toggle-btn" id="btn-view-canvas" onclick="switchRightPanelTab('canvas')">
-            Preview (mock)
-          </button>
-        </div>
       </div>
 
-      <!-- Real Store View Mode (/pay embedded iframe) -->
-      <div id="store-view-mode" style="height:calc(100% - 40px); padding:8px; background:#0d1117;">
+      <!-- The customer's real checkout. There is no second tab now: a mock
+           beside it only ever invited the question of which one was real. -->
+      <div id="store-view-mode" style="height:100%; padding:8px; background:#0d1117;">
         <!-- data-loaded is set here because src is too: without it the first
              switch would reassign src and reload a checkout that is already
              up, which is the flash this panel used to have. -->
         <iframe src="/pay" id="store-iframe" data-loaded="1" style="width:100%; height:100%; border:none; border-radius:4px; background:#ffffff;"></iframe>
       </div>
 
-      <!-- Generative Canvas View Mode -->
-      <div class="panel-body canvas-container" id="canvas-view-mode" style="display:none">
-        
-        <!-- Business Scenario Context Bar -->
-        <div class="biz-context-bar" id="biz-context-bar">
-          <div>
-            <span id="biz-name" style="font-weight:600; color:var(--text-bright);">Payment Platform</span>
-            <span style="font-size:0.7rem; color:var(--text-muted); margin-left:6px;" id="biz-detail-span">(Select a scenario)</span>
-          </div>
-          <span class="biz-badge" id="biz-badge">IDLE</span>
-        </div>
-
-        <!-- Enterprise Razorpay Recovery Canvas Card -->
-        <div class="shop-checkout" id="shop-checkout">
-          <!-- Razorpay Top Bar -->
-          <div class="rzp-top-bar">
-            <div class="rzp-brand">
-              <span style="color:#58a6ff; font-weight:800;">Razorpay</span> Standard Checkout v2
-            </div>
-            <div class="rzp-trust-badge">
-              Mock UI
-            </div>
-          </div>
-
-          <!-- Order Summary Itemization -->
-          <div class="order-summary" id="order-summary">
-            <div class="order-row">
-              <span id="item-name">Select a scenario to begin</span>
-              <span id="item-subtotal">INR 0.00</span>
-            </div>
-            <div class="order-row">
-              <span>Razorpay Recovery Engine</span>
-              <span style="color:var(--accent-green); font-weight:600;">[ACTIVE]</span>
-            </div>
-            <div class="order-row total">
-              <span>Total Payable</span>
-              <span id="canvas-price" style="color:var(--accent-blue);">INR 0.00</span>
-            </div>
-          </div>
-
-          <!-- Virtual Credit Card Preview -->
-          <div class="virtual-card" id="virtual-card">
-            <div class="card-number" id="card-num-preview">•••• •••• •••• ••••</div>
-            <div class="card-footer">
-              <span>CARD HOLDER</span>
-              <span id="card-exp-preview">EXP: MM/YY</span>
-            </div>
-          </div>
-
-          <!-- Morph Container -->
-          <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504')">
-            Simulate a gateway failure
-          </button>
-        </div>
-
-        <div class="recovery-progress-bar">
-          <div class="progress-title">
-            <span>Intervention Pipeline</span>
-            <span style="color:var(--accent-blue);" id="progress-status-label">IDLE</span>
-          </div>
-          <div class="progress-steps">
-            <div class="step-pill" id="p-detect">1. PERCEIVE</div>
-            <div class="step-pill" id="p-diagnose">2. REASON</div>
-            <div class="step-pill" id="p-guardrail">3. GUARD</div>
-            <div class="step-pill" id="p-morph">4. ACT</div>
-            <div class="step-pill" id="p-recovered">5. LEARN</div>
-          </div>
-        </div>
-
-      </div>
     </div>
 
   </div>
@@ -1606,37 +1504,6 @@
     let activePaymentId = "";
     let lastTier = "";
     let currentScenario = null;  // Stores scenario context from API
-
-    function switchRightPanelTab(mode) {
-      const btnCanvas = document.getElementById("btn-view-canvas");
-      const btnStore = document.getElementById("btn-view-store");
-      const canvasMode = document.getElementById("canvas-view-mode");
-      const storeMode = document.getElementById("store-view-mode");
-
-      if (mode === "canvas") {
-        btnCanvas.classList.add("active");
-        btnStore.classList.remove("active");
-        canvasMode.style.display = "flex";
-        storeMode.style.display = "none";
-        playEnter(canvasMode);
-      } else {
-        btnStore.classList.add("active");
-        btnCanvas.classList.remove("active");
-        storeMode.style.display = "block";
-        canvasMode.style.display = "none";
-        playEnter(storeMode);
-        /* Load the checkout ONCE. This reassigned src on every switch, so
-           returning to the store tore down a working iframe and rebuilt it —
-           a white flash and a fresh page load each time, which is most of
-           what made this panel feel rough. A customer mid-payment would have
-           had the page pulled out from under them. */
-        const iframe = document.getElementById("store-iframe");
-        if (iframe && !iframe.dataset.loaded) {
-          iframe.src = "/pay";
-          iframe.dataset.loaded = "1";
-        }
-      }
-    }
 
     function resetProgressPills() {
       document.getElementById("p-detect").className = "step-pill";
@@ -1869,130 +1736,6 @@
     /* `submitCardExpiryFix` lived here. Its only caller was the CARD_EXPIRY_FIXER
        branch of the removed morph panel, so it became unreachable with it. */
 
-    function startPaymentFromCanvas(scenarioReason) {
-      const ctx = currentScenario || { amount: 2999, customer: { name: "Customer", email: "" }, item_name: "Order" };
-      const paymentId = "pay_sim_" + Math.floor(1000 + Math.random() * 9000);
-      const amount = ctx.amount;
-      activePaymentId = paymentId;
-      
-      resetProgressPills();
-      document.getElementById("progress-status-label").textContent = "CREATING RAZORPAY ORDER...";
-      logThought("CHECKOUT", "tag-thinking", `Initiating Razorpay Checkout for ${paymentId}...`, `Amount: INR ${amount.toFixed(2)}`);
-
-      fetch("/api/create-order", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ amount: amount, payment_id: paymentId })
-      })
-      .then(r => r.json())
-      .then(data => {
-        logThought("ORDER", "tag-kg", `Razorpay Order Created: ${data.order_id}`, `Paise: ${data.amount} | Currency: ${data.currency} | Key: ${data.key_id || 'rzp_test_demo'}`);
-        document.getElementById("progress-status-label").textContent = "PROCESSING PAYMENT...";
-        
-        setTimeout(() => {
-          logThought("GATEWAY", "tag-acting", `Razorpay Gateway Failure Event Fired!`, `Reason: ${scenarioReason || 'Gateway Timeout 504'}`);
-          fetch("/api/payment-failed", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              payment_id: paymentId,
-              amount: amount,
-              failure_code: "gateway_timeout",
-              failure_reason: scenarioReason || "Gateway Timeout 504",
-              error_source: "gateway",
-              error_step: "payment_authorization",
-              customer: ctx.customer
-            })
-          });
-        }, 800);
-      });
-    }
-
-    function triggerScenario(name) {
-      resetProgressPills();
-      document.getElementById("progress-status-label").textContent = "SIMULATING...";
-      fetch("/api/simulate/" + name, { method: "POST" })
-        .then(r => r.json())
-        .then(data => {
-          if (data.payment_id) activePaymentId = data.payment_id;
-          // Store scenario context from API (no more hardcoded values)
-          currentScenario = {
-            biz_name: data.biz_name || "Payment Platform",
-            biz_detail: data.biz_detail || "",
-            badge: data.badge || data.scenario,
-            item_name: data.item_name || "Order",
-            amount: data.amount || 0,
-            customer: data.customer || { name: "Customer", email: "", contact: "" },
-            card_last4: data.card_last4 || "0000",
-            card_expiry: data.card_expiry || "MM/YY",
-            card_holder: data.card_holder || "CARD HOLDER",
-          };
-          updateScenarioView();
-          if (data.status === "batch_completed") {
-            logThought("BATCH", "tag-kg", "Batch Evaluation Complete!", data.summary);
-            fetchMetrics();
-          }
-        });
-    }
-
-    // Tier update socket handler
-    socket.on("tier_update", function(data) {
-      const tier = data.tier || "active";
-      const tierLabel = tier === "silent" ? "SILENT" : tier === "hard_decline_blocked" ? "BLOCKED" : "ACTIVE";
-      const tierEl = document.getElementById("tele-tier");
-      tierEl.className = "tier-badge tier-" + tier;
-      tierEl.innerHTML = '<span class="tier-dot"></span> ' + tierLabel;
-      if (data.decline_strategy) {
-        document.getElementById("tele-strategy").textContent = "Strategy: " + data.decline_strategy;
-      }
-      if (data.penalties_prevented > 0) {
-        document.getElementById("tele-penalties").textContent = "Penalties: " + data.penalties_prevented + " blocked";
-        document.getElementById("tele-penalties").style.display = "";
-      }
-      if (data.payday_target_date) {
-        document.getElementById("tele-payday").textContent = "Payday: " + data.payday_target_date;
-        document.getElementById("tele-payday").style.display = "";
-      }
-      if (tier === "silent") {
-        showSilentBanner(data.payday_target_date || "", data.decline_strategy || "");
-      }
-    });
-
-    // Decline strategy socket handler
-    socket.on("decline_strategy", function(data) {
-      if (data.strategy) {
-        document.getElementById("tele-strategy").textContent = "Code " + data.failure_code + ": " + data.strategy;
-      }
-    });
-
-    // Scheduled job socket handler — display real retry scheduler output
-    socket.on("scheduled_job", function(data) {
-      const step = document.createElement("div");
-      step.className = "trace-step open";
-      const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      step.innerHTML = `
-        <div class="trace-header" onclick="toggleStep(this)">
-          <span class="trace-chevron">▸</span>
-          <span class="trace-tag" style="color:#3b82f6;">[SCHEDULED]</span>
-          <span class="trace-title">Background Retry Job Created</span>
-          <span class="tier-badge tier-silent trace-tier"><span class="tier-dot"></span> SILENT</span>
-          <span class="trace-time">${ts}</span>
-        </div>
-        <div class="trace-body">
-          <div class="trace-detail">
-            <span class="trace-chip blue">Job: ${data.job_id}</span>
-            <span class="trace-chip">Target: ${data.target_timestamp}</span>
-            <span class="trace-chip green">Confidence: ${(data.confidence*100).toFixed(0)}%</span>
-            <span class="trace-chip purple">${data.reason}</span>
-          </div>
-        </div>`;
-      sessionAppend(step);
-    });
-
-
-    /* Every write goes into the selected session's buffer as well as the DOM, so
-       switching tabs replays that session's own history instead of a shared
-       scrollback. Writes belonging to a background session are buffered only. */
     function renderToolCard(tc) {
       if (!tc) { toolCard.style.display = "none"; return; }
 
