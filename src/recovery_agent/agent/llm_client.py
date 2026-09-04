@@ -65,7 +65,13 @@ def _check_llm_reachable() -> bool:
     try:
         parsed = urlparse(base_url)
         host = parsed.hostname or "localhost"
-        port = parsed.port or 20128
+        # A remote provider (https://api.anthropic.com/v1) carries no explicit
+        # port, and defaulting to the local proxy's 20128 made this probe dial
+        # a port nothing listens on. The probe short-circuits get_llm_response,
+        # so every remote endpoint looked unreachable and the agent dropped to
+        # heuristics without ever placing a call — a silent downgrade that
+        # reads, from the outside, exactly like a model that answered badly.
+        port = parsed.port or (443 if parsed.scheme == "https" else 20128)
         sock = socket.create_connection((host, port), timeout=1)
         sock.close()
         return True
@@ -79,6 +85,24 @@ DEFAULT_MODELS = [
     "antigravity/gemini-3.6-flash-high",
     "auto/best-reasoning",
 ]
+
+def _fallback_models() -> list[str]:
+    """Alternates to try when the primary model fails — from THIS endpoint.
+
+    DEFAULT_MODELS are ids the local router invents (`no-think/...`, `auto/...`);
+    they mean nothing to a first-party API. Pointed at Anthropic, a single
+    hiccup on the primary spent the rest of the budget on three guaranteed-404
+    model names and then returned None, so a working key still produced
+    heuristics. A remote endpoint gets one honest attempt instead of three
+    fictional ones.
+    """
+    base_url = os.getenv("LLM_BASE_URL", "http://localhost:20128/v1")
+    host = (urlparse(base_url).hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return list(DEFAULT_MODELS)
+    extra = os.getenv("LLM_FALLBACK_MODELS", "")
+    return [m.strip() for m in extra.split(",") if m.strip()]
+
 
 def get_llm(
     temperature: float = 0,
@@ -160,7 +184,8 @@ def invoke_llm(
         return None
 
     primary_model = os.getenv("LLM_MODEL", "antigravity/gemini-2.5-flash")
-    candidate_models = [primary_model] + [m for m in DEFAULT_MODELS if m != primary_model]
+    candidate_models = [primary_model] + [
+        m for m in _fallback_models() if m != primary_model]
 
     deadline = time.monotonic() + LLM_TIMEOUT
     per_model_timeout = max(5, LLM_TIMEOUT // max(1, len(candidate_models)))
