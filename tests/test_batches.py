@@ -150,12 +150,14 @@ def test_two_runs_cannot_work_one_batch_at_the_same_time():
     assert "already running" in body and "409" in body
 
 
-def test_a_case_cannot_be_worked_by_two_runs_at_once():
-    """Belt and braces, because the 409 above only covers one process. Every
-    case carries the run that acted on it and is refused by the next one."""
+def test_a_case_cannot_be_worked_by_two_live_runs_at_once():
+    """Belt and braces, because the 409 above only covers one process. A case
+    stamped by a run that is still going is refused to a second — and a
+    finished run releases it, because waves legitimately return and the
+    ladder (never the stamp) is what forbids repeating a contact."""
     body = _func(EXECUTOR, "precheck")
-    assert 'record.get("batch_run_id") != run_id' in body
     assert "already_in_a_run" in body
+    assert "OPEN" in body, "the skip applies to LIVE runs only"
 
 
 def test_a_run_is_bounded_by_a_budget_not_a_per_click_cap():
@@ -210,9 +212,13 @@ def test_the_rail_does_not_restructure_the_live_view():
 
 
 def test_the_batch_view_uses_the_existing_design_tokens():
-    i = INDEX.index(".batch-card {")
-    body = INDEX[i:i + 400]
-    assert "var(--panel-bg)" in body and "var(--border-color)" in body
+    # Anchored on the DECLARATION that sets the tokens, not on the first
+    # ".batch-card {" in the file — a later animation rule reusing the same
+    # selector otherwise shadows it and the check reads the wrong block.
+    decl = [b for b in INDEX.split(".batch-card {")
+            if "var(--panel-bg)" in b[:400]]
+    assert decl, ".batch-card must still be built from the shared tokens"
+    assert "var(--border-color)" in decl[0][:400]
 
 
 # ── one meaning of "at risk" ────────────────────────────────────────────
@@ -255,7 +261,10 @@ def test_an_offer_renders_as_a_banner_not_a_second_notification():
     """Both were drawn from the one `agent_push` event, so a discount arrived as
     a bar across the top AND another card in the corner moments after the plain
     one — two notifications for a customer who had already read the first."""
-    i = PAY_PAGE_SRC.index('socket.on("agent_push"')
+    # Anchored on the renderer rather than the socket handler, and widened:
+    # the "why did you stop?" prompt now sits between them, and a fixed slice
+    # from the handler no longer reaches the rule it is checking.
+    i = PAY_PAGE_SRC.index("function renderAgentPush(d) {")
     body = PAY_PAGE_SRC[i:i + 6000]
     assert "if (d.offer && d.offer.payable_rupees) return;" in body
 
@@ -474,3 +483,19 @@ def test_a_service_is_still_allowed_to(monkeypatch):
 def test_start_sh_grants_it():
     start = (pathlib.Path(__file__).resolve().parents[1] / "start.sh").read_text()
     assert "export RAZORPAY_WRITES_OK=1" in start
+
+
+def test_every_classified_bin_reaches_the_screen():
+    """`unclassified` and `risk` are load-bearing classifications — one keeps
+    a mystery failure out of the discount path, the other keeps fraud
+    unchased — and a control that matters is a control the operator can SEE
+    working. So the view shows every bin the classifier produces; nothing is
+    filtered between `summarise` and the screen, and the at-risk headline
+    equals the store it describes."""
+    assert classify(rec(failure_code="", decline_strategy="",
+                        failure_reason="")) == "unclassified"
+    assert classify(rec(failure_reason="suspected fraud")) == "risk"
+    body = _func(FRONTEND, "api_batches")
+    assert "summarise(list(store.payment_values()))" in body
+    assert "_OUT_OF_SCOPE" not in FRONTEND, (
+        "the presentation must not quietly drop bins the classifier produces")

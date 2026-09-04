@@ -133,7 +133,6 @@ def test_the_message_carries_this_case_s_own_figures(env, monkeypatch):
     # Fraud is refused twice over too: the classifier puts it in the
     # un-runnable `risk` batch before `pursuit_barred` behind it gets a turn.
     (case(failure_reason="suspected fraud"), ex.SKIPPED, "reclassified"),
-    (case(batch_run_id="another_run"), ex.SKIPPED, "already_in_a_run"),
     # A contactless case is refused twice over: `classify` puts it in no batch
     # at all, so it never even reaches the contact check behind it.
     (case(customer={}), ex.SKIPPED, "reclassified"),
@@ -316,22 +315,33 @@ def test_a_budget_may_be_tightened_but_never_loosened():
         BatchBudget().max_links
 
 
-# ── idempotency: clicking twice must not spend twice ─────────────────────
+# ── one case, one live run — but a finished run releases it ──────────────
 
-def test_a_second_run_over_the_same_batch_acts_on_nothing(env, monkeypatch):
-    from recovery_agent.state_store import StateStore
+def test_a_case_in_a_still_running_run_is_refused_to_a_second(env, monkeypatch):
+    from recovery_agent.batch import run as batch_run
     calls = Calls().install(monkeypatch)
-    store = StateStore()
-    store.save_payment("pay_1", case())
-    store.flush()
+    live = batch_run.register(batch_run.BatchRun(batch_key="dropoff", plans={}))
+    try:
+        d = run(case(batch_run_id=live.run_id), run_id="run_2")
+        assert (d.outcome, d.reason) == (ex.SKIPPED, "already_in_a_run")
+        assert calls.log == []
+    finally:
+        batch_run.forget(live.run_id)
 
-    assert run(case(), run_id="run_1").outcome == ex.ACTED
-    record = dict(store.get_payment("pay_1") or {})
-    assert record["batch_run_id"] == "run_1"
 
-    before = len(calls.log)
-    assert run(record, run_id="run_2").outcome == ex.SKIPPED
-    assert len(calls.log) == before
+def test_a_finished_run_releases_the_case_to_the_ladder(env, monkeypatch):
+    """A later wave legitimately touches the case again; what prevents a
+    repeat CONTACT is the ladder, which never repeats a rung — not a stamp
+    that would bar the case forever after one run."""
+    calls = Calls().install(monkeypatch)
+    d = run(case(batch_run_id="run_finished_long_ago"), run_id="run_2")
+    assert d.outcome == ex.ACTED, "the stamp alone must not bar the case"
+    d2 = run(case(batch_run_id="run_old",
+                  ladder={"offer": {"at": "2026-09-01T10:00:00+00:00"}}),
+             run_id="run_2")
+    assert d2.outcome == ex.EXCEPTION and "ladder_advanced" in d2.reason, (
+        "the rung already climbed is what stops the repeat, and it routes "
+        "to the agent rather than re-sending")
 
 
 # ── dry run: the same twelve checks, zero side effects ───────────────────

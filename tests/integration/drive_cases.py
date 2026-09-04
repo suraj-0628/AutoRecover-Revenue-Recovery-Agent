@@ -816,6 +816,13 @@ def main():
             done = set(json.loads(OBS_JSON.read_text()))
         except Exception:
             pass
+    # --redrive: run the named cases again even though they are already
+    # observed. Resumability is right for finishing an interrupted matrix, but
+    # it makes re-running a no-op -- which is wrong when the goal is corpus
+    # VOLUME rather than coverage. Each drive mints a fresh payment_id, so a
+    # re-driven case is a genuinely new case to the corpus, not a duplicate.
+    if "--redrive" in flags:
+        done -= only
     ctx = {}
     for cid in ORDER:
         if cid not in only or cid in done:

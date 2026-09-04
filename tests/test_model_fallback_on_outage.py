@@ -60,3 +60,28 @@ def test_the_agent_node_actually_consults_the_matcher():
     # The old literal checks must be gone, or 404 slips through again.
     assert '"502" in str(e)' not in src
     assert '"429" in str(e)' not in src
+
+
+# ── The chain must not lie about which model served the turn ────────────────
+
+def test_chain_head_is_the_model_attempt_zero_actually_invokes(monkeypatch):
+    """attempt 0 calls the prebuilt `model`, which _build_model resolves from
+    LLM_MODEL. So entry 0 must BE LLM_MODEL. It once read "gemma-4-31b-it"
+    while claude-sonnet-4-6 served every first turn — and that name is what
+    record_llm_usage and the eval corpus store, so the mislabel quietly
+    attributed real decisions and real spend to a model never called."""
+    from recovery_agent.agent.graph import _fallback_chain
+    monkeypatch.setenv("LLM_MODEL", "some/deliberately-odd-model")
+    assert _fallback_chain()[0] == "some/deliberately-odd-model"
+
+
+def test_chain_holds_no_model_the_proxy_cannot_serve():
+    """Verified 2026-09-04: the proxy has no credentials for the providers
+    behind the gemma models, so they 400/404 on every call. A dead model at
+    the head of the chain buys a wasted round trip on the way to every
+    recovery — and its "16K RPM massive headroom" comment made that look
+    like the fastest option available."""
+    from recovery_agent.agent.graph import _fallback_chain
+    dead = {"gemma-4-31b-it", "gemma-4-26b-it",
+            "crof/gemma-4-31b-it", "bzl/gemma-4-31b-it"}
+    assert not (set(_fallback_chain()) & dead)

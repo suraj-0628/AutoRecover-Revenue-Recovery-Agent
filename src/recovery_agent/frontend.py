@@ -3675,7 +3675,7 @@ def payment_failed():
         if store.get_payment(payment_id).get("status") == "recovering":
             return jsonify({"status": "already_recovering", "payment_id": payment_id})
     if not store.has_payment(payment_id):
-        store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": []})
+        store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": [], "customer": customer or {}})
 
     # SIGNAL PRECEDENCE: a synthetic page event never overwrites a gateway
     # diagnosis. Live (pay_fotw1e7b6, ₹59,976): netbanking failed at the BANK,
@@ -3727,10 +3727,22 @@ def payment_failed():
     # `decline_strategy` is refreshed with the code, not left from the previous
     # attempt. It is a DERIVED field that `failure_kind` consults, so a stale
     # one silently re-diagnoses the new failure as the old one.
+    # The customer is persisted, not merely passed along. The non-deferred path
+    # hands `customer` straight to run_agent_for_payment and so never noticed it
+    # was missing from the record; the deferred path restarts the agent by
+    # reading the record back, got {}, and the agent — correctly, given what it
+    # could see — concluded there was "no contact info available" and escalated
+    # to a human on its first move. Every drop-off that stopped to ask the
+    # customer why lost that customer's email and phone in the process.
+    # Merged, never blanked: a later failure that omits the contact must not
+    # erase the details an earlier one supplied.
+    _known = dict((store.get_payment(payment_id) or {}).get("customer") or {})
+    _known.update({k: v for k, v in (customer or {}).items() if v})
     store.update_payment(payment_id, status="recovering", push_outcome=None,
                          failure_code=failure_code or "",
                          failure_reason=failure_reason or "",
                          decline_strategy=failure_code or "",
+                         customer=_known,
                          abandoned_after_failure=_abandoned_after_failure)
 
 

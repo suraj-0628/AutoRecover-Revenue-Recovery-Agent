@@ -44,13 +44,25 @@ def env(tmp_path, monkeypatch):
             return json.dumps(payload)
         return SimpleNamespace(name=name, func=func)
 
+    # The real notification tool climbs the rung it sends on; the fake must
+    # too, because the ladder is what makes a second run safe.
+    from recovery_agent.agent import ladder as _ladder
+
+    def notify(**kw):
+        calls.append(("send_recovery_notification", kw))
+        rec = state_store.StateStore().get_payment(kw.get("payment_id")) or {}
+        nxt = _ladder.next_rung(rec)
+        if nxt:
+            _ladder.record_rung(kw["payment_id"], nxt["rung"], "batch send")
+        return json.dumps({"status": "ok", "channels": ["email"]})
+
     monkeypatch.setattr(tools, "TOOLS_BY_NAME", {
         "generate_recovery_payment_link": tool(
             "generate_recovery_payment_link",
             {"status": "ok", "link_url": "https://rzp.io/l/fake",
              "link_id": "plink_fake"}),
-        "send_recovery_notification": tool(
-            "send_recovery_notification", {"status": "ok", "channels": ["email"]}),
+        "send_recovery_notification": SimpleNamespace(
+            name="send_recovery_notification", func=notify),
         "retry_in_hours": tool("retry_in_hours", {"status": "scheduled"}),
     })
     yield SimpleNamespace(calls=calls, path=tmp_path)
@@ -158,21 +170,29 @@ def test_repeated_failures_stop_the_run_rather_than_grinding_through(env,
     assert run.stop_reason == "stopped: consecutive_failures"
 
 
-def test_clicking_run_twice_spends_once(env):
-    """The budget lives on the run, and every case must also clear
-    `already_in_a_run` — so a second click creates a run that acts on nothing."""
+def test_clicking_run_twice_never_contacts_a_customer_twice(env):
+    """What protects a double-click is the ladder, not a stamp: run 1 climbed
+    the rung it sent on, so run 2 finds every case past the plan's coverage
+    and routes it to the agent instead of re-sending. (While a run is still
+    LIVE, the `already_in_a_run` skip and the route's 409 add the concurrency
+    guard on top.)"""
     from recovery_agent.state_store import StateStore
     store = StateStore()
     for rec in cases(3):
         store.save_payment(rec["payment_id"], rec)
     store.flush()
 
-    first = make().execute(cases(3))
+    first = make().execute([dict(store.get_payment(f"pay_{i}")) for i in range(3)])
     fresh = [dict(store.get_payment(f"pay_{i}") or {}) for i in range(3)]
+    sends_before = sum(1 for n, _ in env.calls
+                       if n == "send_recovery_notification")
     second = make().execute(fresh)
+    sends_after = sum(1 for n, _ in env.calls
+                      if n == "send_recovery_notification")
 
     assert first["acted"] == 3 and second["acted"] == 0
-    assert second["skipped_by_reason"] == {"already_in_a_run": 3}
+    assert sends_after == sends_before, "no customer was messaged twice"
+    assert second["exceptions"] == 3, "run 2 hands them to the agent"
 
 
 # ── the report is the log ────────────────────────────────────────────────

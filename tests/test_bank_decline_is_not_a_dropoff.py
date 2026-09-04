@@ -95,19 +95,74 @@ def test_a_wrapper_code_with_no_reason_falls_back_to_the_strategy():
 
 # ── the checkout must stop manufacturing the stale signal ───────────────────
 
-def test_the_page_does_not_report_a_dropoff_after_a_failure():
-    """The customer is stuck behind Razorpay's iframe with an invisible offer
-    underneath it. Their only escape is closing the modal — which used to be
-    filed as "changed their mind"."""
+def test_a_close_after_a_failure_is_marked_as_such():
+    """Neither a fresh drop-off nor nothing at all.
+
+    The page must not silently re-diagnose a bank decline as a change of mind
+    (that authorised 5% off a payment the customer was trying to make), but it
+    must still TELL the server they walked — that is what distinguishes a
+    hesitant customer from one who never hit a failure.
+
+    It must NOT close the window for them: Razorpay's own screen offers other
+    rails after a decline, and a customer reaching for UPI themselves is the
+    cheapest recovery available. An earlier version called `rzp.close()` here
+    and interrupted exactly that."""
     from pathlib import Path
     import recovery_agent.frontend as F
     text = Path(F.__file__).read_text()
     assert "_closedAfterFailure = true;" in text
-    assert "rzp.close();" in text, "get them out of the dead rail-selection screen"
+    assert "rzp.close();" not in text, \
+        "let the customer use Razorpay's own retry options"
     i = text.index("modal: {ondismiss")
-    body = text[i:i + 900]
-    assert "if (_closedAfterFailure)" in body and "return;" in body, \
-        "a dismissal we caused must not be reported as a customer cancelling"
+    body = text[i:i + 2000]
+    assert "if (_closedAfterFailure)" in body
+    assert "Closed the checkout after a failed attempt" in body, \
+        "the walk-away is still reported, so the server can record it"
+
+
+def test_walking_away_after_a_failure_is_not_the_same_ladder():
+    """Three journeys, three ladders — the point of the whole distinction."""
+    from recovery_agent.agent import ladder
+    base = dict(LIVE)
+    still_trying = [k for k, _ in ladder.rungs_for(base)]
+    walked = [k for k, _ in ladder.rungs_for({**base, "abandoned_after_failure": True})]
+    pure_drop = [k for k, _ in ladder.rungs_for(
+        {**base, "failure_code": "customer_cancelled",
+         "failure_reason": "Payment cancelled by customer"})]
+
+    # Still trying: the rail is the problem, so a working rail comes first.
+    assert still_trying.index("rail_switch") < still_trying.index("offer")
+    # Walked away: reluctance is proven, so the reason comes before the route.
+    assert walked.index("offer") < walked.index("rail_switch")
+    # Never failed: nothing to switch to — there is no rail_switch rung at all.
+    assert "rail_switch" not in pure_drop
+
+
+def test_walking_away_unlocks_the_discount_without_spending_a_link():
+    """A method case normally earns the discount by trying full price first.
+    Someone who saw the alternatives and closed has already shown us."""
+    import json, tempfile
+    from pathlib import Path as _P
+    import recovery_agent.state_store as state_store
+    from recovery_agent.agent.tools import get_recovery_offer
+
+    tmp = _P(tempfile.mkdtemp())
+    old_dir = state_store._DATA_DIR
+    state_store._DATA_DIR = tmp
+    state_store.StateStore.reset_instances()
+    try:
+        s = state_store.StateStore()
+        s.save_payment("pay_qssihjc5z",
+                       {**LIVE, "abandoned_after_failure": True})
+        s.flush()
+        r = json.loads(get_recovery_offer.invoke({
+            "amount": 12495.0, "stage": "ui_offer",
+            "payment_id": "pay_qssihjc5z"}))
+        assert r["allowed"] is True, "walking away is the evidence"
+        assert r["discount_pct"] > 0
+    finally:
+        state_store._DATA_DIR = old_dir
+        state_store.StateStore.reset_instances()
 
 
 def test_a_new_failure_refreshes_the_derived_field():
@@ -115,6 +170,10 @@ def test_a_new_failure_refreshes_the_derived_field():
     import recovery_agent.frontend as F
     text = Path(F.__file__).read_text()
     i = text.index("def payment_failed")
-    body = text[i:i + 4600]
+    # To the end of the function, not a fixed byte count. The window used to
+    # be `i + 4600`; adding a comment inside payment_failed pushed the line
+    # this asserts on past the cutoff and failed a test about a behaviour that
+    # had not changed. A slice that moves when prose moves tests the prose.
+    body = text[i:text.index("\n@app.route", i)]
     assert "decline_strategy=failure_code" in body, \
         "the derived field must not outlive the failure it was derived from"

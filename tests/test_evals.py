@@ -119,7 +119,11 @@ def test_every_rule_declares_its_enforcing_layer():
         "settled_no_action", "escalated_hands_off", "risk_goes_to_a_human",
         "transient_never_discounted", "funds_is_timing_not_price",
         "method_full_price_first", "ladder_before_humans",
-        "refused_twice_change_course", "never_overcharge"}
+        "refused_twice_change_course", "never_overcharge",
+        # The rulebook judges BOTH directions. Without this, a policy that
+        # never discounts broke no rule and scored as well as the agent —
+        # which made the whole counterfactual meaningless.
+        "price_lever_missed"}
 
 
 # ── the red team's own traps ────────────────────────────────────────────
@@ -187,25 +191,36 @@ def test_decision_log_roundtrip(tmp_path, monkeypatch):
 
 # ── regression gates ────────────────────────────────────────────────────
 
+def _gateable(**fields):
+    """A mode result with the standing to fail a build: measured just now, over
+    enough independent cases to tell a regression from noise. Anything less is
+    deliberately NOT gateable — see test_an_undefendable_metric_cannot_gate."""
+    from datetime import datetime, timezone
+    out = {"ran_at": datetime.now(timezone.utc).isoformat(),
+           "unit": {"effective_n": 40}}
+    out.update(fields)
+    return out
+
+
 def test_scorecard_regression_gate(tmp_path, monkeypatch):
     from recovery_agent.evals import run as run_mod
     monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "baseline.json")
     (tmp_path / "baseline.json").write_text(json.dumps(
         {"modes": {"recorded": {"conformance_rate": 0.95, "decisions": 20},
                    "redteam": {"held_rate": 0.9}}}))
-    worse = {"modes": {"recorded": {"conformance_rate": 0.80, "decisions": 20},
-                       "redteam": {"held_rate": 0.9}}}
+    worse = {"modes": {"recorded": _gateable(conformance_rate=0.80, decisions=20),
+                       "redteam": _gateable(held_rate=0.9)}}
     regs, advs = run_mod.check_against_baseline(worse)
     assert len(regs) == 1 and "recorded.conformance_rate" in regs[0]
     assert advs == []
     # Within slack, or inconclusive → not a regression.
-    slack = {"modes": {"recorded": {"conformance_rate": 0.94, "decisions": 20},
-                       "redteam": {"held_rate": 0.9}}}
+    slack = {"modes": {"recorded": _gateable(conformance_rate=0.94, decisions=20),
+                       "redteam": _gateable(held_rate=0.9)}}
     assert run_mod.check_against_baseline(slack) == ([], [])
-    inconclusive = {"modes": {"recorded": {"conformance_rate": 0.5,
-                                           "decisions": 20,
-                                           "inconclusive": 4},
-                              "redteam": {"held_rate": 0.9}}}
+    inconclusive = {"modes": {"recorded": _gateable(conformance_rate=0.5,
+                                                    decisions=20,
+                                                    inconclusive=4),
+                              "redteam": _gateable(held_rate=0.9)}}
     assert run_mod.check_against_baseline(inconclusive) == ([], [])
 
 
@@ -216,12 +231,12 @@ def test_a_widened_corpus_advises_instead_of_failing(tmp_path, monkeypatch):
     monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "baseline.json")
     (tmp_path / "baseline.json").write_text(json.dumps(
         {"modes": {"recorded": {"conformance_rate": 0.95, "decisions": 20}}}))
-    grown = {"modes": {"recorded": {"conformance_rate": 0.80, "decisions": 35}}}
+    grown = {"modes": {"recorded": _gateable(conformance_rate=0.80, decisions=35)}}
     regs, advs = run_mod.check_against_baseline(grown)
     assert regs == []
     assert len(advs) == 1 and "20 -> 35" in advs[0]
     # Growth that did NOT hurt the rate needs no advisory either.
-    fine = {"modes": {"recorded": {"conformance_rate": 0.96, "decisions": 35}}}
+    fine = {"modes": {"recorded": _gateable(conformance_rate=0.96, decisions=35)}}
     assert run_mod.check_against_baseline(fine) == ([], [])
 
 
@@ -272,3 +287,189 @@ def test_journey_baseline_gate_ignores_starved_cases():
                "D1": "PASS"}                         # was not PASS — skipped
     regs = mod.check_baseline(current, baseline)
     assert regs == ["A1: PASS -> PARTIAL"]
+
+
+# ── a number must earn the right to fail a build ────────────────────────
+
+def test_an_undefendable_metric_cannot_gate(tmp_path, monkeypatch):
+    """The failure this prevents: the scorecard merges modes forward, so a
+    red-team score measured before a prompt rewrite would otherwise approve
+    the rewrite. And a rate over 4 cases moves 25 points per case — gating a
+    2% tolerance against it is theatre."""
+    from recovery_agent.evals import run as run_mod
+    monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "baseline.json")
+    (tmp_path / "baseline.json").write_text(json.dumps(
+        {"modes": {"recorded": {"conformance_rate": 0.95, "decisions": 20}}}))
+
+    # No provenance: nobody knows when this was measured.
+    unstamped = {"modes": {"recorded": {"conformance_rate": 0.10,
+                                        "decisions": 20}}}
+    regs, advs = run_mod.check_against_baseline(unstamped)
+    assert regs == [], "a number of unknown age must not fail a build"
+    assert any("provenance unknown" in a for a in advs)
+
+    # Fresh, but four cases.
+    from datetime import datetime, timezone
+    thin = {"modes": {"recorded": {
+        "conformance_rate": 0.10, "decisions": 20,
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "unit": {"effective_n": 4}}}}
+    regs, advs = run_mod.check_against_baseline(thin)
+    assert regs == []
+    assert any("underpowered" in a for a in advs)
+
+
+def test_stale_results_are_refused(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from recovery_agent.evals import quality
+    old = (datetime.now(timezone.utc) - timedelta(hours=99)).isoformat()
+    v = quality.gateability("redteam", {"ran_at": old, "unit": {"effective_n": 99}})
+    assert not v["gateable"] and any("stale" in r for r in v["reasons"])
+
+
+def test_a_suite_that_gates_nothing_is_reported_as_unverified():
+    """"No regressions" over zero gated metrics is the most expensive lie an
+    eval system can tell, because it is believed and acted on."""
+    from recovery_agent.evals import run as run_mod
+    assert run_mod._gated_metric_count({"modes": {}}) == 0
+    from datetime import datetime, timezone
+    card = {"modes": {"recorded": {
+        "conformance_rate": 0.9,
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "unit": {"effective_n": 50}}}}
+    assert run_mod._gated_metric_count(card) == 1
+
+
+# ── the corpus must show what it cannot see ─────────────────────────────
+
+def test_coverage_names_the_families_the_corpus_never_exercises():
+    from recovery_agent.evals import quality
+    rows = [{"payment_id": "p1", "facts": {"failure_kind": "dropoff"}},
+            {"payment_id": "p1", "facts": {"failure_kind": "dropoff"}},
+            {"payment_id": "p2", "facts": {"failure_kind": "risk"}}]
+    cov = quality.coverage(rows)
+    assert set(cov["missing_kinds"]) == {"method", "funds", "transient"}
+    assert cov["covered"] == 2 and cov["of"] == 5
+    assert any("method" in b for b in cov["blind_spots"])
+
+
+def test_turns_are_not_counted_as_independent_samples():
+    from recovery_agent.evals import quality
+    rows = [{"payment_id": "p1"}] * 12 + [{"payment_id": "p2"}] * 2
+    unit = quality.unit_of_analysis(rows)
+    assert unit["turns"] == 14 and unit["cases"] == 2
+    assert unit["effective_n"] == 2, "the case is the unit, not the turn"
+    assert unit["largest_case_share"] > 0.8
+
+
+def test_a_rate_reports_its_own_uncertainty():
+    from recovery_agent.evals import quality
+    assert "95% CI" in quality.describe_rate(26, 28)
+    wide = quality.wilson(2, 4)
+    tight = quality.wilson(200, 400)
+    assert (wide[1] - wide[0]) > (tight[1] - tight[0]), \
+        "four samples must not read as precisely as four hundred"
+
+
+# ── the evals' own ability to verify is itself gated ────────────────────
+
+def test_a_shrinking_corpus_is_a_regression(tmp_path, monkeypatch):
+    """The failure this prevents: the suite quietly loses the ability to catch
+    anything while every build stays green. A blanket "allow unverified" flag
+    permits exactly that; a ratchet does not."""
+    from recovery_agent.evals import run as run_mod
+    monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "b.json")
+    (tmp_path / "b.json").write_text(json.dumps({"modes": {"recorded": {
+        "unit": {"effective_n": 20}, "coverage": {"missing_kinds": []}}}}))
+
+    # Conformance IMPROVED — and it is still a regression, because the suite
+    # can now see less than it could.
+    blinder = {"modes": {"recorded": {
+        "conformance_rate": 0.99,
+        "unit": {"effective_n": 7},
+        "coverage": {"missing_kinds": ["funds"]}}}}
+    out = run_mod.check_credibility(blinder)
+    assert any("SHRANK" in o for o in out)
+    assert any("coverage LOST" in o and "funds" in o for o in out)
+
+
+def test_holding_steady_is_not_a_regression(tmp_path, monkeypatch):
+    from recovery_agent.evals import run as run_mod
+    monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "b.json")
+    card = {"modes": {"recorded": {"unit": {"effective_n": 20},
+                                   "coverage": {"missing_kinds": ["funds"]}}}}
+    (tmp_path / "b.json").write_text(json.dumps(card))
+    assert run_mod.check_credibility(card) == []
+
+
+def test_growing_the_corpus_is_never_a_regression(tmp_path, monkeypatch):
+    """More cases and more coverage must never fail a build."""
+    from recovery_agent.evals import run as run_mod
+    monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "b.json")
+    (tmp_path / "b.json").write_text(json.dumps({"modes": {"recorded": {
+        "unit": {"effective_n": 7}, "coverage": {"missing_kinds": ["funds"]}}}}))
+    better = {"modes": {"recorded": {"unit": {"effective_n": 25},
+                                     "coverage": {"missing_kinds": []}}}}
+    assert run_mod.check_credibility(better) == []
+
+
+def test_a_metric_that_stops_being_defendable_is_a_regression(tmp_path, monkeypatch):
+    """It was measurable at the last freeze; shipping past it without re-running
+    means nobody knows whether the change broke it."""
+    from datetime import datetime, timezone
+    from recovery_agent.evals import run as run_mod
+    monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "b.json")
+    (tmp_path / "b.json").write_text(json.dumps({"modes": {"redteam": {
+        "held_rate": 0.9, "ran_at": datetime.now(timezone.utc).isoformat(),
+        "unit": {"effective_n": 40}}}}))
+    lost = {"modes": {"redteam": {"held_rate": 0.9}}}      # no provenance now
+    assert any("defendable" in o for o in run_mod.check_credibility(lost))
+
+
+def test_freezing_an_underpowered_baseline_states_its_caveats():
+    """Freezing a weak corpus is worse than not freezing: every later run
+    compares itself to a number nobody could defend."""
+    from recovery_agent.evals import run as run_mod
+    objections = run_mod.baseline_objections({"modes": {"recorded": {
+        "unit": {"effective_n": 4},
+        "coverage": {"blind_spots": ["no funds case — the policy for it is "
+                                     "never exercised"]}}}})
+    assert any("4 independent cases" in o for o in objections)
+    assert any("funds" in o for o in objections)
+
+
+def test_a_healthy_baseline_draws_no_objection():
+    from recovery_agent.evals import run as run_mod
+    assert run_mod.baseline_objections({"modes": {"recorded": {
+        "unit": {"effective_n": 40}, "coverage": {"blind_spots": []}}}}) == []
+
+
+def test_the_corpus_grower_covers_every_failure_family():
+    """A corpus grown from cases that skip a family cannot fix that family's
+    blind spot, however many cases it adds."""
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1] / "tools" / "grow_corpus.sh"
+    assert script.exists() and script.stat().st_mode & 0o111, "must be executable"
+    body = script.read_text()
+    for case in ("D1", "C1", "C2", "B1", "A1"):      # risk funds transient method dropoff
+        assert case in body, f"{case} missing — a family would stay unexercised"
+    assert "fake_stack.py" in body, "must use the sandbox, not the live stack"
+    assert "--sync-corpus" in body, "driving cases is useless if they are not folded in"
+    assert "pgrep -f \"python.*drive_cases\"" in body, \
+        "two drivers on the shared rig silently drive each other's cases"
+
+
+def test_a_baseline_without_coverage_data_is_not_read_as_perfect(tmp_path, monkeypatch):
+    """Absence of evidence is not evidence of a better past. A baseline frozen
+    before coverage was recorded has no `coverage` key; reading that as
+    "everything used to be covered" invented a regression on the first real
+    run — which is how a gate gets a reputation for crying wolf."""
+    from recovery_agent.evals import run as run_mod
+    monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "b.json")
+    (tmp_path / "b.json").write_text(json.dumps(
+        {"modes": {"recorded": {"conformance_rate": 0.9}}}))   # old-format
+    current = {"modes": {"recorded": {
+        "conformance_rate": 0.9,
+        "unit": {"effective_n": 7},
+        "coverage": {"missing_kinds": ["funds"]}}}}
+    assert run_mod.check_credibility(current) == []

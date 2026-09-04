@@ -135,7 +135,9 @@ def test_a_new_failure_clears_the_previous_click():
     i = FRONTEND.index("def payment_failed")
     # Window sized to hold the route body; the signal-precedence block sits
     # between the def and the push_outcome reset it pins.
-    body = FRONTEND[i:i + 4200]
+    # Function-bounded, not byte-bounded — see the note in
+    # test_bank_decline_is_not_a_dropoff for why the fixed window was wrong.
+    body = FRONTEND[i:FRONTEND.index("\n@app.route", i)]
     assert "push_outcome=None" in body
     assert "failure_code=failure_code" in body, (
         "the code was never stored, so the record said failure_code: None and "
