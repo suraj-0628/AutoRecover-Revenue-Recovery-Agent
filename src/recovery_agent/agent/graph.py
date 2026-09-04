@@ -173,8 +173,7 @@ abandoned rather than decided.
 
 YOUR TOOLS (these are the only ones that exist — never invent a name):
   Diagnose:  diagnose_payment_failure, check_payment_status,
-             get_customer_payment_history, query_knowledge_base,
-             discover_recovery_rail, search_memory
+             get_customer_payment_history, query_knowledge_base, search_memory
   Recover:   send_page_push                 (SILENT: the ONE plain nudge, to a
                                               customer still on the checkout.
                                               Costs nothing, carries no offer
@@ -269,6 +268,14 @@ HOW TO WORK — follow this order:
        Nothing was wrong with the customer or their card — our side dropped
        it. There is NO offer rung here at all: discounting our own outage
        pays the customer to forgive us. Retry it.
+
+     Failed, then walked away (declined, saw the alternatives, closed):
+       page_push -> offer -> rail_switch -> voice_call -> alternate_path
+       The briefing says "THEY FAILED, THEN WALKED" when this is the case.
+       Both things are true at once: the instrument let them down AND their
+       appetite is gone. Razorpay already showed them other rails and they
+       closed anyway, so you do not need to prove full price fails — they
+       have shown you. Lead with the reason, keep the route behind it.
 
      They chose not to complete (drop-off, cancelled, abandoned):
        page_push -> offer -> voice_call -> post_call_email -> alternate_path
@@ -694,6 +701,74 @@ _UNAVAILABLE_MODEL = re.compile(
     re.I)
 
 
+# Fallback chain — every entry VERIFIED against the proxy, not assumed.
+#
+# Entry 0 MUST be the configured LLM_MODEL, because that is the model
+# attempt 0 actually invokes (the `else` branch below calls the prebuilt
+# `model`, which _build_model resolves from LLM_MODEL). Naming anything
+# else here does not change which model is called — it only mislabels it,
+# and that label is what lands in the cost ledger and the eval corpus. The
+# head of this list used to read "gemma-4-31b-it" while every first turn
+# was really served by claude-sonnet-4-6.
+#
+# The two gemma entries that used to head the list are gone. Their comments
+# promised "16K RPM / 14K RPD (massive headroom)", but the proxy holds no
+# credentials for the providers that serve them:
+#   gemma-4-31b-it -> 400 ambiguous; both crof/ and bzl/ forms then 404
+#   gemma-4-26b-it -> 404 No active credentials for provider: gemini
+# Headroom on a model you cannot call is not headroom. Sitting at the head
+# of the chain, they cost a wasted round trip on the way to every recovery.
+def _fallback_chain() -> list[str]:
+    """The models agent_node will try, in order, for one turn.
+
+    Ordered by REASONING CAPABILITY, not by rate-limit headroom. It used to be
+    the other way round, and that quietly chose the agent's brain: the primary
+    was quota-exhausted on every turn, so position two — `gemini-3.1-flash-lite`,
+    picked purely for having 500 RPD of room — served 18 of 18 calls across the
+    last four live cases. A *lite* model was deciding whether to discount, whom
+    to call and when to give up, while the config still said Sonnet. Judged on
+    its output the agent looked confused and trigger-happy; it was simply being
+    asked to do a hard job with a small model that nothing announced.
+
+    Headroom still breaks ties, but it no longer outranks being able to think.
+    """
+    override = os.getenv("LLM_FALLBACK_MODELS", "")
+    if override.strip():
+        return [os.getenv("LLM_MODEL", "")] + [
+            m.strip() for m in override.split(",") if m.strip()]
+    return [
+        os.getenv("LLM_MODEL", "no-think/antigravity/claude-sonnet-4-6"),
+        "antigravity/gemini-3.6-flash-high",  # newest, high reasoning effort
+        "antigravity/gemini-2.5-flash",       # fastest (~2s), only 5 RPM
+        "gemini-3.1-flash-lite",              # 500 RPD of room, least capable
+        "auto/best-reasoning",                # router picks; ~50s, last resort
+    ]
+
+
+def _note_model_degraded(pid: str, wanted: str, served: str,
+                         turn: int) -> None:
+    """Record that this turn was answered by something other than the primary.
+
+    Kept deliberately quiet in its failure mode: telemetry must never be the
+    reason a recovery stops. It writes to the case record, which the HUD reads,
+    so the monologue can say the agent is thinking with a smaller model instead
+    of leaving the operator to infer it from the quality of the decisions.
+    """
+    try:
+        from recovery_agent.state_store import StateStore
+        store = StateStore()
+        rec = store.get_payment(pid)
+        if not rec:
+            return
+        seen = list(rec.get("model_degraded") or [])
+        if any(d.get("served") == served for d in seen):
+            return          # one note per substitute model, not one per turn
+        seen.append({"wanted": wanted, "served": served, "turn": turn})
+        store.update_payment(pid, model_degraded=seen)
+    except Exception:
+        pass
+
+
 def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
     """LLM reasons about the payment failure and decides which tools to call.
 
@@ -798,31 +873,18 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
     messages = _trim_tool_results_for_llm(
         _assemble_llm_messages(briefing, state["messages"]))
 
-    # Rate-limit LLM calls to avoid Google upstream 502s
-    # Track last call time across all agent instances
-    if not hasattr(agent_node, '_last_call_time'):
-        agent_node._last_call_time = 0
-    _min_delay = 8.0  # seconds between LLM calls (Google rate limit: ~4 req/20s, need 5s buffer)
-    _elapsed = time.time() - agent_node._last_call_time
-    if _elapsed < _min_delay:
-        time.sleep(_min_delay - _elapsed)
-    agent_node._last_call_time = time.time()
+    # One gate for every model call in the process. The old version was a
+    # module attribute and a sleep: N concurrent sessions — a champion, a
+    # queued exception, a live hand-off — each read the same timestamp, slept
+    # the same delay, and woke TOGETHER, turning an 8-second gap into a burst
+    # of N against the provider's limit. The bucket reserves slots instead, so
+    # simultaneous callers come out spaced and in arrival order, and the time
+    # spent waiting is a number the ops view can show. (Open under pytest, for
+    # the same reason the old gate was.)
+    from recovery_agent.ratelimit import llm_gate
+    llm_gate().acquire()
 
-    # Fallback models — ordered by rate limit headroom (highest first)
-    # gemini-2.5-flash: 5 RPM / 20 RPD (too low)
-    # gemini-3.1-flash-lite: 15 RPM / 500 RPD (3x better)
-    # gemma-4-31b-it: 16K RPM / 14K RPD (massive headroom)
-    # gemma-4-26b-it: 16K RPM / 14K RPD (massive headroom)
-    # auto/best-reasoning: OmniRoute smart routing (picks best available)
-    # no-think/antigravity/claude-sonnet-4-6: works, different provider
-    _fallback_models = [
-        "gemma-4-31b-it",
-        "gemma-4-26b-it",
-        "gemini-3.1-flash-lite",
-        "auto/best-reasoning",
-        "no-think/antigravity/claude-sonnet-4-6",
-        "antigravity/gemini-2.5-flash",  # last resort — 5 RPM limit
-    ]
+    _fallback_models = _fallback_chain()
 
     with traced_span(f"agent_turn_{turn_number}", kind=KIND_CHAIN, tracer=tracer):
         last_error = None
@@ -853,6 +915,15 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
                                        .get("model_name") or current_model)
                         record_llm_usage(pid, model_label,
                                          getattr(response, "usage_metadata", None))
+                        # Which model actually answered is part of the case
+                        # record, not just a console print. The primary being
+                        # exhausted was reported only as `[Agent] Trying
+                        # fallback model:` on the server's stdout, so from the
+                        # HUD a degraded run and a healthy one were identical
+                        # and the agent simply looked bad at its job.
+                        if attempt > 0:
+                            _note_model_degraded(pid, _fallback_models[0],
+                                                 model_label, turn_number)
                         log_decision(pid, turn_number, model_label, briefing_facts,
                                      list(getattr(response, "tool_calls", None) or []))
                     except Exception:
@@ -964,7 +1035,30 @@ def should_continue(state: RecoveryState) -> Literal["tool_repetition_guard", "s
             break
     ai_msgs = [m for m in messages[start:]
                if isinstance(m, AIMessage) and m.tool_calls]
+    #: Tools that FINISH something rather than explore. A run that has decided
+    #: to send the offer, schedule the retry or close the case has done the
+    #: thinking; stopping before the act throws that thinking away.
+    _FINISHING = {"send_recovery_notification", "show_page_offer", "send_page_push",
+                  "retry_in_hours", "escalate_to_human", "close_case",
+                  "wait_for_customer", "generate_recovery_payment_link"}
+
     if len(ai_msgs) >= MAX_TURNS:
+        # ONE grace round, and only for an action that finishes something.
+        #
+        # Live (pay_qssihjc5z): the agent worked out the right move — a
+        # full-price rail switch by email — spent its turns being refused and
+        # re-quoting, and hit the cap with that call pending. The cap threw
+        # away the one correct decision of the run and the customer got
+        # nothing. The cap exists to stop a runaway loop, not to discard a
+        # conclusion, so a finishing call gets to execute exactly once.
+        pending = ([tc["name"] for tc in (last_message.tool_calls or [])]
+                   if isinstance(last_message, AIMessage) and last_message.tool_calls
+                   else [])
+        if (len(ai_msgs) == MAX_TURNS and pending
+                and all(p in _FINISHING for p in pending)):
+            print(f"[Agent] MAX_TURNS={MAX_TURNS} reached, but {pending} finishes "
+                  f"the run — allowing it once", flush=True)
+            return "tool_repetition_guard"
         print(f"[Agent] MAX_TURNS={MAX_TURNS} reached this run, forcing final response",
               flush=True)
         return "stopping_check"
@@ -1124,9 +1218,48 @@ def tool_repetition_guard(state: RecoveryState, config: RunnableConfig = None) -
             # That 400 is what actually broke self_critique, and it is why the
             # model never saw the guard's message and looped on the same tools.
             blocked_set = set(all_blocked)
+
+            # Say WHY it was refused the first time, not merely that it was
+            # asked twice.
+            #
+            # Live (pay_l477mhjef): the link tool was refused because the
+            # customer was mid-payment — a TRANSIENT condition whose refusal
+            # said "call wait_for_customer and let them finish". The agent
+            # re-proposed the same call, and this guard answered "you already
+            # made this exact call", which replaced a reason the agent could
+            # act on with one it could not. Its summary then said the system
+            # was "blocking the creation of a new payment link as I've already
+            # made the request" — it had lost the actual reason. The record
+            # already carries these refusals; surface the matching one.
+            _prior_refusals: dict = {}
+            try:
+                _pid = str(getattr(getattr(getattr(ctx, "case", None), "payment",
+                                           None), "payment_id", "") or "")
+                if _pid:
+                    from recovery_agent.state_store import StateStore
+                    _prior_refusals = (StateStore().get_payment(_pid) or {}).get(
+                        "refusals") or {}
+            except Exception:
+                pass
+
+            def _why_first_time(tool: str) -> str:
+                """The most recent recorded refusal that mentions this tool."""
+                verb = {"generate_recovery_payment_link": "creating a payment link",
+                        "send_recovery_notification": "sending a message",
+                        "show_page_offer": "showing a discount",
+                        "initiate_voice_call": "placing a call"}.get(tool, "")
+                for key in _prior_refusals:
+                    if (verb and key.startswith(verb)) or tool in key:
+                        return key.split(": ", 1)[-1]
+                return ""
+
             reason_by_tool = {}
             for name in blocked:
-                reason_by_tool[name] = "you already made this exact call"
+                why = _why_first_time(name)
+                reason_by_tool[name] = (
+                    f"you already made this exact call, and it was refused "
+                    f"because {why} — that has not changed" if why else
+                    "you already made this exact call")
             for name in blocked_by_doom:
                 reason_by_tool[name] = f"called {tool_call_counts[name]} times already"
 
@@ -1269,6 +1402,39 @@ def mask_tool_outputs_node(state: RecoveryState, config: RunnableConfig = None) 
                 )
             else:
                 masked_messages.append(msg)
+
+        # A REFUSAL THE MODEL CANNOT SKIM PAST.
+        #
+        # Refusals arrived only as tool results — the same channel as ordinary
+        # data — and the model read them as data. Live (pay_l477mhjef) the link
+        # tool said "the customer is mid-payment; call wait_for_customer and
+        # let them finish", and the very next turn re-proposed the identical
+        # call. The instruction was one line long and it skimmed past it.
+        #
+        # So the guidance is repeated in the instruction channel, where the
+        # system prompt lives, naming the tool and the move it must make
+        # instead. Same words, a channel the model cannot treat as payload.
+        _directives: list[str] = []
+        for msg in masked_messages[-6:]:
+            if not isinstance(msg, ToolMessage):
+                continue
+            try:
+                body = json.loads(str(msg.content)[str(msg.content).index("{"):])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(body, dict) or body.get("status") != "blocked":
+                continue
+            guidance = str(body.get("guidance") or "").strip()
+            if guidance:
+                _directives.append(
+                    f"{getattr(msg, 'name', 'that tool')} was REFUSED: "
+                    f"{str(body.get('reason') or '')[:180]} "
+                    f"DO THIS INSTEAD: {guidance}")
+        if _directives:
+            masked_messages = masked_messages + [SystemMessage(
+                content="[Guardrail] " + " | ".join(_directives[-2:]) +
+                        " Do not re-propose a refused call; take the stated "
+                        "alternative or end your turn.")]
 
         _record_attempts_on_case(messages, config)
 

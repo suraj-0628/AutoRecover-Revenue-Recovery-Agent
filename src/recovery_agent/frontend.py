@@ -1329,6 +1329,130 @@ def _wave_autopilot(minutes: float) -> None:
                   f"{payload['cases']} open case(s)", flush=True)
 
 
+@app.route("/api/labels", methods=["GET"])
+def api_labels():
+    """The operator's verdict vocabulary, in render order."""
+    from recovery_agent import labels
+    return jsonify({"labels": labels.choices()})
+
+
+@app.route("/api/cases/<payment_id>/label", methods=["POST"])
+def api_label_case(payment_id: str):
+    """A human's verdict on why an attempt did not land.
+
+    The one verdict deliberately missing is "it succeeded" — money is marked
+    recovered only by the gateway. `paid_outside` closes the case in its own
+    column and adds nothing to recovered totals, so no amount of clicking can
+    inflate the number the batch report calls measured.
+    """
+    from recovery_agent import labels
+    from recovery_agent.agent.classify import classify
+
+    rec = store.get_payment(payment_id)
+    if rec is None:
+        return jsonify({"error": f"unknown case {payment_id!r}"}), 404
+
+    data = request.get_json(silent=True) or {}
+    spec = labels.get(data.get("code"))
+    if spec is None:
+        return jsonify({"error": f"unknown label {data.get('code')!r}",
+                        "labels": [l["code"] for l in labels.choices()]}), 400
+    note = str(data.get("note") or "").strip()[:300]
+    if spec.get("wants_note") and not note:
+        return jsonify({"error": "this label needs a note — it exists for "
+                                 "the answers the list did not anticipate"}), 400
+
+    fields: dict = {"operator_label": {
+        "code": spec["code"], "note": note, "by": "operator",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }}
+    if spec.get("opts_out"):
+        fields["opted_out"] = True
+    if spec.get("settles"):
+        fields["status"] = "settled_outside"
+        fields["closed"] = {
+            "outcome": "settled_outside",
+            "what_happened": (f"operator reports payment arrived outside the "
+                              f"recovery rail. {note}").strip(),
+            "at": fields["operator_label"]["at"],
+            # Deliberately no amount: this money is claimed, not verified.
+        }
+        try:
+            store.cancel_jobs_for(payment_id, "settled outside the rail")
+        except Exception:
+            pass
+    store.update_payment(payment_id, **fields)
+    store.flush()
+
+    fresh = store.get_payment(payment_id) or {}
+    audit.record(audit.CASE_LABELED, payment_id=payment_id,
+                 batch_run_id=fresh.get("batch_run_id") or "",
+                 actor="operator", result=spec["code"], reason=spec["label"],
+                 note=note, rebins_to=classify(fresh),
+                 opted_out=bool(spec.get("opts_out")),
+                 settled_outside=bool(spec.get("settles")))
+    push_event(payment_id, "labeled", {"label": spec["label"],
+                                       "code": spec["code"]})
+    return jsonify({"payment_id": payment_id, "label": spec["code"],
+                    "rebins_to": classify(fresh),
+                    "next": spec.get("next", "")})
+
+
+@app.route("/api/batch-verdicts", methods=["GET"])
+def api_batch_verdicts():
+    """Cases a batch acted on that still need a human's why.
+
+    Acted-but-unpaid is the whole list: paid cases verdict themselves through
+    the gateway, and untouched cases have nothing to explain yet. A case
+    already labeled since its last action drops off — the verdict is in.
+    """
+    out = []
+    for rec in store.payment_values():
+        run_id = rec.get("batch_run_id") or ""
+        if not run_id:
+            continue
+        if str(rec.get("status") or "") in ("recovered", "settled_outside",
+                                            "escalated"):
+            continue
+        acted_at = str(rec.get("batch_attributed_at") or "")
+        label = rec.get("operator_label") or {}
+        if label and str(label.get("at") or "") >= acted_at:
+            continue                      # verdict already in for this attempt
+        last = ""
+        try:
+            for e in reversed(audit.log().for_payment(rec["payment_id"])):
+                if e["kind"] == audit.ACTION_RESULT:
+                    last = f"{e.get('action') or 'acted'} · {e['created_at'][11:16]}"
+                    break
+        except Exception:
+            pass
+        customer = rec.get("customer") or {}
+        out.append({"payment_id": rec["payment_id"],
+                    "amount": float(rec.get("amount") or 0),
+                    "name": customer.get("name") or "",
+                    "batch_run_id": run_id, "acted_at": acted_at,
+                    "last_action": last})
+    out.sort(key=lambda r: r["acted_at"], reverse=True)
+    return jsonify({"verdicts": out[:50]})
+
+
+@app.route("/api/batch-activity", methods=["GET"])
+def api_batch_activity():
+    """The batch engine's feed — a straight read of the append-only log."""
+    try:
+        since = int(request.args.get("since") or 0)
+    except (TypeError, ValueError):
+        since = 0
+    events = audit.log().batch_activity(since_event_id=since, limit=200)
+    from recovery_agent.batch import waves as _waves
+    return jsonify({
+        "events": events,
+        "cursor": events[-1]["event_id"] if events else since,
+        "live": bool([c for c in _waves.all_cycles()
+                      if c.status == _waves.RUNNING]),
+    })
+
+
 @app.route("/api/batch-cycles", methods=["GET"])
 def api_batch_cycles():
     """Every cycle — live ones from the registry, finished ones rebuilt from
@@ -1990,6 +2114,26 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                                 )
             from recovery_agent.economics import record_run_wall
             record_run_wall(payment_id, time.monotonic() - _run_started)
+
+            # If the model that answered was not the model we asked for, say
+            # so on the trail. 18 of 18 calls across four live cases were
+            # served by a flash-LITE model after the primary hit its quota,
+            # and nothing anywhere said so — the operator was left judging the
+            # agent's competence without knowing what was doing the thinking.
+            for note in ((store.get_payment(payment_id) or {}).get(
+                    "model_degraded") or []):
+                key = f"degraded:{note.get('served')}"
+                if key in shown:
+                    continue
+                shown.add(key)
+                emit_thought(
+                    step="model_degraded",
+                    thought=f"[MODEL] Reasoning on {note.get('served')} — "
+                            f"{note.get('wanted')} was unavailable",
+                    detail="The primary model refused this turn (quota or "
+                           "outage) and the run continued on a fallback. "
+                           "Decisions below were made by the smaller model.",
+                )
         except Exception as e:
             # Graph error or LLM unavailable — surface the real error
             try:
