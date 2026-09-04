@@ -683,6 +683,12 @@ def api_drop_reason_skip():
 
     store.update_payment(payment_id, drop_reason_pending=False)
     _do_flush()
+    push_event(payment_id, "reason_skipped", {
+        "step": "awaiting_reason",
+        "msg": "No answer — proceeding on the failure code alone",
+        "detail": "The customer skipped or did not reply. Silence is not "
+                  "recorded as a reason; the agent starts on what it can infer.",
+    })
     socketio.start_background_task(
         run_agent_for_payment, payment_id, float(rec.get("amount") or 0),
         rec.get("failure_reason") or "Payment failed",
@@ -3594,6 +3600,19 @@ def payment_failed():
     if bool(data.get("defer_agent")):
         store.update_payment(payment_id, drop_reason_pending=True)
         _do_flush()
+        # Say so, out loud. Holding was the right call but it emitted nothing,
+        # so the HUD opened a session tab and then showed an empty monologue —
+        # which looks exactly like an agent that has crashed. Correct behaviour
+        # that cannot be seen is indistinguishable from broken behaviour.
+        push_event(payment_id, "awaiting_reason", {
+            "step": "awaiting_reason",
+            "msg": "Holding — asked the customer why they stopped",
+            "detail": ("No error code separates 'no balance' from 'found it "
+                       "cheaper elsewhere', and they need opposite responses. "
+                       "Nothing is sent until they answer, skip, or 2 minutes "
+                       "pass."),
+            "amount": amount,
+        })
         return jsonify({"status": "awaiting_reason", "payment_id": payment_id})
 
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)

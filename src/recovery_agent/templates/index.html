@@ -2085,6 +2085,15 @@
         document.getElementById("p-recovered").className = "step-pill active-recovered";
         document.getElementById("progress-status-label").textContent = "RECORDING OUTCOME";
         fetchMetrics();
+      } else if (data.step === "awaiting_reason") {
+        /* The agent is deliberately doing nothing while the customer answers
+           "why did you stop?". Without this branch the monologue simply went
+           blank, which reads as a crash rather than as restraint. */
+        setStatus("ASKING THE CUSTOMER", "status-thinking");
+        logThoughtWithTier("HOLD", "tag-guardrail", data.msg, data.detail, tier);
+        document.getElementById("p-detect").className = "step-pill active-detect";
+        document.getElementById("progress-status-label").textContent =
+          "WAITING ON THE CUSTOMER";
       } else if (data.step === "harness_start") {
         setStatus("AGENT ACTIVE", "status-thinking");
         logThoughtWithTier("AGENT", "tag-harness", data.msg, data.detail, tier);
@@ -3249,8 +3258,13 @@ function budgetMeter(email, links) {
           '<span class="used" style="width:' + lUsed + '%;background:' + lCol + '"></span>' +
         '</div>' +
         '<div class="cap"><b>' + links.remaining + '</b> left on this account, ' +
-          '<b>ever</b> &mdash; cancelling one does not give it back. Counted ' +
-          'across every case, not just this view.</div>' +
+          '<b>ever</b> &mdash; cancelling one does not give it back.' +
+          (links.baseline
+            ? ' ' + links.from_records + ' minted by the cases on record, plus a ' +
+              links.baseline + ' baseline spent before them: Razorpay will not ' +
+              'report the lifetime figure, so that part is set by hand and is a ' +
+              'floor, not a fact.'
+            : ' Counted across every case, not just this view.') + '</div>' +
       '</div>';
   }
   return out;
