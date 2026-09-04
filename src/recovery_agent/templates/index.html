@@ -930,6 +930,10 @@
     #view-ops .ops-grid > :nth-child(n+5),
     #view-batches .batch-grid > :nth-child(n+5) { animation-delay: .14s }
 
+    /* Applied by playEnter() to anything shown via JS rather than a class:
+       the live workspace, its header, and the two customer-view panels. */
+    .view-enter { animation: viewEnter .24s cubic-bezier(.2,.7,.3,1) both }
+
     /* The fetch, made visible. Fixed to the top of the content area so it
        reads as "this screen is loading" rather than belonging to any card. */
     #view-progress {
@@ -969,7 +973,7 @@
        movement — the information is in the numbers, not the animation. */
     @media (prefers-reduced-motion: reduce) {
       .batchview.on, #view-ops .ops-grid > *, #view-batches .batch-grid > *,
-      #view-policy .batch-card { animation: none }
+      #view-policy .batch-card, .view-enter { animation: none }
       #view-progress::after { animation: none; width: 100% }
       .rail-btn:active, .toggle-btn:active, .btn-batch:active:enabled {
         transform: none }
@@ -1641,13 +1645,23 @@
         btnStore.classList.remove("active");
         canvasMode.style.display = "flex";
         storeMode.style.display = "none";
+        playEnter(canvasMode);
       } else {
         btnStore.classList.add("active");
         btnCanvas.classList.remove("active");
         storeMode.style.display = "block";
         canvasMode.style.display = "none";
+        playEnter(storeMode);
+        /* Load the checkout ONCE. This reassigned src on every switch, so
+           returning to the store tore down a working iframe and rebuilt it —
+           a white flash and a fresh page load each time, which is most of
+           what made this panel feel rough. A customer mid-payment would have
+           had the page pulled out from under them. */
         const iframe = document.getElementById("store-iframe");
-        if (iframe) iframe.src = "/pay";
+        if (iframe && !iframe.dataset.loaded) {
+          iframe.src = "/pay";
+          iframe.dataset.loaded = "1";
+        }
       }
     }
 
@@ -2425,8 +2439,14 @@ function showView(which) {
   const isOps = which === "ops";
   const isPolicy = which === "policy";
   const away = isBatch || isOps || isPolicy;
+  var backToLive = !away && live && live.style.display === "none";
   if (live) live.style.display = away ? "none" : "";
   if (hdr) hdr.style.display = away ? "none" : "";
+  /* The other three views animate through .batchview.on; the live view is
+     shown by clearing an inline display, which no CSS transition can see.
+     Without this, three of four views faded in and the fourth snapped — and
+     the odd one out is the screen people return to most. */
+  if (backToLive) { playEnter(hdr); playEnter(live); }
   batches.classList.toggle("on", isBatch);
   if (ops) ops.classList.toggle("on", isOps);
   if (policy) policy.classList.toggle("on", isPolicy);
@@ -2444,6 +2464,17 @@ function showView(which) {
     pending.then(function () { showViewProgress(false); },
                  function () { showViewProgress(false); });
   }
+}
+
+/* Replays an enter animation on an element that is shown by JS rather than
+   by a class. Removing the class is not enough on its own — the browser
+   coalesces the remove and the add into no change at all, so the layout has
+   to be read in between to force the restart. */
+function playEnter(el) {
+  if (!el) return;
+  el.classList.remove("view-enter");
+  void el.offsetWidth;
+  el.classList.add("view-enter");
 }
 
 var _progressTimer = null;
