@@ -274,3 +274,49 @@ def test_a_repeat_after_a_transient_refusal_still_names_the_real_reason(store):
     assert body["status"] == "blocked"
     assert "mid-payment" in body["reason"], \
         "the agent must be told what actually blocks it, not just that it repeated"
+
+
+def test_every_way_of_walking_away_asks_first():
+    """There are two ways out of the checkout and only one of them asked.
+
+    A dismissal after a failed attempt was handled; a plain walk-away was
+    not — which had it backwards, because a plain dismissal carries NO error
+    code at all, so the customer's answer is the only evidence that will ever
+    exist. Live (pay_kaagj53tv), someone closed the modal and got a "Complete
+    your order" push before being asked anything.
+    """
+    import re
+    import recovery_agent.frontend as F
+    page = Path(F.__file__).read_text()
+    page = page[page.index('PAY_PAGE = r"""'):]
+
+    calls = []
+    for m in re.finditer(r"triggerRecovery\(\{", page):
+        seg = page[m.start():m.start() + 340]
+        calls.append(" ".join(seg[:seg.find(");") + 2].split()))
+
+    leaving = [c for c in calls if "customer_cancelled" in c]
+    assert len(leaving) == 2, "both exits from the checkout must be covered"
+    for c in leaving:
+        assert c.rstrip().endswith(", true);"), f"does not hold the agent: {c}"
+
+
+def test_a_customer_still_on_the_page_is_not_interrogated():
+    """The question is for someone who LEFT. A decline they are looking at,
+    or a rail they just switched to, is a live signal the agent should act on
+    immediately — holding those would stall a customer who is still trying."""
+    import re
+    import recovery_agent.frontend as F
+    page = Path(F.__file__).read_text()
+    page = page[page.index('PAY_PAGE = r"""'):]
+
+    engaged = []
+    for m in re.finditer(r"triggerRecovery\(\{", page):
+        seg = page[m.start():m.start() + 340]
+        call = " ".join(seg[:seg.find(");") + 2].split())
+        if "customer_cancelled" not in call:
+            engaged.append(call)
+
+    assert engaged, "the gateway-failure and method-switch paths still exist"
+    for c in engaged:
+        assert not c.rstrip().endswith(", true);"), f"should not hold: {c[:90]}"

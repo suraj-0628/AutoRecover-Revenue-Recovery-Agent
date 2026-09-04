@@ -2878,10 +2878,21 @@ function startPayment() {
         askWhyTheyStopped();
         return;
       }
+      /* The OTHER way out of a checkout: dismissed without ever attempting a
+         payment. This path did not ask, which had it exactly backwards — a
+         plain walk-away carries NO error code at all, so there is nothing to
+         infer from and the customer's own answer is the only evidence there
+         will ever be. Live (pay_kaagj53tv), someone closed the modal and got
+         a "Complete your order" push before being asked anything.
+
+         Same contract as the branch above: hold the agent, ask, and let the
+         answer — or Skip, or the timeout — decide what it does. */
       showStatus("failed", "Payment cancelled. Our agent will help you recover it.");
       btn.disabled = false; btn.innerHTML = "Retry Payment";
-      triggerRecovery({code:"customer_cancelled", reason:"Payment cancelled by customer", source:"customer", step:"payment_processing"});
-      _flushHeldPush();
+      triggerRecovery({code:"customer_cancelled",
+                       reason:"Payment cancelled by customer",
+                       source:"customer", step:"payment_processing"}, true);
+      askWhyTheyStopped();
     }}});
     rzp.on("payment.failed", function(r) {
       showStatus("failed", "Payment couldn't be processed: " + r.error.description);
