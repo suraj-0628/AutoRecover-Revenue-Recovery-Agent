@@ -81,6 +81,27 @@ _UNKNOWN: list[tuple[str, str]] = [
     ("alternate_path", "a different route than the ones already tried"),
 ]
 
+#: They hit a real failure, saw the alternatives, and stopped anyway.
+#:
+#: This is neither a plain bank decline nor a plain drop-off, and treating it
+#: as either gets it wrong. A pure drop-off never tried: nothing is broken, so
+#: price is the only lever. A plain method failure IS still trying: the rail is
+#: the problem, and a discount does not fix a refused instrument. But someone
+#: who was declined, was offered other rails by Razorpay's own screen, and
+#: cancelled has demonstrated BOTH — the instrument failed them and their
+#: appetite is gone. So the route and the reason are both worth offering, with
+#: the reason first, because the alternatives have already been in front of
+#: them once and did not move them.
+_HESITANT: list[tuple[str, str]] = [
+    ("page_push", "silent in-page notification"),
+    ("offer", "the discount — their reluctance is already demonstrated, so "
+              "price is a fair lever here"),
+    ("rail_switch", "a working rail at the discounted price, if the offer "
+                    "alone does not move them"),
+    ("voice_call", "voice call to ask why and negotiate within policy"),
+    ("alternate_path", "a different route than the ones already tried"),
+]
+
 RUNGS_BY_KIND: dict[str, list[tuple[str, str]]] = {
     "dropoff": _DROPOFF,
     "method": _METHOD,
@@ -109,9 +130,62 @@ def kind_of(record: dict) -> str:
         return "unknown"
 
 
+def abandoned_after_failure(record: dict) -> bool:
+    """Did the customer hit a real failure and then give up on their own?
+
+    Set at ingress when a cancellation arrives on a case that already carries
+    a gateway failure. It does not change the DIAGNOSIS — the bank really did
+    decline — it records that the customer has since seen the alternatives and
+    walked, which is the evidence a method case otherwise earns by trying full
+    price first.
+    """
+    return bool(record.get("abandoned_after_failure"))
+
+
+def _entry_rung(record: dict) -> str:
+    """The rung the customer's own answer starts us on, if it names one."""
+    code = (record.get("drop_reason") or {}).get("code") or ""
+    if not code:
+        return ""
+    try:
+        from recovery_agent.drop_reasons import get as _reason
+        return (_reason(code) or {}).get("entry_rung") or ""
+    except Exception:
+        return ""
+
+
 def rungs_for(record: dict) -> list[tuple[str, str]]:
-    """The ladder that belongs to this failure."""
-    return RUNGS_BY_KIND.get(kind_of(record), _UNKNOWN)
+    """The ladder that belongs to this failure, entered where the customer put us.
+
+    The stated reason used to pick the ladder and then say nothing about where
+    on it to start, so testimony could only ever VETO a discount (`offer_ok`)
+    and never reach for one. A customer who answered "I found a better price
+    elsewhere" still got rung one of the drop-off ladder — a page push reading
+    "You left this payment incomplete. Can we help?" and a five-minute wait —
+    while the briefing above it said, correctly, that a discount is the one
+    thing that answers a price objection and to offer it promptly
+    (pay_p9c6jv4x1). The advice changed; the plan did not, and the plan is
+    what the agent follows.
+
+    Rungs BEFORE the named one are dropped rather than marked climbed: they
+    were not attempted, and recording attempts that never happened would be a
+    lie the rest of the ladder reasons from.
+    """
+    kind = kind_of(record)
+    # Someone who failed AND then walked is on neither the "still trying"
+    # ladder nor the "nothing broke" one — see _HESITANT.
+    if abandoned_after_failure(record) and kind in ("method", "unknown"):
+        ladder = _HESITANT
+    else:
+        ladder = RUNGS_BY_KIND.get(kind, _UNKNOWN)
+
+    entry = _entry_rung(record)
+    if entry:
+        for i, (key, _label) in enumerate(ladder):
+            if key == entry:
+                # Never climb BACK to a rung already used; only skip forward.
+                return ladder[i:] if i else ladder
+    return ladder
 
 
 def has_rung(record: dict, key: str) -> bool:

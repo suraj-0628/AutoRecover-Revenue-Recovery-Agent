@@ -54,7 +54,13 @@ def test_no_balance_becomes_a_timing_problem():
 def test_a_better_price_elsewhere_becomes_a_price_problem():
     assert failure_kind(said("better_price")) == "dropoff"
     rungs = [k for k, _ in ladder.rungs_for(said("better_price"))]
-    assert rungs.index("offer") == 1, "the discount is the answer here"
+    # FIRST, not second. This asserted index 1 — the discount sitting behind
+    # the drop-off ladder's opening page push — which is how pay_p9c6jv4x1 met
+    # a stated price objection with "You left this payment incomplete. Can we
+    # help?" and a five-minute wait. The intent in the message below was always
+    # right; the position encoded the opposite of it.
+    assert rungs.index("offer") == 0, "the discount is the answer here"
+    assert "page_push" not in rungs
 
 
 def test_the_two_diverge_from_an_identical_failure():
