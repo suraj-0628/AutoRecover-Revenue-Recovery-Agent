@@ -96,12 +96,19 @@ def _fallback_models() -> list[str]:
     heuristics. A remote endpoint gets one honest attempt instead of three
     fictional ones.
     """
+    extra = [m.strip() for m in os.getenv("LLM_FALLBACK_MODELS", "").split(",")
+             if m.strip()]
+    if extra:
+        # Explicit config wins, on any endpoint. This used to be ignored on
+        # localhost while graph._fallback_chain honoured it, so the same env
+        # var produced two different chains in one process — the sort of split
+        # that is invisible until a fallback silently does nothing.
+        return extra
     base_url = os.getenv("LLM_BASE_URL", "http://localhost:20128/v1")
     host = (urlparse(base_url).hostname or "").lower()
     if host in ("localhost", "127.0.0.1", "::1"):
         return list(DEFAULT_MODELS)
-    extra = os.getenv("LLM_FALLBACK_MODELS", "")
-    return [m.strip() for m in extra.split(",") if m.strip()]
+    return []
 
 
 def get_llm(
