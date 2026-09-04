@@ -240,6 +240,57 @@ def _reconcile_voice_costs() -> None:
         print(f"[daemon] voice cost reconcile failed: {e}", file=sys.stderr)
 
 
+#: How long a case may sit waiting for the customer to say why they stopped.
+#: The checkout gives them 2 minutes; this is the backstop for the answer that
+#: never comes because the tab was closed, so it must be longer than that.
+DROP_REASON_GRACE = int(os.getenv("DROP_REASON_GRACE_SECONDS", "300"))
+
+
+def _release_stranded_holds() -> int:
+    """Start the agent on cases whose "why did you stop?" was never answered.
+
+    The hold was released by a setTimeout in the customer's browser and by
+    nothing else, so closing the tab stranded the case: pending forever, agent
+    never started, revenue never chased. Waiting for an answer is right;
+    waiting for one that cannot arrive is a silent dropped case.
+
+    Uses the same endpoint the Skip button does, so a swept case follows the
+    identical path as a customer who declined to answer — one behaviour to
+    reason about, not two.
+    """
+    from recovery_agent.state_store import StateStore
+
+    store = StateStore()
+    store.refresh()
+    now = datetime.now(timezone.utc)
+    released = 0
+    for pid, rec in list((store.all_payments() or {}).items()):
+        if not (rec or {}).get("drop_reason_pending"):
+            continue
+        stamp = rec.get("drop_reason_pending_at")
+        if stamp:
+            try:
+                age = (now - datetime.fromisoformat(stamp)).total_seconds()
+            except (TypeError, ValueError):
+                age = DROP_REASON_GRACE + 1     # unparseable: treat as stale
+        else:
+            age = DROP_REASON_GRACE + 1         # pre-dates the stamp: sweep it
+        if age < DROP_REASON_GRACE:
+            continue
+        try:
+            req = urllib.request.Request(
+                f"{FRONTEND_URL}/api/drop-reason/skip",
+                data=json.dumps({"payment_id": pid}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10):
+                released += 1
+        except Exception as e:
+            print(f"[daemon] Could not release {pid}: {e}", file=sys.stderr)
+    return released
+
+
 def daemon_loop():
     """Main daemon loop — polls every POLL_INTERVAL seconds."""
     print(f"[daemon] Starting daemon worker (poll interval: {POLL_INTERVAL}s)")
@@ -253,6 +304,14 @@ def daemon_loop():
                 print(f"[daemon] Processed {executed} retry job(s)")
         except Exception as e:
             print(f"[daemon] Error in daemon loop: {e}", file=sys.stderr)
+
+        try:
+            released = _release_stranded_holds()
+            if released:
+                print(f"[daemon] Released {released} case(s) stuck waiting "
+                      f"for a drop reason")
+        except Exception as e:
+            print(f"[daemon] Error releasing holds: {e}", file=sys.stderr)
 
         now = time.monotonic()
         if now - last_reconcile >= VOICE_RECONCILE_INTERVAL:

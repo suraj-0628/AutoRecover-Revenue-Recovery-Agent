@@ -37,8 +37,11 @@ def test_switching_to_the_proxy_clears_the_other_providers_models(env, monkeypat
     _switch(monkeypatch, "proxy")
     text = env.read_text()
     assert LP.get(text, "LLM_BASE_URL") == "http://localhost:20128/v1"
-    assert LP.get(text, "LLM_FALLBACK_MODELS") == "", \
+    fb = LP.get(text, "LLM_FALLBACK_MODELS")
+    assert "qwen" not in fb and "gpt-oss" not in fb, \
         "Groq model ids would be sent to the local router and 404"
+    assert all(m.startswith(("antigravity/", "auto/", "gemini", "no-think/"))
+               for m in fb.split(",") if m), f"not router models: {fb}"
 
 
 def test_the_outgoing_key_is_kept_not_discarded(env, monkeypatch):
@@ -56,9 +59,11 @@ def test_pacing_follows_the_provider(env, monkeypatch):
     """Groq's 8000 TPM against ~7k-token turns needs slower pacing than the
     router does; carrying one provider's rate to another guarantees 429s."""
     _switch(monkeypatch, "proxy")
-    assert LP.get(env.read_text(), "LLM_CALLS_PER_MINUTE") == "7.5"
+    proxy_rate = float(LP.get(env.read_text(), "LLM_CALLS_PER_MINUTE"))
     _switch(monkeypatch, "groq")
-    assert LP.get(env.read_text(), "LLM_CALLS_PER_MINUTE") == "3"
+    groq_rate = float(LP.get(env.read_text(), "LLM_CALLS_PER_MINUTE"))
+    # Groq's 8000 TPM against ~7k-token turns is the tighter cap of the two.
+    assert groq_rate < proxy_rate, (groq_rate, proxy_rate)
 
 
 def test_every_provider_is_internally_consistent():

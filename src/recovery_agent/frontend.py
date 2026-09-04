@@ -3048,7 +3048,16 @@ function startPayment() {
       showStatus("failed", "Payment couldn't be processed: " + r.error.description);
       btn.disabled = false; btn.innerHTML = "Retry Payment";
       showDeclineWall(r.error.code || "failed", r.error.description);
-      triggerRecovery({code:r.error.code || "technical_error", reason:r.error.description || r.error.reason || "Payment failed", source:r.error.source || "gateway", step:r.error.step || "payment_processing"});
+      /* Record the decline, but DO NOT start the agent yet. The customer is
+         still standing in the Razorpay modal with its other rails in front of
+         them, and the agent starting here reasoned to completion and committed
+         to a page push before anyone had asked why they stopped — a push that
+         renders under the iframe they are still using (pay_glpfpyq90). Holding
+         the notification was never enough: the DECISION is what has to wait,
+         because a decision taken before the reason is known cannot use it.
+         The close is the signal that they are done trying; `ondismiss` then
+         asks why and releases the agent with the answer in hand. */
+      triggerRecovery({code:r.error.code || "technical_error", reason:r.error.description || r.error.reason || "Payment failed", source:r.error.source || "gateway", step:r.error.step || "payment_processing"}, true);
       /* LET THEM TRY. Razorpay's own screen offers other rails after a
          decline, and a customer reaching for UPI themselves is the cheapest
          recovery there is — it costs us no link, no discount and no message.
@@ -3754,7 +3763,13 @@ def payment_failed():
     # answer for which a discount is useless and a link is a link nobody can
     # pay. The reply arrives seconds later; the case can wait that long.
     if bool(data.get("defer_agent")):
-        store.update_payment(payment_id, drop_reason_pending=True)
+        # Stamped, because the only thing that released this hold was a
+        # setTimeout in the customer's browser. Close the tab and the case
+        # waited for an answer that could no longer arrive — forever, with no
+        # agent and no recovery. The daemon sweeps stale holds using this.
+        store.update_payment(payment_id, drop_reason_pending=True,
+                             drop_reason_pending_at=datetime.now(timezone.utc)
+                             .isoformat())
         _do_flush()
         # Say so, out loud. Holding was the right call but it emitted nothing,
         # so the HUD opened a session tab and then showed an empty monologue —

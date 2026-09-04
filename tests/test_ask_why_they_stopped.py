@@ -301,22 +301,36 @@ def test_every_way_of_walking_away_asks_first():
         assert c.rstrip().endswith(", true);"), f"does not hold the agent: {c}"
 
 
-def test_a_customer_still_on_the_page_is_not_interrogated():
-    """The question is for someone who LEFT. A decline they are looking at,
-    or a rail they just switched to, is a live signal the agent should act on
-    immediately — holding those would stall a customer who is still trying."""
+def test_a_customer_actively_switching_rails_is_not_interrogated():
+    """Still-trying and still-present are not the same thing.
+
+    This rule used to cover the gateway failure too, on the reasoning that a
+    decline the customer is looking at is a live signal worth acting on. In
+    practice that let the agent reason to a conclusion and commit to a page
+    push while they were still inside the Razorpay modal — a push that renders
+    under the iframe (pay_glpfpyq90) — and it did so without the one piece of
+    evidence that separates "no balance" from "found it cheaper", because
+    nobody had been asked yet. Holding the notification did not help: the
+    DECISION was already made, and a decision taken before the reason is known
+    cannot use it.
+
+    So the gateway failure now waits for the close, which is the customer's own
+    signal that they are done trying. A METHOD SWITCH still does not wait — a
+    customer reaching for UPI themselves is actively paying, and interrupting
+    that to ask why they stopped would be both wrong and rude.
+    """
     import re
     import recovery_agent.frontend as F
     page = Path(F.__file__).read_text()
     page = page[page.index('PAY_PAGE = r"""'):]
 
-    engaged = []
+    switches = []
     for m in re.finditer(r"triggerRecovery\(\{", page):
         seg = page[m.start():m.start() + 340]
         call = " ".join(seg[:seg.find(");") + 2].split())
-        if "customer_cancelled" not in call:
-            engaged.append(call)
+        if "method_switch" in call:
+            switches.append(call)
 
-    assert engaged, "the gateway-failure and method-switch paths still exist"
-    for c in engaged:
+    assert switches, "the method-switch path still exists"
+    for c in switches:
         assert not c.rstrip().endswith(", true);"), f"should not hold: {c[:90]}"
