@@ -1420,22 +1420,29 @@
 
         <!-- View Switcher -->
         <div class="view-toggle-bar">
-          <button class="toggle-btn active" id="btn-view-canvas" onclick="switchRightPanelTab('canvas')">
-            Canvas View
-          </button>
-          <button class="toggle-btn" id="btn-view-store" onclick="switchRightPanelTab('store')">
+          <button class="toggle-btn active" id="btn-view-store" onclick="switchRightPanelTab('store')">
             Store Checkout (/pay)
+          </button>
+          <!-- Second, and named for what it is. This panel loads no SDK, opens
+               no checkout and registers no presence, so the agent's page push
+               is correctly refused against it — the recovery ladder cannot
+               start here. The real surface is the default for that reason. -->
+          <button class="toggle-btn" id="btn-view-canvas" onclick="switchRightPanelTab('canvas')">
+            Preview (mock)
           </button>
         </div>
       </div>
 
       <!-- Real Store View Mode (/pay embedded iframe) -->
-      <div id="store-view-mode" style="display:none; height:calc(100% - 40px); padding:8px; background:#0d1117;">
-        <iframe src="/pay" id="store-iframe" style="width:100%; height:100%; border:none; border-radius:4px; background:#ffffff;"></iframe>
+      <div id="store-view-mode" style="height:calc(100% - 40px); padding:8px; background:#0d1117;">
+        <!-- data-loaded is set here because src is too: without it the first
+             switch would reassign src and reload a checkout that is already
+             up, which is the flash this panel used to have. -->
+        <iframe src="/pay" id="store-iframe" data-loaded="1" style="width:100%; height:100%; border:none; border-radius:4px; background:#ffffff;"></iframe>
       </div>
 
       <!-- Generative Canvas View Mode -->
-      <div class="panel-body canvas-container" id="canvas-view-mode">
+      <div class="panel-body canvas-container" id="canvas-view-mode" style="display:none">
         
         <!-- Business Scenario Context Bar -->
         <div class="biz-context-bar" id="biz-context-bar">
@@ -1454,7 +1461,7 @@
               <span style="color:#58a6ff; font-weight:800;">Razorpay</span> Standard Checkout v2
             </div>
             <div class="rzp-trust-badge">
-              API Verified
+              Mock UI
             </div>
           </div>
 
@@ -1486,7 +1493,7 @@
           <!-- Morph Container -->
           <div id="morph-container">
             <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504')">
-              Pay Now
+              Simulate a gateway failure
             </button>
           </div>
         </div>
