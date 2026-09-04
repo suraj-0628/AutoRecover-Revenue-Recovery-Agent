@@ -13,10 +13,19 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
+    """Bind the endpoint's own store, as the sibling suites do.
+
+    `frontend.store` is captured at import, so resetting the singleton is not
+    enough — whichever test ran last leaves that name pointing at its own
+    temp directory, and these tests then read a different store from the one
+    the route writes to.
+    """
     from recovery_agent import state_store
+    from recovery_agent import frontend as F
     monkeypatch.setattr(state_store, "_DATA_DIR", tmp_path)
     monkeypatch.setenv("STATE_DIR", str(tmp_path))
     state_store.StateStore.reset_instances()
+    monkeypatch.setattr(F, "store", state_store.StateStore())
     yield
     state_store.StateStore.reset_instances()
 
@@ -49,7 +58,8 @@ def test_a_deferred_case_still_knows_who_to_contact(monkeypatch):
                         lambda *a, **k: started.setdefault("args", a))
     c = frontend.app.test_client()
     _fail(c, "pay_c2", defer_agent=True)
-    c.post("/api/drop-reason/skip", json={"payment_id": "pay_c2"})
+    rel = c.post("/api/drop-reason/skip", json={"payment_id": "pay_c2"})
+    assert rel.get_json().get("status") == "released", rel.get_json()
     # run_agent_for_payment(payment_id, amount, reason, customer, ...)
     assert started["args"][4] == CUST, "agent was released without the customer"
 
