@@ -763,30 +763,6 @@
     }
 
     /* Voice Call Player Widget */
-    .voice-widget {
-      width: 100%;
-      max-width: 460px;
-      background: #161b22;
-      border: 1px solid var(--accent-purple);
-      border-radius: 6px;
-      padding: 12px;
-      margin-top: 10px;
-      display: none;
-    }
-    .voice-widget.active { display: block; }
-    .btn-voice-audio {
-      background: #21262d;
-      color: var(--accent-purple);
-      border: 1px solid var(--accent-purple);
-      padding: 4px 10px;
-      border-radius: 4px;
-      font-size: 0.72rem;
-      font-weight: 600;
-      font-family: var(--font-mono);
-      cursor: pointer;
-      margin-top: 6px;
-    }
-    .btn-voice-audio:hover { background: var(--accent-purple); color: #0d1117; }
 
     /* View Switcher */
     .view-toggle-bar {
@@ -1109,6 +1085,14 @@
     /* Batches with nothing in them collapse to one quiet row: still visible —
        an empty batch says that failure class is not happening — without four
        hollow cards claiming a third of the screen. */
+    .wave-bar { display: flex; align-items: center; gap: 14px;
+                padding: 10px 16px; margin-bottom: 16px;
+                border: 1px solid var(--border-color); border-radius: 8px }
+    .wave-bar .wave-note { font-size: 10.5px; color: var(--text-muted);
+                           flex: 1 }
+    .wave-bar .wave-note .won { color: var(--accent-green) }
+    .wave-bar .wave-note.live { color: var(--accent-amber) }
+
     .batch-quiet { margin-top: 14px; padding: 10px 16px; border: 1px dashed var(--border-color);
                    border-radius: 8px; display: flex; align-items: center; gap: 8px;
                    flex-wrap: wrap; font-size: 10.5px; color: var(--text-muted) }
@@ -1491,29 +1475,12 @@
           </div>
 
           <!-- Morph Container -->
-          <div id="morph-container">
-            <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504')">
-              Simulate a gateway failure
-            </button>
-          </div>
-        </div>
-
-        <!-- Voice Call Player Widget -->
-        <div class="voice-widget" id="voice-widget">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-weight:600; color:var(--accent-purple); font-size:0.8rem;">Voice AI Call Active</span>
-            <span style="font-size:0.72rem; color:var(--accent-green);">[CONNECTED]</span>
-          </div>
-          <div style="font-size:0.78rem; color:var(--text-main); font-style:italic; background:#0d1117; padding:8px; border-radius:4px; margin-top:8px; border:1px solid #21262d;" id="voice-transcript">
-            "Voice call will appear here when triggered..."
-          </div>
-          <button class="btn-voice-audio" onclick="speakHinglish('Voice call replay not available. Trigger a voice call scenario first.')">
-            Replay Voice Agent Call
+          <button style="width:100%; background:#238636; color:#fff; border:1px solid #2ea043; padding:10px; border-radius:4px; font-weight:600; cursor:pointer; font-family:var(--font-mono);" id="pay-now-btn" onclick="startPaymentFromCanvas('Gateway Timeout 504')">
+            Simulate a gateway failure
           </button>
         </div>
 
-        <!-- Live 5-Step Recovery Progress Tracker Bar -->
-        <div class="recovery-progress-bar" id="recovery-progress-bar">
+        <div class="recovery-progress-bar">
           <div class="progress-title">
             <span>Intervention Pipeline</span>
             <span style="color:var(--accent-blue);" id="progress-status-label">IDLE</span>
@@ -1635,7 +1602,6 @@
     const toolArgs = document.getElementById("tool-args");
     const toolKv = document.getElementById("tool-kv");
     const toolStatus = document.getElementById("tool-status");
-    const voiceWidget = document.getElementById("voice-widget");
 
     let activePaymentId = "";
     let lastTier = "";
@@ -1737,16 +1703,6 @@
     function setStatus(text, cls) {
       statusPill.textContent = text;
       statusPill.className = "status-pill " + cls;
-    }
-
-    function speakHinglish(text) {
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = 'hi-IN';
-        utterance.rate = 0.95;
-        window.speechSynthesis.speak(utterance);
-      }
     }
 
     fetchMetrics();
@@ -1953,7 +1909,6 @@
     }
 
     function triggerScenario(name) {
-      voiceWidget.classList.remove("active");
       resetProgressPills();
       document.getElementById("progress-status-label").textContent = "SIMULATING...";
       fetch("/api/simulate/" + name, { method: "POST" })
@@ -2869,6 +2824,86 @@ function batchLine(r) {
   return bits.join(" \u00b7 ");
 }
 
+/* Waves: the whole board, worked in re-binning passes. One button because it
+   is one decision — everything else (plans per bin, budgets, stopping, the
+   audit trail) is the same machinery the per-batch Run uses. */
+function runWaves() {
+  const btn = document.getElementById("run-waves");
+  const note = document.getElementById("wave-note");
+  btn.disabled = true;
+  note.className = "wave-note"; note.textContent = "starting the cycle...";
+  fetch("/api/batches/waves", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({settle_seconds: 45, max_waves: 3})})
+    .then(r => r.json()).then(function (d) {
+      if (d.error) {
+        note.textContent = d.error; btn.disabled = false; return;
+      }
+      btn.disabled = false;
+      btn.className = "btn-batch stop"; btn.textContent = "Abort";
+      btn.onclick = function () { abortWaves(d.cycle_id); };
+      pollWaves(d.cycle_id, 0, false);
+    }).catch(function () {
+      note.textContent = "could not start"; btn.disabled = false;
+    });
+}
+
+function abortWaves(cycleId) {
+  document.getElementById("run-waves").disabled = true;
+  fetch("/api/batch-cycles/" + cycleId + "/abort", {method: "POST",
+        headers: {"Content-Type": "application/json"}, body: "{}"})
+    .then(r => r.json()).catch(function () {});
+}
+
+function pollWaves(cycleId, tries, refreshed) {
+  fetch("/api/batch-cycles/" + cycleId).then(r => r.json()).then(function (c) {
+    const note = document.getElementById("wave-note");
+    const btn = document.getElementById("run-waves");
+    if (!note || c.error) { return; }
+    note.className = "wave-note" + (c.status === "running" ? " live" : "");
+    note.innerHTML = waveLine(c);
+    if (c.status === "running" && tries < 600) {
+      setTimeout(function () { pollWaves(cycleId, tries + 1, refreshed); }, 2000);
+      return;
+    }
+    if (btn) {
+      btn.className = "btn-batch"; btn.textContent = "Run waves";
+      btn.disabled = false;
+      btn.onclick = runWaves;
+    }
+    if (!refreshed) {
+      loadBatches().then(function () { pollWaves(cycleId, tries, true); });
+      return;
+    }
+    /* Money keeps arriving after the last wave; keep the line honest. */
+    if (tries < 60) {
+      setTimeout(function () { pollWaves(cycleId, tries + 1, true); }, 15000);
+    }
+  }).catch(function () {});
+}
+
+function waveLine(c) {
+  const waves = c.waves || [];
+  const bits = [];
+  if (c.status === "running") {
+    const w = waves[waves.length - 1];
+    bits.push("wave " + (w ? w.wave : 1) + " of " + c.config.max_waves);
+  } else {
+    bits.push(waves.length + " wave" + (waves.length === 1 ? "" : "s") +
+              " \u00b7 stopped: " + esc(c.stop_reason || "?"));
+  }
+  const acted = waves.reduce(function (n, w) { return n + w.acted; }, 0);
+  if (acted) { bits.push("acted " + acted + " of " + c.cases); }
+  if (c.recovered_paise) {
+    bits.push("<span class=\"won\">recovered " +
+              inr(c.recovered_rupees) + "</span>");
+  }
+  if ((c.exceptions || []).length) {
+    bits.push(c.exceptions.length + " on the agent's desk");
+  }
+  return bits.join(" \u00b7 ");
+}
+
 /* Keep the rail badge honest even while you are on the live view. */
 setInterval(function () {
   fetch("/api/batches").then(r => r.json()).then(function (d) {
@@ -2907,6 +2942,14 @@ loadBatches();
       clock or a person, and there is nothing a bulk run could add.
     </div>
     <div class="batch-stats" id="batch-stats"></div>
+    <div class="wave-bar" id="wave-bar">
+      <button class="btn-batch" id="run-waves" onclick="runWaves()"
+              title="Bin every open case, apply one plan per bin, wait for money, re-bin what is left, repeat. Stops when a wave changes nothing.">
+        Run waves</button>
+      <span class="wave-note" id="wave-note">work every batch in
+        re-binning waves &mdash; recovered money is counted live, second
+        touches go to the agent, not to a louder inbox</span>
+    </div>
     <div class="batch-grid" id="batch-grid"></div>
     <div class="batch-quiet" id="batch-quiet" style="display:none"></div>
   </section>
