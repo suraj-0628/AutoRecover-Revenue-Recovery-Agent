@@ -1691,25 +1691,36 @@
     }
 
     function fetchMetrics() {
-      fetch("/api/payments")
+      /* One source for the banner and the ops screen, so they cannot
+         disagree. This used to do its own arithmetic over /api/payments and
+         got two things wrong: it summed each case's ORIGINAL amount as
+         "recovered", so an order settled at a discount reported the full
+         price rather than the money that actually arrived; and it counted
+         every payment on record as "at risk", including the recovered ones.
+         economics.summarise() computes all three from recovered_amount, and
+         the OPS view reads the same figures. */
+      fetch("/api/economics")
         .then(r => r.json())
         .then(data => {
-          const payments = data.payments || [];
-          let risk = 0;
-          let recovered = 0;
-
-          payments.forEach(p => {
-            const amt = floatVal(p.amount);
-            risk += amt;
-            if (p.status === "recovered") {
-              recovered += amt;
-            }
-          });
-
-          document.getElementById("kpi-risk").textContent = "INR " + risk.toLocaleString('en-IN', { minimumFractionDigits: 2 });
-          document.getElementById("kpi-recovered").textContent = "INR " + recovered.toLocaleString('en-IN', { minimumFractionDigits: 2 });
-          const yieldPct = risk > 0 ? ((recovered / risk) * 100).toFixed(1) : "0.0";
-          document.getElementById("kpi-yield").textContent = yieldPct + "%";
+          const h = (data.economics || {}).headline || {};
+          const inrFmt = function (n) {
+            return "INR " + Number(n || 0).toLocaleString('en-IN',
+                     { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+          };
+          const risk = document.getElementById("kpi-risk");
+          const rec = document.getElementById("kpi-recovered");
+          const yld = document.getElementById("kpi-yield");
+          risk.textContent = inrFmt(h.at_risk);
+          risk.parentElement.title =
+            "Value of worked cases where no money has come back yet.";
+          rec.textContent = inrFmt(h.recovered);
+          rec.parentElement.title =
+            "What actually arrived, not what was owed — a case settled at a "
+            + "discount counts the discounted figure.";
+          yld.textContent = (h.yield_pct != null ? h.yield_pct : 0) + "%";
+          yld.parentElement.title =
+            "Of " + inrFmt(h.entered_recovery) + " that entered recovery across "
+            + (h.cases || 0) + " cases, the share that came back.";
         });
     }
 

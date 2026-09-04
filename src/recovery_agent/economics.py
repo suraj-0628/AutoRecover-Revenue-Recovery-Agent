@@ -212,6 +212,7 @@ def summarise(records: Iterable[dict], scope: str = "all") -> dict:
     except Exception:
         billed_voice = {}
     rows = []
+    all_rows = []          # every worked case, before the scope filter
     for rec in records:
         worked = (rec.get("llm_usage") or rec.get("contacts")
                   or rec.get("recovery_links")
@@ -221,6 +222,7 @@ def summarise(records: Iterable[dict], scope: str = "all") -> dict:
         if not worked:
             continue
         row = case_economics(rec, p, billed_voice=billed_voice)
+        all_rows.append(row)
         if scope in (ORIGIN_LIVE, ORIGIN_SEEDED) and row["origin"] != scope:
             continue
         rows.append(row)
@@ -254,6 +256,29 @@ def summarise(records: Iterable[dict], scope: str = "all") -> dict:
     for r in rows:
         by_kind.setdefault(r["failure_kind"], []).append(r)
 
+    # The banner across the top of every screen, computed HERE so it cannot
+    # drift from the view below it. It was doing its own arithmetic over
+    # /api/payments and getting two things wrong: it summed each case's
+    # ORIGINAL amount as "recovered", so a ₹2,499 order settled at a 5%
+    # discount reported ₹2,499 rather than the ₹2,374.05 that actually
+    # arrived; and it counted every payment on record as "at risk",
+    # including the ones already recovered.
+    #
+    # Deliberately computed over every worked case, not the selected scope:
+    # a headline that moves when someone toggles a filter underneath it is
+    # not a headline.
+    entered = sum(r["amount"] for r in all_rows)      # money that entered recovery
+    got_back = sum(r["recovered"] for r in all_rows)  # money that actually arrived
+    headline = {
+        "at_risk": round(sum(r["amount"] for r in all_rows
+                             if r["recovered"] <= 0), 2),
+        "recovered": round(got_back, 2),
+        "entered_recovery": round(entered, 2),
+        # Of the money that entered recovery, how much came back.
+        "yield_pct": round(got_back / entered * 100, 1) if entered > 0 else 0.0,
+        "cases": len(all_rows),
+    }
+
     recovered_rows = [r for r in rows if r["recovered"] > 0]
     totals = _bucket(rows)
     totals["recovered_cases"] = len(recovered_rows)
@@ -280,6 +305,7 @@ def summarise(records: Iterable[dict], scope: str = "all") -> dict:
     unattributed = round(max(0.0, ledger_voice - attributed), 2)
     return {
         "scope": scope,
+        "headline": headline,
         # Both populations are Razorpay TEST MODE — this says how a case got
         # here, not that any of the money moved.
         "test_mode": str(os.getenv("RAZORPAY_KEY_ID", "")).startswith("rzp_test"),

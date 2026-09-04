@@ -223,3 +223,51 @@ def test_the_endpoint_defaults_to_live_and_reports_both_counts():
     assert seeded["economics"]["scope"] == "seeded"
     bad = json.loads(app.test_client().get("/api/economics?scope=nonsense").data)
     assert bad["economics"]["scope"] == "live"
+
+
+# ── the banner and the ops screen must not disagree ─────────────────────
+
+def test_headline_counts_money_that_arrived_not_money_that_was_owed():
+    """The banner summed each case's ORIGINAL amount as "recovered", so an
+    order settled at a discount reported the full price. Only
+    recovered_amount is money that actually arrived."""
+    records = [_live_case("pay_l1")]
+    records[0]["amount"] = 2499.0
+    records[0]["recovered_amount"] = 2374.05        # settled at 5% off
+    h = economics.summarise(records)["headline"]
+    assert h["recovered"] == 2374.05
+
+
+def test_headline_at_risk_excludes_what_came_back():
+    """It counted every payment on record as at risk, recovered ones too."""
+    records = [_live_case("pay_done"),                       # recovered
+               _seeded_case("pay_open", amount=5000.0)]      # still out there
+    records[0]["recovered_amount"] = records[0]["amount"]
+    h = economics.summarise(records)["headline"]
+    assert h["at_risk"] == 5000.0
+
+
+def test_headline_does_not_move_when_the_scope_toggle_does():
+    """A headline that changes when someone filters the view underneath it
+    is not a headline."""
+    records = [_live_case("pay_l1"), _seeded_case("pay_s1")]
+    seen = {json.dumps(economics.summarise(records, scope=s)["headline"],
+                       sort_keys=True)
+            for s in ("live", "seeded", "all")}
+    assert len(seen) == 1
+
+
+def test_yield_is_the_share_of_at_risk_money_that_came_back():
+    records = [_live_case("pay_l1"), _seeded_case("pay_s1", amount=1000.0)]
+    records[0]["amount"] = 1000.0
+    records[0]["recovered_amount"] = 400.0
+    h = economics.summarise(records)["headline"]
+    assert h["entered_recovery"] == 2000.0
+    assert h["yield_pct"] == 20.0          # 400 of 2000
+
+
+def test_the_endpoint_serves_the_headline_the_banner_reads():
+    from recovery_agent.frontend import app
+    body = json.loads(app.test_client().get("/api/economics").data)
+    h = body["economics"]["headline"]
+    assert set(h) >= {"at_risk", "recovered", "yield_pct", "entered_recovery"}
