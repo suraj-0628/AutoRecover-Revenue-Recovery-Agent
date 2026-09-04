@@ -518,8 +518,47 @@ def _trim_tool_results_for_llm(messages: list,
     return trimmed
 
 
+#: What the agent is told once the money is in (or the case is with a person).
+#:
+#: The operating prompt is a recovery manual: it opens with "FIRST, check the
+#: context for FOLLOW-UP", then walks a ladder. Handed to a case that is already
+#: paid, that instruction is the loudest thing in the context and it points at
+#: work that must not happen. Live (pay_nam2g0aj7): INR 1,234.05 arrived 15
+#: seconds after the offer email, the briefing said so plainly, and the model
+#: still opened with "FOLLOW-UP: ... 15 minutes have passed. The customer has
+#: NOT paid" — narrating a follow-up it had invented, because that is what the
+#: prompt told it to look for first. It then called no tool at all, so the case
+#: stayed open with the money already banked.
+#:
+#: Withholding the rung tools (see agent_node) stopped it acting on that. It
+#: could not stop it BELIEVING it, and an agent reasoning from a false premise
+#: with no legal move available simply stops. So the manual is replaced rather
+#: than contradicted.
+SETTLED_PROMPT = """You are a Razorpay revenue recovery agent, and THIS CASE IS OVER.
+
+Read the briefing below for what happened. The money is in, or the case is with
+a person. Either way the recovery work is finished and must not be restarted.
+
+There is no ladder to climb, no rung to move to, and no follow-up to send. Any
+"FOLLOW-UP" framing you remember from earlier in this conversation described a
+situation that no longer exists. Do not reason about whether the customer paid:
+the briefing tells you, and it is authoritative.
+
+Do exactly two things, in this order:
+
+1. manage_memory — record what actually worked (or did not), attributed to the
+   channel the briefing names and nothing else. This lesson is permanent, and a
+   wrong attribution sends the next recovery down the wrong path.
+2. close_case — with the outcome the briefing states.
+
+Then stop. Do not contact the customer. Do not offer anything. Do not create a
+link. You do not have those tools here, and asking for them wastes the turn.
+"""
+
+
 def _assemble_llm_messages(briefing: list, history: list,
-                           max_messages: int = 30) -> list:
+                           max_messages: int = 30,
+                           settled: bool = False) -> list:
     """System prompt + perception briefing + (truncated) history, in that order.
 
     Truncation used to run over the ASSEMBLED list, keeping index 0 (the
@@ -529,7 +568,8 @@ def _assemble_llm_messages(briefing: list, history: list,
     cases most at risk of acting on stale beliefs. The head is never trimmed;
     only the history is.
     """
-    head = [SystemMessage(content=SYSTEM_PROMPT)] + list(briefing)
+    head = [SystemMessage(content=SETTLED_PROMPT if settled else SYSTEM_PROMPT)]
+    head += list(briefing)
     if len(history) <= max_messages:
         return head + list(history)
 
@@ -788,6 +828,10 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
 
     ctx = _get_context(config)
     tier = "silent"
+    # Bound before the branch: `case` was only assigned when a context existed,
+    # while the settled check below reads it unconditionally. Without a context
+    # that is a NameError inside the turn, not a missing optimisation.
+    case = None
     if ctx:
         case = ctx.case
         # `Case` has no `current_tier` — the field is `recovery_tier`. The old
@@ -870,8 +914,13 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
     # Context assembly: the head (prompt + briefing) is never trimmed, the
     # history is; large tool results are shortened on copies. The rules and
     # the incidents behind them live on the two helpers.
+    # `_settled` is computed above to decide which TOOLS this turn may use;
+    # the same fact decides which PROMPT it reasons with. Splitting those two
+    # left the agent forbidden from working the ladder while still being told
+    # to work it — which is how a paid case produced an invented follow-up and
+    # then no action at all.
     messages = _trim_tool_results_for_llm(
-        _assemble_llm_messages(briefing, state["messages"]))
+        _assemble_llm_messages(briefing, state["messages"], settled=_settled))
 
     # One gate for every model call in the process. The old version was a
     # module attribute and a sleep: N concurrent sessions — a champion, a

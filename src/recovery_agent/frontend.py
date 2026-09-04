@@ -862,6 +862,50 @@ def api_evals():
     except Exception as exc:
         out["corpus"] = {"error": str(exc)}
 
+    # Re-judge the corpus HERE, on this request, rather than serving the rate
+    # that was written to the scorecard hours ago.
+    #
+    # The whole point of this screen is that a number can be trusted, and
+    # "trust me, I computed this earlier" is exactly what it cannot ask for.
+    # Judging is rule-based over the recorded decisions: 76 of them take 0.03s,
+    # no LLM and no network, so there is no reason NOT to do it live. The card
+    # can then say the rate was computed now, from evidence on disk that anyone
+    # can open and count by hand.
+    try:
+        # judge_decision, not judge, and one verdict per ROW: a turn that calls
+        # three tools is ONE decision, conformant only if every call in it is.
+        # Scoring per tool call instead gave 70/72 against the runner's 74/76 --
+        # two different rates on one screen, which is worse than not
+        # recomputing at all.
+        from recovery_agent.evals.conformance import judge_decision
+        corpus_path = root / "evals" / "corpus" / "decisions.jsonl"
+        rows = [json.loads(l) for l in corpus_path.read_text().splitlines()
+                if l.strip()]
+        n = conformant = 0
+        failures = []
+        for r in rows:
+            n += 1
+            verdicts = judge_decision(r.get("facts") or {}, r.get("chosen") or [])
+            bad = [v for v in verdicts if not v.ok]
+            if not bad:
+                conformant += 1
+            elif len(failures) < 12:
+                failures.append({"payment_id": r.get("payment_id"),
+                                 "turn": r.get("turn"),
+                                 "chosen": [c.get("name")
+                                            for c in (r.get("chosen") or [])],
+                                 "rules": sorted({v.rule for v in bad})})
+        out["recomputed"] = {
+            "decisions": n, "conformant": conformant,
+            "violations": n - conformant,
+            "rate": round(conformant / n, 4) if n else None,
+            "examples": failures[:12],
+            "note": ("judged on this request from evals/corpus/decisions.jsonl "
+                     "-- rule-based, no LLM, no network"),
+        }
+    except Exception as exc:
+        out["recomputed"] = {"error": str(exc)}
+
     # The counterfactual is the money exhibit. It is pure replay over the
     # corpus -- no LLM, no network -- so it is safe to compute per request.
     try:
@@ -4018,25 +4062,11 @@ def daemon_retry_complete():
         window = int(os.getenv("RETRY_WATCH_MINUTES", "30")) * 60
         socketio.start_background_task(_watch_for_recovery, payment_id, window)
 
-    # The agent asked to be woken and the wait has elapsed. Hand it back with
-    # what it said it was waiting for, so it resumes its own plan instead of
-    # re-deriving one — and so a case that deferred (quiet hours, a pending
-    # response) cannot sit at `awaiting_customer` for ever.
-    if result.get("status") == "woken":
-        rec = store.get_payment(payment_id) or {}
-        why = (result.get("reason")
-               or (rec.get("waiting_for") or {}).get("reason")
-               or "the wait you asked for")
-        store.update_payment(payment_id, waiting_for=None)
-        store.flush()
-        _handoff_to_agent(
-            payment_id,
-            f"THE WAIT YOU ASKED FOR IS OVER. You said you were waiting for: "
-            f"{why}. Check where the case stands now, then either take the next "
-            f"rung or wait again with a fresh reason — do not repeat anything "
-            f"already tried.",
-            scenario=f"wait_elapsed:{job_id}",
-        )
+    # (The duplicate of this block that stood here fired a second hand-off for
+    # the same wake. `_handoff_to_agent` de-duplicates on the scenario key, so
+    # the extra call was usually absorbed — but it also cleared `waiting_for`
+    # and re-flushed twice per wake, and any scenario key that ever varied
+    # would have started two agent runs on one timer.)
 
     return jsonify({"status": "received", "payment_id": payment_id})
 
