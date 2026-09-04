@@ -896,7 +896,84 @@
       margin-left: 62px; padding: 14px; overflow-y: auto; flex: 1;
       display: none;
     }
-    .batchview.on { display: block }
+    .batchview.on { display: block; animation: viewEnter .24s cubic-bezier(.2,.7,.3,1) both }
+
+    /* ── Moving between views ────────────────────────────────────────
+       Switching used to be a display:none/block cut: the old screen
+       vanished, nothing replaced it, and the numbers appeared a beat later
+       when the fetch returned. The eye reads that as a stall rather than a
+       transition. A short rise-and-fade covers the swap, a progress line
+       covers the fetch, and the cards arrive in sequence so the screen
+       assembles instead of snapping into place. */
+    @keyframes viewEnter {
+      from { opacity: 0; transform: translateY(8px) }
+      to   { opacity: 1; transform: none }
+    }
+    @keyframes cardEnter {
+      from { opacity: 0; transform: translateY(6px) }
+      to   { opacity: 1; transform: none }
+    }
+    /* Staggered by position, in CSS — the alternative is a timer per card in
+       JS that has to be kept in step with however many cards there are. */
+    #view-ops .ops-grid > *, #view-batches .batch-grid > *,
+    #view-policy .batch-card {
+      animation: cardEnter .26s cubic-bezier(.2,.7,.3,1) both;
+    }
+    #view-ops .ops-grid > :nth-child(1), #view-batches .batch-grid > :nth-child(1),
+    #view-policy .batch-card:nth-child(1) { animation-delay: .02s }
+    #view-ops .ops-grid > :nth-child(2), #view-batches .batch-grid > :nth-child(2),
+    #view-policy .batch-card:nth-child(2) { animation-delay: .05s }
+    #view-ops .ops-grid > :nth-child(3), #view-batches .batch-grid > :nth-child(3),
+    #view-policy .batch-card:nth-child(3) { animation-delay: .08s }
+    #view-ops .ops-grid > :nth-child(4), #view-batches .batch-grid > :nth-child(4),
+    #view-policy .batch-card:nth-child(4) { animation-delay: .11s }
+    #view-ops .ops-grid > :nth-child(n+5),
+    #view-batches .batch-grid > :nth-child(n+5) { animation-delay: .14s }
+
+    /* The fetch, made visible. Fixed to the top of the content area so it
+       reads as "this screen is loading" rather than belonging to any card. */
+    #view-progress {
+      position: fixed; top: 0; left: 62px; right: 0; height: 2px; z-index: 200;
+      opacity: 0; transition: opacity .18s; pointer-events: none;
+      background: rgba(48,94,255,.10);
+    }
+    #view-progress.on { opacity: 1 }
+    #view-progress::after {
+      content: ''; display: block; height: 100%; width: 35%;
+      background: linear-gradient(90deg, transparent, var(--rzp-blue), transparent);
+      animation: progressSweep 1.1s ease-in-out infinite;
+    }
+    @keyframes progressSweep {
+      from { transform: translateX(-100%) } to { transform: translateX(400%) }
+    }
+
+    /* Press feedback: a control that does not acknowledge the click feels
+       broken on a slow fetch, which is exactly when it matters. */
+    .rail-btn:active, .toggle-btn:active, .btn-batch:active:enabled {
+      transform: translateY(1px) }
+    .rail-btn, .toggle-btn, .btn-batch { transition: background .15s, color .15s,
+                                         border-color .15s, transform .08s }
+
+    /* A working button says so, and keeps its width so the row does not
+       jump while it waits. */
+    .btn-batch.busy { position: relative; color: transparent !important }
+    .btn-batch.busy::after {
+      content: ''; position: absolute; inset: 0; margin: auto;
+      width: 11px; height: 11px; border-radius: 50%;
+      border: 1.5px solid rgba(157,180,255,.35);
+      border-top-color: #9db4ff; animation: btnSpin .6s linear infinite;
+    }
+    @keyframes btnSpin { to { transform: rotate(360deg) } }
+
+    /* Anyone who has asked for less motion gets the layout and none of the
+       movement — the information is in the numbers, not the animation. */
+    @media (prefers-reduced-motion: reduce) {
+      .batchview.on, #view-ops .ops-grid > *, #view-batches .batch-grid > *,
+      #view-policy .batch-card { animation: none }
+      #view-progress::after { animation: none; width: 100% }
+      .rail-btn:active, .toggle-btn:active, .btn-batch:active:enabled {
+        transform: none }
+    }
 
     /* Guardrail policy controls. The description sits beside the control, not
        behind a tooltip: someone raising a contact cap mid-incident should not
@@ -1214,6 +1291,10 @@
 <body>
 
   <!-- Left rail: the live view is one place to be, batches are another -->
+  <!-- Tracks the fetch behind a view switch, so the wait is visible rather
+       than looking like a stall. -->
+  <div id="view-progress"></div>
+
   <nav class="railnav">
     <div class="rail-mark">R</div>
     <button class="rail-btn active" id="rail-live" onclick="showView('live')">
@@ -2353,9 +2434,30 @@ function showView(which) {
   document.getElementById("rail-batches").classList.toggle("active", isBatch);
   document.getElementById("rail-ops").classList.toggle("active", isOps);
   document.getElementById("rail-policy").classList.toggle("active", isPolicy);
-  if (isBatch) loadBatches();
-  if (isOps) loadOps();
-  if (isPolicy) loadPolicy();
+  /* The bar follows the actual request rather than a guessed duration, so
+     it is honest on a slow one and barely seen on a fast one. */
+  var pending = isBatch ? loadBatches()
+              : isOps ? loadOps()
+              : isPolicy ? loadPolicy() : null;
+  if (pending && pending.then) {
+    showViewProgress(true);
+    pending.then(function () { showViewProgress(false); },
+                 function () { showViewProgress(false); });
+  }
+}
+
+var _progressTimer = null;
+function showViewProgress(on) {
+  var el = document.getElementById("view-progress");
+  if (!el) return;
+  clearTimeout(_progressTimer);
+  if (on) {
+    /* Only show it if the fetch is actually slow enough to notice. Flashing
+       a loading bar for 40ms is worse than showing none. */
+    _progressTimer = setTimeout(function () { el.classList.add("on"); }, 120);
+  } else {
+    el.classList.remove("on");
+  }
 }
 
 /* ── Guardrail policy ──────────────────────────────────────────────────────
@@ -2367,7 +2469,7 @@ function showView(which) {
 let _policySpec = [];
 
 function loadPolicy() {
-  fetch("/api/guardrails").then(r => r.json()).then(d => {
+  return fetch("/api/guardrails").then(r => r.json()).then(d => {
     _policySpec = d.settings || [];
     renderPolicy();
   }).catch(() => {
@@ -2615,12 +2717,12 @@ function batchNote(key) { return document.getElementById("note-" + key); }
 function previewBatch(key) {
   const btn = document.getElementById("dry-" + key);
   const note = batchNote(key);
-  btn.disabled = true;
+  btn.disabled = true; btn.classList.add("busy");
   note.className = "batch-note"; note.textContent = "checking...";
   fetch("/api/batches/" + key + "/plan", {method: "POST",
         headers: {"Content-Type": "application/json"}, body: "{}"})
     .then(r => r.json()).then(function (d) {
-      btn.disabled = false;
+      btn.disabled = false; btn.classList.remove("busy");
       if (d.error) { note.textContent = d.error; return; }
       const r = d.report, held = r.skipped + r.deferred + r.exceptions;
       note.className = "batch-note settled";
@@ -2628,17 +2730,21 @@ function previewBatch(key) {
         " \u00b7 " + r.links_created + " links \u00b7 " +
         Object.keys(d.plans).length + " plans" +
         (held ? " \u00b7 " + held + " held back" : "") + " \u00b7 nothing sent";
-    }).catch(function () { btn.disabled = false; note.textContent = "could not check"; });
+    }).catch(function () {
+      btn.disabled = false; btn.classList.remove("busy");
+      note.textContent = "could not check";
+    });
 }
 
 function runBatch(key) {
   const btn = document.getElementById("run-" + key);
   const note = batchNote(key);
-  btn.disabled = true;
+  btn.disabled = true; btn.classList.add("busy");
   note.className = "batch-note"; note.textContent = "starting...";
   fetch("/api/batches/" + key + "/run", {method: "POST",
         headers: {"Content-Type": "application/json"}, body: "{}"})
     .then(r => r.json()).then(function (d) {
+      btn.classList.remove("busy");
       if (d.error) {
         note.textContent = d.error; btn.disabled = false; return;
       }
@@ -2649,7 +2755,12 @@ function runBatch(key) {
       btn.textContent = "Abort";
       btn.onclick = function () { abortBatch(key, d.batch_run_id); };
       pollBatchRun(key, d.batch_run_id);
-    }).catch(function () { note.textContent = "could not start"; btn.disabled = false; });
+    }).catch(function () {
+      /* The spinner has to stop on the failure path too, or a button that
+         could not start anything sits there looking like it is working. */
+      note.textContent = "could not start";
+      btn.disabled = false; btn.classList.remove("busy");
+    });
 }
 
 function abortBatch(key, runId) {
@@ -2933,7 +3044,7 @@ function setOpsScope(scope) {
 }
 
 function loadOps() {
-  fetch("/api/economics?scope=" + encodeURIComponent(OPS_SCOPE))
+  return fetch("/api/economics?scope=" + encodeURIComponent(OPS_SCOPE))
     .then(function (r) { return r.json(); }).then(renderOps)
     .catch(function () {
       document.getElementById("ops-grid").innerHTML =
