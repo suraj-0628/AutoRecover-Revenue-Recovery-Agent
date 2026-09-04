@@ -698,6 +698,190 @@
     /* Voice Call Player Widget */
 
     /* View Switcher */
+    /* ── EVALS view ──────────────────────────────────────────────────
+       Colour carries meaning here and nowhere else on this screen: green is
+       "the model refused", amber is "a rail caught it", red is "it reached a
+       customer". Nothing decorative is allowed to use those three. */
+    .ev-strip {
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      padding: 14px 18px; border-radius: 10px; margin: 14px 0 6px;
+      border: 1px solid var(--border, #30363d); background: var(--panel-bg);
+    }
+    .ev-strip.ev-ok { border-color: rgba(126,231,135,.45); }
+    .ev-strip.ev-bad { border-color: rgba(255,123,114,.5); }
+    .ev-verdict { font-size: 15px; font-weight: 700; letter-spacing: .08em; }
+    .ev-ok .ev-verdict { color: var(--accent-green); }
+    .ev-bad .ev-verdict { color: var(--accent-red); }
+    .ev-strip-bits { font-size: 12px; color: var(--text-muted); }
+
+    .ev-cards {
+      display: grid; gap: 12px; margin: 14px 0 4px;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    }
+    .ev-card {
+      background: var(--panel-bg); border: 1px solid var(--border, #30363d);
+      border-radius: 10px; padding: 14px 16px;
+    }
+    /* A number nobody will stand behind must not look like one they will. */
+    .ev-card-ungated { opacity: .62; border-style: dashed; }
+    .ev-card-label {
+      font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .ev-card-big {
+      font-size: 26px; font-weight: 650; color: var(--text-bright);
+      margin: 6px 0 2px; font-variant-numeric: tabular-nums;
+    }
+    .ev-card-sub { font-size: 11.5px; color: var(--text-muted); }
+    .ev-card-note { font-size: 11px; color: var(--text-muted); margin-top: 8px; }
+    .ev-warn { color: var(--accent-amber); }
+
+    .ev-bar {
+      display: flex; height: 8px; border-radius: 4px; overflow: hidden;
+      margin-top: 10px; background: rgba(255,255,255,.06);
+    }
+    .ev-seg { height: 100%; }
+    .ev-held { background: var(--accent-green); }
+    .ev-caught { background: var(--accent-amber); }
+    .ev-leaked { background: var(--accent-red); }
+
+    .ev-block { margin: 20px 0 4px; }
+    .ev-block h3 {
+      font-size: 13px; font-weight: 600; color: var(--text-bright);
+      margin: 0 0 4px;
+    }
+    .ev-block-sub {
+      font-size: 11.5px; color: var(--text-muted); margin-bottom: 12px;
+      line-height: 1.5; max-width: 78ch;
+    }
+    .ev-foot {
+      font-size: 11px; color: var(--text-muted); margin-top: 10px;
+      line-height: 1.5; max-width: 78ch;
+    }
+
+    .ev-row {
+      display: grid; align-items: center; gap: 10px; margin-bottom: 7px;
+      grid-template-columns: 128px 1fr 96px 130px;
+    }
+    .ev-row-name { font-size: 12px; color: var(--text-muted); }
+    .ev-row-agent { color: var(--text-bright); font-weight: 600; }
+    .ev-row-track {
+      height: 16px; border-radius: 4px; background: rgba(255,255,255,.05);
+      overflow: hidden;
+    }
+    .ev-row-fill {
+      height: 100%; background: rgba(255,123,114,.55); border-radius: 4px;
+      transition: width .35s ease;
+    }
+    .ev-fill-agent { background: var(--accent-green); }
+    .ev-row-val {
+      font-size: 12px; text-align: right; color: var(--text-bright);
+      font-variant-numeric: tabular-nums;
+    }
+    .ev-row-side { font-size: 11px; color: var(--text-muted); }
+
+    .ev-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .ev-table th {
+      text-align: left; font-weight: 500; font-size: 10px;
+      letter-spacing: .07em; text-transform: uppercase;
+      color: var(--text-muted); padding: 6px 10px 6px 0;
+      border-bottom: 1px solid var(--border, #30363d);
+    }
+    .ev-table td {
+      padding: 7px 10px 7px 0; color: var(--text-muted);
+      border-bottom: 1px solid rgba(255,255,255,.04);
+    }
+    .ev-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    /* ── Evals, brought onto the shared system ───────────────────────
+       The numbers and their meaning are unchanged; this only stops the
+       screen reading as a different product from OPS and BATCH. Same
+       rules as there: one joined strip rather than floating cards, the
+       headline metric leads in the brand colour, uppercase micro-labels
+       take Razorpay's wide tracking, and no figure wraps mid-number. */
+
+    /* One strip, dividers instead of gaps — as .batch-stats elsewhere. */
+    #view-evals .ev-cards {
+      gap: 0; border: 1px solid var(--border-color); border-radius: 8px;
+      background: var(--panel-bg); overflow: hidden;
+    }
+    #view-evals .ev-card {
+      border: 0; border-right: 1px solid var(--border-color);
+      border-radius: 0; background: transparent;
+    }
+    #view-evals .ev-card:last-child { border-right: 0 }
+    #view-evals .ev-card-label { letter-spacing: .14em }
+    #view-evals .ev-card-big { white-space: nowrap }
+
+    /* Rule conformance is the number this whole screen exists to state,
+       so it leads — same treatment as cost-per-100 in the ops view. */
+    #view-evals .ev-card:first-child { border-left: 2px solid var(--rzp-blue) }
+    #view-evals .ev-card:first-child .ev-card-big { color: var(--rzp-blue) }
+
+    /* A metric nobody will stand behind still has to look different once
+       the cards are joined and a dashed border has nothing to outline. */
+    #view-evals .ev-card-ungated {
+      opacity: .62;
+      background: repeating-linear-gradient(45deg,
+                  rgba(255,255,255,.02) 0 4px, transparent 4px 8px);
+    }
+    #view-evals .ev-card-ungated:first-child { border-left-color: var(--border-color) }
+    #view-evals .ev-card-ungated:first-child .ev-card-big { color: var(--text-bright) }
+
+    /* Tables: same rhythm as .ops-table, and figures that never break. */
+    #view-evals .ev-table th { letter-spacing: .12em; padding: 8px 14px 6px 0 }
+    #view-evals .ev-table td { padding: 6px 14px 6px 0 }
+    #view-evals .ev-table td:first-child,
+    #view-evals .ev-row-val, #view-evals .ev-row-side {
+      white-space: nowrap; font-variant-numeric: tabular-nums;
+    }
+    #view-evals .ev-table tbody tr:hover { background: rgba(88,166,255,.03) }
+
+    /* The corpus-health figures are the same kind of thing as the strip
+       above them — four counts that qualify a verdict — so they join the
+       same way rather than floating as a second, different grid. */
+    #view-evals .ev-health {
+      gap: 0; border: 1px solid var(--border-color); border-radius: 8px;
+      background: var(--panel-bg); overflow: hidden;
+    }
+    #view-evals .ev-health > div {
+      border: 0; border-right: 1px solid var(--border-color);
+      border-radius: 0; background: transparent; padding: 12px 16px;
+    }
+    #view-evals .ev-health > div:last-child { border-right: 0 }
+    #view-evals .ev-k { letter-spacing: .14em }
+    #view-evals .ev-v { white-space: nowrap }
+
+    /* Section headings, sized against the ops cards rather than the page. */
+    #view-evals .ev-block h3 { letter-spacing: -0.1px }
+    #view-evals .ev-block-sub, #view-evals .ev-foot { max-width: 86ch }
+
+    .ev-health {
+      display: grid; gap: 10px; margin-bottom: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    }
+    .ev-health > div {
+      background: var(--panel-bg); border: 1px solid var(--border, #30363d);
+      border-radius: 8px; padding: 10px 12px; display: flex;
+      flex-direction: column; gap: 3px;
+    }
+    .ev-k {
+      font-size: 10px; letter-spacing: .07em; text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .ev-v {
+      font-size: 16px; color: var(--text-bright);
+      font-variant-numeric: tabular-nums;
+    }
+    .ev-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .ev-chip {
+      font-size: 11px; color: var(--text-muted); padding: 3px 9px;
+      border-radius: 999px; border: 1px solid var(--border, #30363d);
+    }
+    .ev-chip b { color: var(--text-bright); }
+    .ev-chip-bad { border-color: rgba(255,123,114,.5); color: var(--accent-red); }
+    .ev-chip-bad b { color: var(--accent-red); }
+
     .view-toggle-bar {
       display: flex;
       background: #0d1117;
@@ -1246,6 +1430,17 @@
         stroke="currentColor" stroke-width="2" stroke-linecap="round"
         stroke-linejoin="round" style="vertical-align:-2px"><path
         d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>GUARDRAIL
+    </button>
+    <!-- A checked box, not a chart: this rail is not more metrics, it is the
+         answer to "can we vouch for this build". Inline SVG for the same
+         reason as the shield above. -->
+    <button class="rail-btn" id="rail-evals" onclick="showView('evals')">
+      <span class="ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" stroke-width="2" stroke-linecap="round"
+        stroke-linejoin="round" style="vertical-align:-2px"><path
+        d="M9 11l3 3L22 4"/><path
+        d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg
+        ></span>EVALS
     </button>
   </nav>
 
@@ -2053,36 +2248,40 @@
   
 /* ── Views ─────────────────────────────────────────────────────────
    The live workspace is untouched; this only hides it. */
+/* Every view away from LIVE is one row here. It was four sets of parallel
+   variables and toggles, which is fine at four and starts dropping lines at
+   five -- a rail that lights up while its section stays hidden. */
+var VIEWS = [
+  {name: "batches", section: "view-batches", rail: "rail-batches", load: function () { return loadBatches(); }},
+  {name: "ops",     section: "view-ops",     rail: "rail-ops",     load: function () { return loadOps(); }},
+  {name: "policy",  section: "view-policy",  rail: "rail-policy",  load: function () { return loadPolicy(); }},
+  {name: "evals",   section: "view-evals",   rail: "rail-evals",   load: function () { return loadEvals(); }}
+];
+
 function showView(which) {
   const live = document.querySelector(".workspace");
-  const batches = document.getElementById("view-batches");
-  const ops = document.getElementById("view-ops");
-  const policy = document.getElementById("view-policy");
   const hdr = document.querySelector("header");
-  const isBatch = which === "batches";
-  const isOps = which === "ops";
-  const isPolicy = which === "policy";
-  const away = isBatch || isOps || isPolicy;
+  var target = null;
+  VIEWS.forEach(function (v) { if (v.name === which) target = v; });
+  const away = !!target;
   var backToLive = !away && live && live.style.display === "none";
   if (live) live.style.display = away ? "none" : "";
   if (hdr) hdr.style.display = away ? "none" : "";
-  /* The other three views animate through .batchview.on; the live view is
-     shown by clearing an inline display, which no CSS transition can see.
-     Without this, three of four views faded in and the fourth snapped — and
-     the odd one out is the screen people return to most. */
+  /* The other views animate through .batchview.on; the live view is shown by
+     clearing an inline display, which no CSS transition can see. Without this,
+     the others faded in and the fourth snapped -- and the odd one out is the
+     screen people return to most. */
   if (backToLive) { playEnter(hdr); playEnter(live); }
-  batches.classList.toggle("on", isBatch);
-  if (ops) ops.classList.toggle("on", isOps);
-  if (policy) policy.classList.toggle("on", isPolicy);
+  VIEWS.forEach(function (v) {
+    var sec = document.getElementById(v.section);
+    if (sec) sec.classList.toggle("on", v === target);
+    var btn = document.getElementById(v.rail);
+    if (btn) btn.classList.toggle("active", v === target);
+  });
   document.getElementById("rail-live").classList.toggle("active", !away);
-  document.getElementById("rail-batches").classList.toggle("active", isBatch);
-  document.getElementById("rail-ops").classList.toggle("active", isOps);
-  document.getElementById("rail-policy").classList.toggle("active", isPolicy);
   /* The bar follows the actual request rather than a guessed duration, so
      it is honest on a slow one and barely seen on a fast one. */
-  var pending = isBatch ? loadBatches()
-              : isOps ? loadOps()
-              : isPolicy ? loadPolicy() : null;
+  var pending = target ? target.load() : null;
   if (pending && pending.then) {
     showViewProgress(true);
     pending.then(function () { showViewProgress(false); },
@@ -2122,6 +2321,218 @@ function showViewProgress(on) {
    disabled with the reason visible — opt-out is a legal obligation, not a
    tuning parameter, and a panel that can switch it off is a liability. */
 let _policySpec = [];
+
+var _evals = null;
+
+function loadEvals() {
+  return fetch("/api/evals").then(r => r.json()).then(d => {
+    _evals = d;
+    renderEvals();
+  }).catch(() => {
+    document.getElementById("evals-body").innerHTML =
+      '<div style="color:var(--text-muted)">Could not load evals.</div>';
+  });
+}
+
+function recheckEvals() {
+  var b = document.getElementById("evals-recheck");
+  if (b) { b.disabled = true; b.textContent = "Re-checking…"; }
+  showViewProgress(true);
+  return loadEvals().then(function () {
+    showViewProgress(false);
+    if (b) { b.disabled = false; b.textContent = "Re-check"; }
+  });
+}
+
+function evEsc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+    return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c];
+  });
+}
+
+function evRupees(n) {
+  return "₹" + Number(n || 0).toLocaleString("en-IN",
+    {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+
+function renderEvals() {
+  const d = _evals || {};
+  const body = document.getElementById("evals-body");
+  const meta = document.getElementById("evals-meta");
+  const status = document.getElementById("evals-status");
+  if (!body) return;
+
+  /* Never having run is a normal state, and it renders as a sentence rather
+     than as zeros. A zero on the red-team bar reads as "nothing held", which
+     is the opposite of "we have not measured yet". */
+  if (!d.ok) {
+    if (meta) meta.textContent = "";
+    if (status) status.textContent = "";
+    body.innerHTML = '<div class="ops-help-body" style="margin-top:12px">' +
+      evEsc(d.reason || "The evals have not run in this checkout.") + '</div>';
+    return;
+  }
+
+  const v = d.verdict || {};
+  const c = d.corpus || {};
+  const rec = (d.modes || {}).recorded || {};
+  const rt = (d.modes || {}).redteam || {};
+
+  if (status) {
+    status.textContent = rec.age_hours != null
+      ? "scored " + Math.round(rec.age_hours) + "h ago" : "";
+  }
+  if (meta) {
+    meta.textContent = (c.cases || 0) + " cases · " + (c.turns || 0) +
+      " decisions · " + (c.covered || 0) + "/" + (c.of || 0) + " failure families";
+  }
+
+  body.innerHTML =
+    evVerdictStrip(v, c) +
+    evCards(rec, rt, c) +
+    evMoneyChart(d.counterfactual || {}) +
+    evViolations(rec) +
+    evCorpusHealth(c, d.baseline || {});
+}
+
+/* ── block 1: the one line that answers the question in the heading ── */
+function evVerdictStrip(v, c) {
+  const ok = !!v.verified;
+  const bits = [
+    (v.gated || 0) + " of " + (v.of || 0) + " metrics gated",
+    (c.cases || 0) + " cases",
+    (c.covered || 0) + "/" + (c.of || 0) + " families"
+  ];
+  return '<div class="ev-strip ' + (ok ? "ev-ok" : "ev-bad") + '">' +
+    '<span class="ev-verdict">' + (ok ? "VERIFIED" : "NOT VERIFIED") + '</span>' +
+    '<span class="ev-strip-bits">' + evEsc(bits.join("  ·  ")) + '</span>' +
+    '</div>' +
+    (ok ? "" : '<div class="ops-help-body" style="margin-top:8px">' +
+      'No metric is defendable enough to gate on. The build is unverified &mdash; ' +
+      'not proven bad, but not proven good either.</div>');
+}
+
+/* ── block 2: four cards, each with the question it answers ── */
+function evCards(rec, rt, c) {
+  const held = rt.held || 0, caught = rt.caught_by_gate || 0, leaked = rt.leaked || 0;
+  const tot = Math.max(1, held + caught + leaked);
+  const pct = n => (100 * n / tot).toFixed(1) + "%";
+  const bar = '<div class="ev-bar">' +
+    '<div class="ev-seg ev-held" style="width:' + pct(held) + '" title="' +
+      held + ' held: the model refused the bait"></div>' +
+    '<div class="ev-seg ev-caught" style="width:' + pct(caught) + '" title="' +
+      caught + ' caught: the model took it, a runtime rail stopped it"></div>' +
+    '<div class="ev-seg ev-leaked" style="width:' + pct(leaked) + '" title="' +
+      leaked + ' leaked: nothing would have stopped it"></div></div>';
+
+  const card = (label, big, sub, extra, ungated) =>
+    '<div class="ev-card' + (ungated ? " ev-card-ungated" : "") + '">' +
+    '<div class="ev-card-label">' + label + '</div>' +
+    '<div class="ev-card-big">' + big + '</div>' +
+    '<div class="ev-card-sub">' + sub + '</div>' +
+    (extra || "") + '</div>';
+
+  return '<div class="ev-cards">' +
+    card("Rule conformance",
+         rec.rate != null ? (100 * rec.rate).toFixed(1) + "%" : "—",
+         "followed the money rules",
+         '<div class="ev-card-note">' + evEsc(rec.rate_with_ci || "") + '</div>',
+         !rec.gateable) +
+    card("Red team", held + " / " + caught + " / " + leaked,
+         "held · caught by a rail · reached a customer", bar,
+         !rt.gateable) +
+    card("Coverage", (c.covered || 0) + "/" + (c.of || 0),
+         "failure families exercised",
+         (c.blind_spots || []).length
+           ? '<div class="ev-card-note ev-warn">' +
+             evEsc(c.blind_spots.join("; ")) + '</div>'
+           : '<div class="ev-card-note">no blind spots</div>', false) +
+    card("Evidence", (c.cases || 0) + " cases",
+         "independent, not " + (c.turns || 0) + " turns",
+         '<div class="ev-card-note">' +
+         (c.cases >= (c.min_cases_to_gate || 20)
+           ? "enough to gate"
+           : "need " + (c.min_cases_to_gate || 20) + " to gate") + '</div>',
+         c.cases < (c.min_cases_to_gate || 20)) +
+    '</div>';
+}
+
+/* ── block 3: the money exhibit ── */
+function evMoneyChart(cf) {
+  const rows = (cf.results || []).slice();
+  if (!rows.length) return "";
+  const max = Math.max.apply(null, rows.map(r => r.giveaway_rupees || 0)) || 1;
+  const bars = rows.map(function (r) {
+    const isAgent = r.policy === "agent";
+    const w = Math.max(0.4, 100 * (r.giveaway_rupees || 0) / max);
+    return '<div class="ev-row">' +
+      '<div class="ev-row-name' + (isAgent ? " ev-row-agent" : "") + '">' +
+        evEsc(r.policy) + '</div>' +
+      '<div class="ev-row-track"><div class="ev-row-fill' +
+        (isAgent ? " ev-fill-agent" : "") + '" style="width:' + w + '%"></div></div>' +
+      '<div class="ev-row-val">' + evRupees(r.giveaway_rupees) + '</div>' +
+      '<div class="ev-row-side">' + (r.conformance_pct != null
+        ? r.conformance_pct.toFixed(1) + "% · acted " + (r.acted || 0) : "") +
+      '</div></div>';
+  }).join("");
+  return '<div class="ev-block"><h3>What each policy would have given away</h3>' +
+    '<div class="ev-block-sub">The same <b>' + (cf.decisions || 0) + ' decisions</b> ' +
+    'replayed through each policy, on the facts the agent actually saw. Offline: ' +
+    'no traffic was split and no customer was experimented on.</div>' +
+    bars +
+    '<div class="ev-foot"><b>do_nothing</b> scores 100% by construction &mdash; it ' +
+    'never acts, so it never breaks a rule. It is kept here on purpose: a ' +
+    'conformance column a do-nothing policy wins is not measuring recovery, and ' +
+    'the money and <i>acted</i> columns are what separate them.</div></div>';
+}
+
+/* ── block 4: our own failures, named ── */
+function evViolations(rec) {
+  const ex = rec.examples || [];
+  const byRule = rec.violations_by_rule || {};
+  const ruleLine = Object.keys(byRule).map(k =>
+    evEsc(k) + " ×" + byRule[k]).join(", ");
+  if (!ex.length && !ruleLine) {
+    return '<div class="ev-block"><h3>Violations</h3>' +
+      '<div class="ev-block-sub">None in the corpus.</div></div>';
+  }
+  const rows = ex.slice(0, 12).map(function (e) {
+    return '<tr><td class="ev-mono">' + evEsc(e.payment_id) + '</td>' +
+      '<td>' + evEsc(e.turn) + '</td>' +
+      '<td class="ev-mono">' + evEsc((e.chosen || []).join(", ")) + '</td>' +
+      '<td class="ev-warn">' + evEsc((e.rules || []).join(", ")) + '</td></tr>';
+  }).join("");
+  return '<div class="ev-block"><h3>Violations</h3>' +
+    '<div class="ev-block-sub">' + evEsc(ruleLine) + '. Shown rather than ' +
+    'summed &mdash; a count says how many, these say which.</div>' +
+    '<table class="ev-table"><thead><tr><th>case</th><th>turn</th>' +
+    '<th>chose</th><th>rule broken</th></tr></thead><tbody>' + rows +
+    '</tbody></table></div>';
+}
+
+/* ── block 5: is the alarm still plugged in ── */
+function evCorpusHealth(c, base) {
+  const kinds = c.cases_by_kind || {};
+  const chips = Object.keys(kinds).sort().map(k =>
+    '<span class="ev-chip">' + evEsc(k) + ' <b>' + kinds[k] + '</b></span>').join("");
+  const missing = (c.missing_kinds || []).map(k =>
+    '<span class="ev-chip ev-chip-bad">' + evEsc(k) + ' <b>0</b></span>').join("");
+  const share = c.largest_case_share != null
+    ? (100 * c.largest_case_share).toFixed(1) + "%" : "—";
+  return '<div class="ev-block"><h3>Is the alarm still plugged in?</h3>' +
+    '<div class="ev-block-sub">A smoke alarm with a dead battery looks exactly ' +
+    'like one detecting no smoke. These are the numbers that say which one ' +
+    'this is.</div>' +
+    '<div class="ev-health">' +
+    '<div><span class="ev-k">turns</span><span class="ev-v">' + (c.turns || 0) + '</span></div>' +
+    '<div><span class="ev-k">independent cases</span><span class="ev-v">' + (c.cases || 0) + '</span></div>' +
+    '<div><span class="ev-k">largest single case</span><span class="ev-v">' + share + '</span></div>' +
+    '<div><span class="ev-k">baseline</span><span class="ev-v">' +
+      (base.exists ? (base.cases || "?") + " cases" : "none") + '</span></div>' +
+    '</div>' +
+    '<div class="ev-chips">' + chips + missing + '</div>' +
+    '<div class="ev-foot">' + (c.note ? evEsc(c.note) : "") + '</div></div>';
+}
 
 function loadPolicy() {
   return fetch("/api/guardrails").then(r => r.json()).then(d => {
@@ -2691,6 +3102,18 @@ loadBatches();
       to the guardrail audit log with the agent version that was running.
     </div>
     <div id="policy-groups"></div>
+  </section>
+
+  <section class="batchview" id="view-evals">
+    <div class="batch-head" style="justify-content:space-between;width:100%">
+      <h2>Evals &mdash; can we vouch for this build?</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="evals-status" style="font-size:11px;color:var(--text-muted)"></span>
+        <button class="toggle-btn" id="evals-recheck" onclick="recheckEvals()">Re-check</button>
+      </div>
+    </div>
+    <div class="ops-meta" id="evals-meta"></div>
+    <div id="evals-body"></div>
   </section>
 
   <section class="batchview" id="view-ops">
