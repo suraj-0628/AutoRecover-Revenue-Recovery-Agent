@@ -908,9 +908,20 @@
     .pol-meta { flex: 1; min-width: 0 }
     .pol-label { font-size: 12.5px; font-weight: 600; color: var(--text-main);
                  margin-bottom: 3px }
-    .pol-src { font-size: 9.5px; font-weight: 500; color: var(--text-muted);
+    /* "default" is the resting state and should recede; "changed here" is
+       the one worth spotting from across a room when a demo misbehaves. */
+    .pol-src { font-size: 9px; font-weight: 600; color: var(--text-muted);
                border: 1px solid var(--border-color); border-radius: 999px;
-               padding: 1px 6px; margin-left: 4px; vertical-align: 1px }
+               padding: 1px 7px; margin-left: 6px; vertical-align: 1px;
+               letter-spacing: .04em }
+    .pol-src.set { color: #9db4ff; border-color: rgba(48,94,255,.45);
+                   background: rgba(48,94,255,.12) }
+    .pol-src.env { color: var(--accent-purple);
+                   border-color: rgba(210,168,255,.35) }
+    /* The body of a policy group, now that the group is a card. */
+    .pol-body { padding: 4px 14px }
+    .pol-row { transition: background .12s }
+    .pol-row:hover { background: rgba(88,166,255,.03) }
     .pol-lock { font-size: 9.5px; color: #d29922; border: 1px solid #d29922;
                 border-radius: 999px; padding: 1px 6px; margin-left: 4px }
     .pol-what { font-size: 11px; color: var(--text-muted); line-height: 1.5 }
@@ -919,8 +930,9 @@
     .pol-ctl { flex: 0 0 210px; display: flex; justify-content: flex-end;
                align-items: center; padding-top: 2px }
     .pol-slide { display: flex; align-items: center; gap: 10px; width: 100% }
-    .pol-slide input[type=range] { flex: 1; accent-color: var(--accent-blue) }
+    .pol-slide input[type=range] { flex: 1; accent-color: var(--rzp-blue) }
     .pol-val { min-width: 24px; text-align: right; font-size: 13px;
+               font-variant-numeric: tabular-nums; letter-spacing: -0.3px;
                font-weight: 600; color: var(--accent-blue);
                font-variant-numeric: tabular-nums }
     .pol-input { background: #0d1117; border: 1px solid var(--border-color);
@@ -930,7 +942,7 @@
                color: var(--text-muted); font-size: 12px }
     .pol-switch { display: flex; align-items: center; gap: 8px; cursor: pointer;
                   font-size: 12px; color: var(--text-muted) }
-    .pol-switch input { accent-color: var(--accent-blue); width: 15px; height: 15px }
+    .pol-switch input { accent-color: var(--rzp-blue); width: 15px; height: 15px }
     .pol-switch input:disabled { cursor: not-allowed; opacity: .5 }
     .batch-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 6px }
     .batch-head h2 { font-size: 14px; color: var(--text-bright); font-weight: 600;
@@ -1214,8 +1226,15 @@
     <button class="rail-btn" id="rail-ops" onclick="showView('ops')">
       <span class="ico">&#931;</span>OPS
     </button>
+    <!-- A shield, not a cog: this rail is not general settings, it is the six
+         controls deciding what the agent may do to a customer. Inline SVG for
+         the same reason the batch icons are — an emoji ignores currentColor
+         and would render in full colour against three monochrome siblings. -->
     <button class="rail-btn" id="rail-policy" onclick="showView('policy')">
-      <span class="ico">&#9881;</span>POLICY
+      <span class="ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" stroke-width="2" stroke-linecap="round"
+        stroke-linejoin="round" style="vertical-align:-2px"><path
+        d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>GUARDRAIL
     </button>
   </nav>
 
@@ -2389,20 +2408,37 @@ function policyControl(s) {
     ' onchange="setPolicy(\'' + s.key + '\', Number(this.value))"></div>';
 }
 
+/* One icon per policy group, in the same stroke family as the rail and the
+   ops cards — a bare uppercase word looked like a form fieldset rather than
+   part of this product. */
+var POLICY_ICONS = {
+  Contact: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v12H5.17L4 17.17z"/></svg>',
+  Money: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>',
+  Channels: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
+  Safety: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>',
+  _: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>'
+};
+
 function renderPolicy() {
   const groups = {};
   _policySpec.forEach(s => { (groups[s.group] = groups[s.group] || []).push(s); });
   let html = "";
   Object.keys(groups).forEach(g => {
-    html += '<div class="panel" style="margin-bottom:14px"><div class="panel-header">' +
-      '<span class="panel-title">' + esc(g) + '</span></div><div class="panel-body">';
+    html += '<div class="batch-card" style="margin-bottom:14px">' +
+      '<div class="batch-card-top">' +
+        '<span class="batch-ico">' + (POLICY_ICONS[g] || POLICY_ICONS._) + '</span>' +
+        '<span class="batch-title">' + esc(g) + '</span>' +
+        '<span class="batch-n">' + groups[g].length + '</span></div>' +
+      '<div class="pol-body">';
     groups[g].forEach(s => {
       const src = s.source === "operator" ? "changed here"
                 : s.source === "env" ? "from .env" : "default";
+    const srcCls = s.source === "operator" ? " set"
+                 : s.source === "env" ? " env" : "";
       html += '<div class="pol-row' + (s.danger ? " danger" : "") + '">' +
         '<div class="pol-meta"><div class="pol-label">' + esc(s.label) +
         (s.locked ? ' <span class="pol-lock">locked</span>' : "") +
-        ' <span class="pol-src">' + src + '</span></div>' +
+        '<span class="pol-src' + srcCls + '">' + src + '</span></div>' +
         '<div class="pol-what">' + esc(s.what) + '</div>' +
         (s.why ? '<div class="pol-why">' + esc(s.why) + '</div>' : "") +
         '</div><div class="pol-ctl">' + policyControl(s) + '</div></div>';
@@ -2410,6 +2446,27 @@ function renderPolicy() {
     html += "</div></div>";
   });
   document.getElementById("policy-groups").innerHTML = html;
+
+  /* Whether this is stock policy or a tuned one is the first thing to know
+     when you walk up to the screen — a demo behaving oddly is usually a
+     setting somebody moved. */
+  var changed = _policySpec.filter(function (x) { return x.source === "operator"; });
+  var fromEnv = _policySpec.filter(function (x) { return x.source === "env"; });
+  var meta = document.getElementById("policy-meta");
+  if (meta) {
+    meta.innerHTML =
+      '<b>' + _policySpec.length + ' controls</b>' +
+      '<span>over what the agent may do to a customer</span>' +
+      '<span class="sep">|</span>' +
+      (changed.length
+        ? '<span class="ops-pill block">' + changed.length + ' changed here</span>'
+        : '<span class="ops-pill ok">all at defaults</span>') +
+      (fromEnv.length
+        ? '<span>' + fromEnv.length + ' set by the deployment</span>' : '') +
+      '<span class="sep">|</span>' +
+      '<button class="ops-help" onclick="toggleHelp(\'policy-help-body\')">' +
+      'How to read this</button>';
+  }
 }
 
 function setPolicy(key, value) {
@@ -2725,11 +2782,21 @@ loadBatches();
         <button class="toggle-btn" onclick="resetPolicy()">Reset to defaults</button>
       </div>
     </div>
-    <p style="font-size:11.5px;color:var(--text-muted);max-width:760px;margin:0 0 14px">
-      Changes apply to the next agent turn — no restart. The engine is rebuilt
-      per run, so a case already mid-flight finishes under the policy it started
-      with.
-    </p>
+    <div class="ops-meta" id="policy-meta"></div>
+    <div class="ops-help-body" id="policy-help-body">
+      <b>Changes apply to the next agent turn — no restart.</b> The engine is
+      rebuilt per run, so a case already mid-flight finishes under the policy
+      it started with.<br><br>
+      These are not general settings. Each one decides something the agent may
+      or may not do to a customer, and the agent is <b>told</b> when a rule
+      refuses it &mdash; the refusal, its reason and a workable alternative go
+      back into the next turn's briefing, so tightening a rule changes what the
+      agent chooses rather than only what it is prevented from doing.<br><br>
+      <b>changed here</b> means an operator set it on this screen and it
+      overrides the environment; <b>from .env</b> means the deployment set it;
+      <b>default</b> is the value the code ships with. Every refusal is written
+      to the guardrail audit log with the agent version that was running.
+    </div>
     <div id="policy-groups"></div>
   </section>
 
