@@ -76,7 +76,62 @@ def test_it_refuses_to_give_up_while_rungs_remain():
     _case(ladder={"page_push": {"at": "x"}})
     r = _close(outcome="unrecoverable", what_happened="giving up")
     assert r["status"] == "blocked"
-    assert r["next_rung"] == "offer"
+    # This case carries no failure code, so it climbs the fail-closed ladder:
+    # after the silent push comes a FULL-PRICE attempt on another rail, and a
+    # discount only if that fails too. It used to say "offer" here because one
+    # global ladder sent every failure to a discount as rung 2, whatever had
+    # actually gone wrong.
+    assert r["next_rung"] == "rail_switch"
+
+
+def test_the_next_rung_depends_on_what_actually_broke():
+    """One ladder for every failure was the generic-agent problem itself."""
+    from recovery_agent.agent import ladder
+
+    def nxt(**over):
+        rec = {"payment_id": "p", "amount": 1299.0,
+               "customer": {"email": "a@b.com", "contact": "9000000000"},
+               "ladder": {}}
+        rec.update(over)
+        n = ladder.next_rung(rec)
+        return n["rung"] if n else None
+
+    # The account was short: a different DAY, not a different message.
+    assert nxt(failure_code="insufficient_funds") == "silent_retry"
+    # Our own plumbing dropped it: retry, never apologise with money.
+    assert nxt(failure_code="gateway_timeout") == "silent_retry"
+    # The bank refused the instrument: another rail at the same price.
+    assert nxt(failure_code="bank_declined", ladder={"page_push": {"at": "x"}}) \
+        == "rail_switch"
+    # They simply left: price is the honest lever here, and only here.
+    assert nxt(failure_code="customer_cancelled",
+               ladder={"page_push": {"at": "x"}}) == "offer"
+
+
+def test_a_transient_failure_has_no_discount_rung_at_all():
+    """Discounting a gateway timeout pays the customer to forgive our outage."""
+    from recovery_agent.agent import ladder
+    rungs = [k for k, _ in ladder.rungs_for({"failure_code": "network_timeout"})]
+    assert "offer" not in rungs
+    assert rungs[0] == "silent_retry"
+
+
+def test_a_pending_retry_means_the_case_is_waiting_not_exhausted():
+    """C1, 2026-09-03: a funds case was handed to a human while retries were
+    scheduled for the next day and three days out — and the closing note
+    claimed both had failed when neither had run."""
+    from datetime import datetime, timedelta, timezone
+    from recovery_agent.agent import ladder
+
+    soon = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    rec = {"payment_id": "p", "amount": 1299.0, "failure_code": "insufficient_funds",
+           "customer": {}, "ladder": {"silent_retry": {"at": "x"},
+                                      "page_push": {"at": "x"}},
+           "scheduled_job": {"status": "scheduled", "target_timestamp": soon}}
+    assert not ladder.exhausted(rec), "a retry on the clock is not exhaustion"
+
+    rec["scheduled_job"]["status"] = "completed"
+    assert ladder.exhausted(rec), "once it has run, the ladder is done"
 
 
 def test_it_accepts_unrecoverable_once_nothing_is_left():

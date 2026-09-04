@@ -172,9 +172,10 @@ def api_metrics():
 
     policy_compliance_rate = 1.0 - (policy_violations / total) if total > 0 else 1.0
 
-    # Live Memory Store Stats
+    # Live Memory Store Stats — the shared persistent store, not a fresh
+    # in-memory one that would always report zero customers.
     from recovery_agent.agent.memory import CustomerMemoryStore
-    mem_store = CustomerMemoryStore()
+    mem_store = CustomerMemoryStore.live()
     mem_stats = mem_store.get_stats()
 
     # Live Knowledge Graph Stats

@@ -19,6 +19,26 @@ FRONTEND = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agen
 INDEX = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
          / "templates" / "index.html").read_text()
 PAY_PAGE_SRC = FRONTEND
+EXECUTOR = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+            / "batch" / "executor.py").read_text()
+RUN = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+       / "batch" / "run.py").read_text()
+
+
+def _func(src: str, name: str) -> str:
+    """The body of one function, by indentation — not a fixed-size window.
+
+    Slicing N characters after a `def` breaks silently the moment the function
+    grows a comment, which has already happened twice in this repo's tests.
+    """
+    start = src.index(f"def {name}(")
+    lines = src[start:].split("\n")
+    out = [lines[0]]
+    for line in lines[1:]:
+        if line and not line[0].isspace() and not line.startswith(")"):
+            break
+        out.append(line)
+    return "\n".join(out)
 
 
 def rec(**over):
@@ -122,28 +142,57 @@ def test_recovered_money_is_not_counted_as_at_risk():
 
 # ── running a batch ─────────────────────────────────────────────────────
 
-def test_a_run_never_starts_a_second_session_on_one_payment():
-    i = FRONTEND.index("def api_run_batch")
-    body = FRONTEND[i:i + 3000]
-    assert "if pid in active_agent_payments:" in body
-    assert "already being worked" in body
+def test_two_runs_cannot_work_one_batch_at_the_same_time():
+    """The rule the session model rests on, moved up a level: a batch run holds
+    the budget, so a second click while the first is going would spend a second
+    budget against the same customers."""
+    body = _func(FRONTEND, "api_run_batch")
+    assert "already running" in body and "409" in body
 
 
-def test_a_run_is_capped_and_says_so():
+def test_a_case_cannot_be_worked_by_two_runs_at_once():
+    """Belt and braces, because the 409 above only covers one process. Every
+    case carries the run that acted on it and is refused by the next one."""
+    body = _func(EXECUTOR, "precheck")
+    assert 'record.get("batch_run_id") != run_id' in body
+    assert "already_in_a_run" in body
+
+
+def test_a_run_is_bounded_by_a_budget_not_a_per_click_cap():
     """A batch can hold hundreds; a run that quietly worked all of them would
-    send hundreds of emails and burn the payment link quota in one click."""
-    i = FRONTEND.index("def api_run_batch")
-    body = FRONTEND[i:i + 3000]
-    assert "BATCH_RUN_LIMIT" in FRONTEND
-    assert '"limit": limit' in body and '"total_in_batch"' in body
-    assert "limit " in INDEX and "per run" in INDEX, (
-        "a partial run must not read as a complete one"
-    )
+    send hundreds of emails and burn the payment-link quota in one click.
+
+    `BATCH_RUN_LIMIT` was per click, so clicking twice spent twice. The budget
+    lives on the run and every refusal names the resource it ran out of."""
+    from recovery_agent.batch.plan import BatchBudget
+    budget = BatchBudget()
+    assert budget.max_links < budget.max_cases, (
+        "links are the scarce resource: 30 per test account, for its lifetime")
+    assert budget.max_discount_paise == 0
+    assert budget.max_wallclock_seconds > 0
+    assert "budget_" in EXECUTOR and "stop_reason" in RUN
+
+
+def test_a_run_says_what_it_did_not_do():
+    """A partial run must never read as a complete one."""
+    body = _func(RUN, "projection")
+    for field in ("skipped_by_reason", "exception_by_reason", "stop_reason",
+                  "candidates", "acted"):
+        assert field in body, field
 
 
 def test_a_run_skips_cases_with_no_way_to_contact_them():
-    i = FRONTEND.index("def api_run_batch")
-    assert "no way to contact them" in FRONTEND[i:i + 3000]
+    body = _func(EXECUTOR, "precheck")
+    assert "no_contact" in body
+
+
+def test_a_batch_watches_the_links_it_creates(): 
+    """Links go out, customers pay them, and without this nothing notices —
+    the run would report zero recovered however much came back."""
+    body = _func(FRONTEND, "api_run_batch")
+    assert "_watch_for_recovery" in body
+    assert "order_id=link_id" in body, (
+        "the watcher finds the link through order_id")
 
 
 def test_an_unknown_batch_is_rejected():
@@ -178,13 +227,26 @@ def test_recovered_money_is_not_counted_as_at_risk_in_the_header():
     assert "if not _settled(p)" in body
 
 
-def test_recovered_reports_what_arrived_not_what_was_owed():
+def test_recovered_reports_what_arrived_and_never_falls_back_to_what_was_owed():
     """A INR 2,499 order recovered at 5% off brought back INR 2,374.05.
-    Counting the full 2,499 quietly credits the agent with the discount it gave
-    away."""
-    i = FRONTEND.index("def api_payments")
-    body = FRONTEND[i:i + 1800]
-    assert 'p.get("recovered_amount") or p.get("amount")' in body
+    Counting the full 2,499 credits the agent with the discount it gave away.
+
+    The earlier fix reported `recovered_amount or amount`, which still credited
+    the owed figure whenever the amount was missing — and `close_case` never
+    wrote it, so two live records took that branch. The fallback is gone; a
+    settled case without a figure is now surfaced as a data defect instead."""
+    body = _func(FRONTEND, "api_payments")
+    assert 'p.get("recovered_amount") or p.get("amount")' not in body
+    assert 'unattributed_settled' in body
+
+
+def test_close_case_writes_the_amount_it_already_verified():
+    """`closed["amount_recovered"]` comes from ground_truth(verify=True) and was
+    written to the receipt but not to the record the reports read."""
+    TOOLS = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
+             / "agent" / "tools.py").read_text()
+    body = _func(TOOLS, "close_case")
+    assert 'fields["recovered_amount"] = received' in body
 
 
 # ── one notification per customer ───────────────────────────────────────
@@ -317,8 +379,7 @@ def test_every_catalogued_code_classifies_correctly(code, expected):
 def test_the_catalog_is_consulted_before_substrings():
     CLS = (pathlib.Path(__file__).resolve().parents[1] / "src" / "recovery_agent"
            / "agent" / "classify.py").read_text()
-    i = CLS.index("def failure_kind")
-    body = CLS[i:i + 2200]
+    body = _func(CLS, "failure_kind")
     assert "FAILURE_CODE_MAP" in body
     assert body.index("FAILURE_CODE_MAP") < body.index("_METHOD_WORDS"), (
         "substring matching is the fallback, not the rule"

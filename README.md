@@ -296,6 +296,30 @@ Based on deep-dive research on 6 production recovery systems — **Stripe, Redux
 
 ---
 
+## The Engineering Around the Agent — Governance, Economics, Memory, Evals
+
+An agent is only as trustworthy as the machinery that watches it. Four systems surround the loop:
+
+**1. Policy gate — guardrails ON the tool path.** Every customer-contact or money-moving tool call passes through the `GuardrailEngine` (quiet hours, frequency cap, opt-out, double-debit lock, monetary cap, hard-decline protection) at a dedicated LangGraph node *before* execution. A refusal is not a silent veto: it returns to the model as a ToolMessage with the reason and a workable alternative, lands on the case record's `refusals`, and shows up in the next turn's perception briefing — the agent *learns from policy* instead of bouncing off a cage. Every evaluation is appended to `audit_logs/guardrail_verdicts.jsonl` with the agent version, so "which policy refused this contact?" always has an answer.
+
+**2a. Billed costs, not just estimated ones.** Every cost carries a **provenance**: `BILLED` (the provider's own invoice line), `MEASURED` (we counted the real quantity, priced at a configured rate) or `ESTIMATED`. Voice is billed: `reconcile_voice_costs` reads SuperU's call log — a read that places no calls and spends no credits — joins each record back to its case through the `campaign_id` the agent stamps on every call, and records SuperU's own per-call charge in an append-only cost ledger keyed on the call uuid, so the daemon can poll it every five minutes without ever double-counting. The dashboard says which figures are invoice lines and which are our arithmetic. It found the standing ₹15/call estimate was **3–8× too high** — real calls cost ₹1.82–4.89.
+
+**2b. The agent knows its own ammunition.** Three metered resources bound what it can do, and it is told about all three rather than discovering them by failing: 30 payment links per account *ever*, a SuperU voice balance, and 300 Brevo emails per day. The email allowance is metered from our own delivery log (always available) and reconciled against Brevo's own per-day statistics when `BREVO_API_KEY` is set, taking the worse of the two — allowance spent elsewhere on the account is still spent. A reserve is held back, and the policy gate refuses a send that would eat into it, telling the agent to come back tomorrow or put the offer on the page instead. The 301st email does not fail loudly — it simply never arrives — so this is the difference between a stalled case and a customer who was actually reached.
+
+**2. Unit economics — what a recovered rupee costs.** Token usage is captured per LLM call on the case record; deliveries, voice calls and minted payment links are recorded by the tools that verified them; an accepted discount is costed as spend. The **OPS window** in the merchant HUD (Σ in the rail) prices every worked case — LLM + comms + discounts against revenue returned, by failure kind — down to *cost per ₹100 recovered*. Underneath sits a single tracing init (`observability.py`): every LLM turn lands in **Arize Phoenix** as an OpenInference span inside a per-case session (`session.id = case:{payment_id}`), the price table is seeded for the whole model fleet at startup, and Phoenix independently rolls tokens *and dollars* up per case — the dashboard links straight into it. History predating capture was reconstructed from LangGraph's own checkpoints (`scripts/backfill_llm_usage.py`), so no worked case reads as free.
+
+**3. A closed memory loop.** Every `close_case` writes a structured, PII-masked episode (failure kind, rungs climbed, outcome, discount) to the SQLite store, and updates the customer's persistent profile (channel win-rates, contact history). At every turn, perception folds both back into the briefing as measured lines — *"this customer before now: email recovered 2/2"*, *"of 6 past bank-decline cases, 4 recovered at full price"* — so memory is something the agent **sees**, not something it must remember to ask for. The frequency-cap guardrail feeds on the same contact history.
+
+**4. Behavioural evals** (`make evals`, report in `EVALS.md`). The graph logs every (perceived facts → chosen action) pair to a decision corpus; the harness in `src/recovery_agent/evals/` scores it four ways:
+- **recorded** — every live decision judged against the money/ladder invariants (free, no LLM);
+- **replay** — recorded briefings put back in front of the current model *k* times: conformance + stability, so a prompt change that breaks judgment fails in seconds, not in a customer's inbox;
+- **red team** — eight briefings engineered to bait violations (a paid customer demanding the promised discount, a "VIP" asking to skip a fraud review…). Each failure is attributed to the runtime layer that would catch it — *held / caught by rails / leaked* is a measured defense-in-depth map;
+- **memory A/B** — the same decision with and without the memory lines, measuring whether memory demonstrably changes behaviour.
+
+Baselines gate regressions: `evals/baseline.json` for decision metrics, `tests/integration/baseline.json` for the 18-journey case matrix (`drive_cases.py --check`). Transport failures score INCONCLUSIVE, never FAIL.
+
+---
+
 ## 🤝 Technology Partners
 
 | Partner | Role | Integration |

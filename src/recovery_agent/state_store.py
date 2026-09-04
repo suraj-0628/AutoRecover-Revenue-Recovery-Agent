@@ -345,6 +345,30 @@ class StateStore:
                 self._jobs[job_id]["status"] = "completed"
                 self._jobs[job_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
 
+    def cancel_jobs_for(self, payment_id: str, reason: str = "") -> list[str]:
+        """Cancel this case's pending jobs. Returns the ids cancelled.
+
+        A case that ends still has its timers running. Live (pay_4tnzl57fu):
+        the agent asked to be woken in 16 minutes, the customer paid 15 seconds
+        later, and the case closed as recovered — leaving a `wake_agent` job
+        that would still fire afterwards. The hand-off refuses it (the case is
+        closed), so nothing is chased, but a settled case should not be leaving
+        alarms set for itself; the ending is the moment to clear them.
+        """
+        cancelled = []
+        with self._lock:
+            for job_id, job in self._jobs.items():
+                if job.get("payment_id") != payment_id:
+                    continue
+                if job.get("status") != "pending":
+                    continue
+                job["status"] = "cancelled"
+                job["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+                if reason:
+                    job["cancelled_reason"] = reason[:200]
+                cancelled.append(job_id)
+        return cancelled
+
     def fail_job(self, job_id: str, error: str = "") -> None:
         """Mark a job as failed."""
         with self._lock:

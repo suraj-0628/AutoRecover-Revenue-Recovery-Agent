@@ -47,6 +47,30 @@ class CustomerMemoryStore:
             self._store_path = self._persist_dir / "memory_store.json"
             self._load_all()
 
+    _live_instance: "CustomerMemoryStore | None" = None
+    _live_dir: str = ""
+
+    @classmethod
+    def live(cls) -> "CustomerMemoryStore":
+        """The persistent store every live component shares.
+
+        `CustomerMemoryStore()` with no argument is in-memory only — and that
+        is how the frontend and dashboard were constructing it, so every
+        channel win-rate and contact the agent "learned" died with the
+        process. One store, on disk, under STATE_DIR, or the learning is
+        theatre.
+        """
+        target = str(Path(os.getenv("STATE_DIR", "data")) / "memory")
+        if cls._live_instance is None or cls._live_dir != target:
+            cls._live_instance = cls(persist_dir=target)
+            cls._live_dir = target
+        return cls._live_instance
+
+    @classmethod
+    def reset_live(cls) -> None:
+        cls._live_instance = None
+        cls._live_dir = ""
+
     @contextmanager
     def _file_lock(self):
         """Acquire cross-platform file lock for atomic read/write."""
@@ -174,6 +198,25 @@ class CustomerMemoryStore:
         self.save_profile(profile)
         return profile
 
+    def record_contact(self, customer_id: str, channel: str,
+                       payment_id: str = "") -> None:
+        """A message actually went out on this channel, right now.
+
+        Recorded as status="contact" so the frequency cap can count it without
+        it polluting channel win-rates (those count only "success"). This is
+        the data the FrequencyCapGuardrail was starving without — a cap over an
+        empty history is a cap that never fires.
+        """
+        profile = self.get_or_create_profile(customer_id)
+        profile.payment_history.append(PaymentRecord(
+            payment_id=payment_id,
+            amount=0,
+            channel_used=channel or "unknown",
+            status="contact",
+        ))
+        profile.last_contacted = datetime.now(timezone.utc)
+        self.save_profile(profile)
+
     def record_promise_to_pay(
         self,
         customer_id: str,
@@ -263,7 +306,7 @@ class CustomerMemoryStore:
         now = datetime.now(timezone.utc)
         count = 0
         for record in profile.payment_history:
-            if record.channel_used and record.status in ("success", "failed"):
+            if record.channel_used and record.status in ("success", "failed", "contact"):
                 time_diff = (now - record.timestamp).total_seconds()
                 if time_diff < 86400:
                     count += 1

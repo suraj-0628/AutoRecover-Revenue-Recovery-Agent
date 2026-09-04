@@ -96,6 +96,17 @@ def execute_retry(job: dict[str, Any]) -> dict[str, Any]:
     action = job.get("action", "retry_payment")
     method = job.get("metadata", {}).get("method", "card")
 
+    # A wake-up reaches nobody and moves no money, so it needs no gateway —
+    # and must not be refused when Razorpay is unconfigured. It exists so the
+    # agent's own `wait_for_customer` is a promise the system keeps.
+    if action == "wake_agent":
+        return {
+            "status": "woken",
+            "payment_id": payment_id,
+            "reason": job.get("metadata", {}).get("reason", ""),
+            "message": "the wait the agent asked for has elapsed",
+        }
+
     client = RazorpayClient()
 
     if not client.is_configured:
@@ -193,7 +204,7 @@ def _process_due_jobs() -> int:
 
         result = execute_retry(job)
 
-        if result.get("status") in ("retry_created", "link_created"):
+        if result.get("status") in ("retry_created", "link_created", "woken"):
             store.complete_job(job_id)
             store.flush()
             notify_frontend(job, result)
@@ -208,11 +219,33 @@ def _process_due_jobs() -> int:
     return executed_count
 
 
+#: How often to pull SuperU's billed call costs into the ledger. Their
+#: call-ended webhook carries only a uuid and needs a public URL, so polling
+#: the log is the reliable path for a local deployment. The read places no
+#: calls and spends no credits; reconciliation is keyed on each call's uuid,
+#: so polling can never double-count.
+VOICE_RECONCILE_INTERVAL = int(os.getenv("VOICE_RECONCILE_INTERVAL", "300"))
+
+
+def _reconcile_voice_costs() -> None:
+    """Fold SuperU's own per-call charges into the cost ledger. Never raises —
+    accounting must not be able to stop scheduled retries from firing."""
+    try:
+        from recovery_agent.integrations import superu_reconcile
+        out = superu_reconcile.reconcile()
+        if out.get("recorded"):
+            print(f"[daemon] voice costs: recorded {out['recorded']} billed "
+                  f"call(s), INR {out['inr']:.2f}", flush=True)
+    except Exception as e:
+        print(f"[daemon] voice cost reconcile failed: {e}", file=sys.stderr)
+
+
 def daemon_loop():
     """Main daemon loop — polls every POLL_INTERVAL seconds."""
     print(f"[daemon] Starting daemon worker (poll interval: {POLL_INTERVAL}s)")
     print(f"[daemon] Frontend URL: {FRONTEND_URL}")
 
+    last_reconcile = 0.0
     while True:
         try:
             executed = _process_due_jobs()
@@ -221,6 +254,11 @@ def daemon_loop():
         except Exception as e:
             print(f"[daemon] Error in daemon loop: {e}", file=sys.stderr)
 
+        now = time.monotonic()
+        if now - last_reconcile >= VOICE_RECONCILE_INTERVAL:
+            last_reconcile = now
+            _reconcile_voice_costs()
+
         time.sleep(POLL_INTERVAL)
 
 
@@ -228,6 +266,8 @@ def daemon_loop():
 
 def main():
     """Run the daemon worker as a standalone process."""
+    from recovery_agent.observability import init_observability
+    init_observability("daemon")
     daemon_loop()
 
 

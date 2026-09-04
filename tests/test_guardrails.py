@@ -78,16 +78,25 @@ class TestQuietHours:
         assert result.verdict == GuardrailVerdict.PASS
 
     def test_night_deferred(self):
+        """A ringing phone is what quiet hours are for. Email is not deferred —
+        it waits in an inbox — so the deferred action here is the voice call."""
         guardrail = QuietHourGuardrail()
         now = datetime(2026, 1, 1, 22, 0, tzinfo=timezone.utc)  # 10 PM
-        result = guardrail.check(ActionType.SEND_NOTIFICATION, now=now)
+        result = guardrail.check(ActionType.VOICE_CALL, now=now)
         assert result.verdict == GuardrailVerdict.MODIFIED
         assert result.modified_action == ActionType.WAIT_AND_RETRY.value
+
+    def test_an_email_is_not_deferred_at_night(self):
+        """It wakes nobody. Blocking it stalled a live 06:30 recovery."""
+        guardrail = QuietHourGuardrail()
+        now = datetime(2026, 1, 1, 22, 0, tzinfo=timezone.utc)
+        result = guardrail.check(ActionType.SEND_NOTIFICATION, now=now)
+        assert result.verdict == GuardrailVerdict.PASS
 
     def test_early_morning_deferred(self):
         guardrail = QuietHourGuardrail()
         now = datetime(2026, 1, 1, 3, 0, tzinfo=timezone.utc)  # 3 AM
-        result = guardrail.check(ActionType.SEND_NOTIFICATION, now=now)
+        result = guardrail.check(ActionType.VOICE_CALL, now=now)
         assert result.verdict == GuardrailVerdict.MODIFIED
 
     def test_8am_passes(self):
@@ -99,7 +108,7 @@ class TestQuietHours:
     def test_9pm_deferred(self):
         guardrail = QuietHourGuardrail()
         now = datetime(2026, 1, 1, 21, 0, tzinfo=timezone.utc)  # 9 PM
-        result = guardrail.check(ActionType.SEND_NOTIFICATION, now=now)
+        result = guardrail.check(ActionType.VOICE_CALL, now=now)
         assert result.verdict == GuardrailVerdict.MODIFIED
 
     def test_retry_not_deferred_at_night(self):
@@ -279,13 +288,22 @@ class TestGuardrailEngine:
         # Should be escalated, not retried
         assert action == ActionType.ESCALATE_TO_HUMAN
 
-    def test_quiet_hours_modifies_notification(self):
-        """Quiet hours modify SEND_NOTIFICATION to WAIT_AND_RETRY."""
+    def test_quiet_hours_modifies_a_voice_call(self):
+        """Quiet hours defer what INTERRUPTS. A call becomes WAIT_AND_RETRY."""
         engine = GuardrailEngine()
         case = make_case()
         now = datetime(2026, 1, 1, 22, 0, tzinfo=timezone.utc)  # 10 PM
-        action, checks = engine.validate_action(case, ActionType.SEND_NOTIFICATION, now=now)
+        action, checks = engine.validate_action(case, ActionType.VOICE_CALL, now=now)
         assert action == ActionType.WAIT_AND_RETRY
+
+    def test_quiet_hours_leave_an_email_alone(self):
+        """An email waits to be opened, so overnight it still goes. The SMS leg
+        is suppressed inside the dispatcher, not by refusing the whole message."""
+        engine = GuardrailEngine()
+        case = make_case()
+        now = datetime(2026, 1, 1, 22, 0, tzinfo=timezone.utc)
+        action, checks = engine.validate_action(case, ActionType.SEND_NOTIFICATION, now=now)
+        assert action == ActionType.SEND_NOTIFICATION
 
     def test_safe_action_passes_all_guardrails(self):
         """RETRY_PAYMENT on a normal case passes all guardrails."""

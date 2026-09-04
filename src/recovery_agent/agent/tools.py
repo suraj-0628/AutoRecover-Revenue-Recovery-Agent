@@ -114,6 +114,42 @@ def _still_worth_doing(payment_id: str, what: str) -> str:
     return ""
 
 
+def _record_contact(payment_id: str, channels: list[str]) -> None:
+    """A delivery actually happened — write it where the controls can see it.
+
+    Two ledgers, one event: the durable record's `contacts` (per-case, feeds
+    unit economics), and the customer profile's history (cross-case, feeds the
+    frequency-cap guardrail). Recording only claimed deliveries keeps both
+    honest — this is called from the paths that verified delivery, never from
+    the attempt. Never raises.
+    """
+    if not channels:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        from recovery_agent.state_store import StateStore
+        store = StateStore()
+        rec = store.get_payment(payment_id)
+        if rec is not None:
+            contacts = list(rec.get("contacts") or [])
+            contacts.extend({"channel": ch, "at": now_iso} for ch in channels)
+            store.update_payment(payment_id, contacts=contacts)
+            store.flush()
+            customer = (rec.get("customer") or {}).get("email") \
+                or rec.get("customer_email") or "unknown"
+        else:
+            customer = "unknown"
+    except Exception:
+        customer = "unknown"
+    try:
+        from recovery_agent.agent.memory import CustomerMemoryStore
+        profile_store = CustomerMemoryStore.live()
+        for ch in channels:
+            profile_store.record_contact(customer, ch, payment_id=payment_id)
+    except Exception:
+        pass
+
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -522,6 +558,10 @@ def generate_recovery_payment_link(
             # What the customer will actually be charged. Everything the agent
             # then says about price is checked against this.
             case.payment.metadata["recovery_link_amount"] = float(amount)
+            # What the customer can actually pay WITH. The message may tell
+            # them to "try UPI"; that has to be true of the link they are
+            # being sent, not a rail the agent liked the sound of.
+            case.payment.metadata["recovery_link_rails"] = list(rails)
             if expire_by:
                 case.payment.metadata["recovery_link_expire_by"] = int(expire_by)
         # A link on different rails, or at a different price, is a genuinely
@@ -529,6 +569,21 @@ def generate_recovery_payment_link(
         # does not.
         ladder.record_action(payment_id,
                              f"link:{'+'.join(sorted(rails))}:{float(amount):.2f}")
+        # Durable ledger of minted links. Each one spends a unit of a
+        # 30-per-lifetime account quota, so a case must be able to say how many
+        # it consumed after the run's metadata is gone.
+        try:
+            from recovery_agent.state_store import StateStore
+            _st = StateStore()
+            _rec = _st.get_payment(payment_id)
+            if _rec is not None:
+                _links = list(_rec.get("recovery_links") or [])
+                _links.append({"link_id": link_id, "amount": float(amount),
+                               "at": datetime.now(timezone.utc).isoformat()})
+                _st.update_payment(payment_id, recovery_links=_links)
+                _st.flush()
+        except Exception:
+            pass
         return json.dumps({
             "status": "ok",
             "payment_id": payment_id,
@@ -688,7 +743,14 @@ def show_page_offer(
                 st.flush()
         except Exception:
             pass
-        ladder.record_rung(payment_id, "offer", payload["offer_text"])
+        # A banner carrying no discount is not the offer rung — on a bank
+        # decline it is the rail switch (same price, another way to pay), and
+        # recording it as "offer" spent a rung that gave nothing away.
+        _rung = ("rail_switch"
+                 if rail_switch and ladder.has_rung(_live_record(payment_id),
+                                                    "rail_switch")
+                 else "offer")
+        ladder.record_rung(payment_id, _rung, payload["offer_text"])
         ladder.record_action(payment_id, f"page_offer:{payable_amount}", is_rung=True)
 
     return json.dumps({
@@ -732,13 +794,118 @@ def wait_for_customer(
             "reason": str(waiting_for)[:200],
             "expected_within_minutes": minutes,
         }
+
+    # THE WAIT IS A PROMISE, NOT A NOTE.
+    #
+    # This used to write the wait into Case metadata and nothing anywhere read
+    # it, which broke in both directions. Live 2026-09-04 (pay_woo85c9gh): the
+    # agent was refused a link during quiet hours, said "wake me in 60
+    # minutes", and nothing ever did — no timer, no job, no watcher — so the
+    # case sat at awaiting_customer for good. And on the C1 funds case the
+    # opposite: the run was classified `failed`, the ladder hand-off fired ten
+    # seconds later, and the agent was marched up rungs it had explicitly
+    # asked to wait through.
+    #
+    # Registering a real job fixes both. The daemon already polls for due jobs
+    # and calls the frontend back; "wake_agent" is a job that reaches nobody
+    # and moves no money — it just brings the agent back when it asked.
+    woken_at = ""
+    try:
+        from datetime import timedelta
+        from recovery_agent.state_store import StateStore
+        store = StateStore()
+        if store.get_payment(payment_id) is not None:
+            due = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            woken_at = due.isoformat()
+            store.schedule_job(
+                job_id=f"wake_{payment_id}_{int(due.timestamp())}",
+                payment_id=payment_id,
+                target_time=woken_at,
+                action="wake_agent",
+                metadata={"reason": str(waiting_for)[:200]},
+            )
+            store.update_payment(payment_id, waiting_for={
+                "reason": str(waiting_for)[:200],
+                "until": woken_at,
+            })
+            store.flush()
+    except Exception:
+        pass                    # a bookkeeping failure must not break the turn
+
     return json.dumps({
         "status": "ok",
         "payment_id": payment_id,
         "waiting_for": str(waiting_for)[:200],
-        "note": f"Turn ended. You will be started again when this resolves or "
-                f"after about {minutes} minute(s). Do not call any more tools.",
+        "wake_at": woken_at,
+        "note": (f"Turn ended. You will be started again when this resolves or "
+                 f"at {woken_at or f'about {minutes} minute(s) from now'}. "
+                 f"Do not call any more tools."),
     })
+
+
+def _write_episode(payment_id: str, outcome: str, facts: dict,
+                   lesson: str = "") -> None:
+    """One closed case → one structured episode, plus a profile update.
+
+    Namespaced by failure kind so retrieval at case start is "cases like this
+    one", not "everything ever". Text fields are PII-masked before storage —
+    memory outlives cases, and a store full of card numbers and phone numbers
+    is a liability, not a memory. Never raises.
+    """
+    try:
+        from recovery_agent.state_store import StateStore
+        from recovery_agent.agent.classify import failure_kind
+        from recovery_agent.agent.governance import mask_pii
+        from recovery_agent.agent.graph import get_memory_store
+        from recovery_agent.agent import ladder as _lad
+        import uuid as _uuid
+
+        rec = StateStore().get_payment(payment_id) or {}
+        kind = failure_kind(rec) or "unknown"
+        owed = float(facts.get("owed") or 0)
+        received = float(facts.get("received") or 0)
+        discount_pct = (round((owed - received) / owed * 100, 1)
+                        if outcome == "recovered" and owed > 0 and received < owed
+                        else 0.0)
+        climbed = list((_lad.state(rec) or {}).get("climbed") or [])
+        contacts = [c.get("channel", "") for c in (rec.get("contacts") or [])]
+
+        get_memory_store().put(
+            ("recovery", "episodes", ns_safe(kind)), str(_uuid.uuid4()), {
+                "failure_kind": kind,
+                "failure_code": str(rec.get("failure_code") or ""),
+                "outcome": outcome,
+                "amount": owed,
+                "recovered": received,
+                "discount_pct": discount_pct,
+                "climbed": climbed,
+                "contacts": contacts,
+                "payment_id": payment_id,
+                "lesson": mask_pii(str(lesson or ""))[:400],
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+    except Exception:
+        return
+
+    # The profile learns the outcome too: which channel closed it (or failed
+    # to), so "this customer pays when you email them" is a number, not a hunch.
+    try:
+        from recovery_agent.agent.memory import CustomerMemoryStore
+        customer = (rec.get("customer") or {}).get("email") \
+            or rec.get("customer_email") or "unknown"
+        channel = contacts[-1] if contacts else \
+            ("voice" if "voice_call" in climbed else
+             "email" if ("offer" in climbed or "post_call_email" in climbed) else
+             "page" if "page_push" in climbed else "")
+        CustomerMemoryStore.live().update_profile_after_attempt(
+            customer,
+            attempt={"payment_id": payment_id, "amount": received,
+                     "failure_type": kind},
+            success=(outcome == "recovered"),
+            channel=channel,
+        )
+    except Exception:
+        pass
 
 
 @tool
@@ -852,12 +1019,39 @@ def close_case(
             fields = {"closed": closed, "closing_summary": closed["what_happened"]}
             if outcome == "recovered":
                 fields["status"] = "recovered"
+                # Write the figure, not just the verdict.
+                #
+                # This wrote `status` and dropped `closed["amount_recovered"]`,
+                # which is gateway-verified and sitting right there. A case then
+                # read `recovered` with no `recovered_amount`, and /api/payments
+                # papered over it with `recovered_amount or amount` — silently
+                # crediting the FULL owed figure and handing the agent credit
+                # for the discount it gave away.
+                received = float(facts.get("received") or 0)
+                if received > 0:
+                    fields["recovered_amount"] = received
             elif outcome == "escalated":
                 fields["status"] = "escalated"
             else:
                 fields["status"] = "unrecoverable"
+            # An ended case keeps no timers. `wait_for_customer` registers a
+            # real wake-up now, so closing without clearing it leaves an alarm
+            # set on a finished case — live on pay_4tnzl57fu, a 16-minute wake
+            # outlived a recovery that completed in 15 seconds.
+            fields["waiting_for"] = None
             store.update_payment(payment_id, **fields)
+            store.cancel_jobs_for(payment_id, reason=f"case closed: {outcome}")
             store.flush()
+            # The stopping rule, in the record. An auditor asking "why did this
+            # stop?" gets the agent's own stated reason and the outcome it
+            # declared, at the moment it declared them.
+            from recovery_agent import audit
+            rec = store.get_payment(payment_id) or {}
+            audit.record(audit.CASE_CLOSED, payment_id=payment_id,
+                         batch_run_id=rec.get("batch_run_id") or "",
+                         result=outcome, reason=closed["what_happened"],
+                         amount_rupees=closed["amount_recovered"],
+                         climbed=sorted(rec.get("ladder") or {}))
     except Exception as exc:
         return json.dumps({"status": "error",
                            "message": f"could not record the closure: {exc}"})
@@ -882,6 +1076,14 @@ def close_case(
             stored = key
         except Exception as exc:
             stored = f"(not stored: {exc})"
+
+    # The structured episode is NOT optional and NOT the agent's to remember:
+    # every closed case teaches the next one, whether or not the model thought
+    # to write a lesson. What failed, what was climbed, what ended it and at
+    # what price — keyed by failure kind so the next bank-decline can be told
+    # "in six cases like this, the method switch worked four times". Failure to
+    # store must never block a closure.
+    _write_episode(payment_id, outcome, facts, lesson)
 
     return json.dumps({
         "status": "closed",
@@ -1145,24 +1347,131 @@ def get_recovery_offer(
     return json.dumps(body)
 
 
+#: Rails a message might tell the customer to use, and the words people write
+#: them with. Only checked where the text RECOMMENDS one — "your card was
+#: declined, try UPI" names two rails and only the second is a promise.
+_RAIL_WORDS = {
+    "upi": ("upi",),
+    "netbanking": ("netbanking", "net banking", "net-banking", "internet banking"),
+    "card": ("card", "credit card", "debit card"),
+    "wallet": ("wallet",),
+    "emi": ("emi",),
+}
+_RECOMMENDS = re.compile(
+    r"(?:try|use|pay(?:ing)?\s+(?:with|via|using|by)|switch(?:ing)?\s+to|"
+    r"choose|select|opt\s+for)\b[^.;!?]{0,40}?"
+    r"\b(upi|net\s?-?banking|internet banking|card|wallet|emi)\b", re.I)
+#: A money figure only counts as a claim when it is marked as money. Bare
+#: numbers are "16 minutes" and "3 attempts" far more often than prices.
+_MONEY = re.compile(r"(?:₹|INR|Rs\.?)\s*([\d,]+(?:\.\d{1,2})?)", re.I)
+_PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+#: Saying "discount" when none was authorised is a promise the link will not keep.
+_DISCOUNT_WORDS = re.compile(
+    r"\b(discount|% off|percent off|reduced price|special price|"
+    r"cheaper|save(?:\s+₹|\s+INR)?)\b", re.I)
+
+
+def _ungrounded_claims(text: str, facts: dict) -> str:
+    """What this message asserts that the case cannot back up. '' if honest.
+
+    The agent writes the words — tone and wording are exactly what it is good
+    at, and a templated "Reason: <prose>" email was both generic AND wrong.
+    What it must not do is promise something the customer will not find when
+    they click: a price the link does not charge, a discount nobody authorised,
+    or a payment method the link does not accept.
+
+    So the prose is free and the FACTS in it are checked. Same principle as
+    show_page_offer refusing a banner that disagrees with its link.
+    """
+    owed = float(facts.get("owed") or 0)
+    charged = facts.get("charged")
+    pct = float(facts.get("discount_pct") or 0)
+    rails = [str(r).lower() for r in (facts.get("rails") or [])]
+
+    allowed_amounts = {round(owed, 2)} if owed else set()
+    if charged is not None:
+        allowed_amounts.add(round(float(charged), 2))
+        if owed:
+            allowed_amounts.add(round(owed - float(charged), 2))   # "save ₹124.95"
+
+    for raw in _MONEY.findall(text):
+        try:
+            figure = round(float(raw.replace(",", "")), 2)
+        except ValueError:
+            continue
+        if allowed_amounts and not any(abs(figure - a) < 0.01 for a in allowed_amounts):
+            return (f"it quotes ₹{figure:,.2f}, which is neither the amount owed "
+                    f"nor what the link charges "
+                    f"({', '.join(f'₹{a:,.2f}' for a in sorted(allowed_amounts))})")
+
+    for raw in _PERCENT.findall(text):
+        try:
+            claimed = float(raw)
+        except ValueError:
+            continue
+        if pct <= 0:
+            return (f"it claims {claimed:g}% off, but no discount is authorised "
+                    f"on this case")
+        if abs(claimed - pct) > 0.01:
+            return (f"it claims {claimed:g}% off but the authorised discount is "
+                    f"{pct:g}%")
+
+    if pct <= 0 and _DISCOUNT_WORDS.search(text):
+        return ("it promises a discount, but none is authorised on this case — "
+                "the customer would arrive at the full price")
+
+    for match in _RECOMMENDS.finditer(text):
+        word = match.group(1).lower().replace("-", " ").replace("  ", " ")
+        rail = next((k for k, words in _RAIL_WORDS.items()
+                     if any(w == word or w.replace(" ", "") == word.replace(" ", "")
+                            for w in words)), None)
+        if rail and rails and rail not in rails:
+            return (f"it tells the customer to pay by {rail}, which this payment "
+                    f"link does not accept (it takes {', '.join(rails)})")
+    return ""
+
+
 @tool
 def send_recovery_notification(
     payment_id: str,
     customer_email: str,
     customer_phone: str,
     message: str,
+    subject: str = "",
     payment_link: str = "",
     amount: float = 0,
     attempt_count: int = 0,
     runtime=None,
 ) -> str:
-    """Send an email/SMS notification to the customer about the failed payment.
+    """Email/SMS the customer. YOU write it — subject and body both.
+
+    Write for THIS customer and THIS failure. There is no template any more:
+    a bank decline and an abandoned cart used to receive the identical
+    "Payment Recovery: Complete Your Pending Payment", which is the least
+    openable line available and tells the customer nothing they did not know.
+
+    Say what actually happened and what to do about it — "your bank declined
+    the card, UPI works on this link", "here is 5% off to finish your order".
+
+    EVERY FACT YOU STATE IS CHECKED against the case before it is sent:
+      - any ₹ figure must be the amount owed, what the link charges, or the
+        saving between them
+      - any % must be the discount actually authorised, and you may not use
+        the language of a discount when none is authorised
+      - any payment method you tell them to USE must be one the link accepts
+    A message that fails these is refused with the reason, not quietly fixed.
+    This is not about tone — write freely — it is about not promising the
+    customer something they will not find when they click.
 
     Args:
         payment_id: The payment ID
         customer_email: Customer's email address
         customer_phone: Customer's phone number (with country code)
-        message: The message to send
+        message: The body, in your own words. No greeting or sign-off needed.
+        subject: The email subject line. Keep it under 60 characters so it is
+            not truncated on a phone, and put no prices or percentages in it —
+            money belongs in the body where the link is. Leave empty only if
+            you have nothing better than the generic line.
         payment_link: The recovery link URL from generate_recovery_payment_link.
             ALWAYS pass this if you have created one — without it the customer
             gets a message telling them to pay with no way to do so.
@@ -1200,6 +1509,35 @@ def send_recovery_notification(
                         f"amount={float(offered):.2f}, then send the message.",
         })
 
+    # Every FACT the message states, checked against the case. The prose is the
+    # agent's; the promises in it are the system's to keep.
+    _rec_now = _live_record(payment_id)
+    _claims = _ungrounded_claims(f"{subject}\n{message}", {
+        "owed": float(_rec_now.get("amount") or amount or 0),
+        "charged": charged,
+        "discount_pct": meta.get("offer_pct") or 0,
+        "rails": meta.get("recovery_link_rails") or [],
+    })
+    if _claims:
+        return json.dumps({
+            "status": "error",
+            "message": f"this message promises something the case cannot back "
+                       f"up: {_claims}.",
+            "guidance": "Rewrite it so every figure, percentage and payment "
+                        "method matches what the link actually does, then send "
+                        "again. Do not remove the link or the offer — correct "
+                        "the words.",
+        })
+
+    if len(subject) > 60:
+        return json.dumps({
+            "status": "error",
+            "message": f"the subject is {len(subject)} characters; anything past "
+                       f"60 is cut off on a phone, which is where most of these "
+                       f"are read.",
+            "guidance": "Shorten the subject and send again.",
+        })
+
     # Refuse to send a message the customer cannot act on.
     #
     # Live: the link tool failed (Razorpay test-mode quota), the agent sent the
@@ -1231,6 +1569,11 @@ def send_recovery_notification(
             # checkout page" with no link. A recovery message the customer
             # cannot act on is not a recovery.
             recovery_link=payment_link or _last_recovery_link(runtime, payment_id),
+            # The agent's own words, as the subject and the body — not stuffed
+            # into a "Reason:" line inside a template, which is what used to
+            # happen to every message it wrote.
+            subject=subject,
+            body=message,
             failure_reason=message,
             amount=amount,
             attempt_count=attempt_count,
@@ -1252,17 +1595,35 @@ def send_recovery_notification(
                             "show_page_offer, or take another route — do not "
                             "assume they saw anything.",
             })
-        # Which rung an email is depends on what came before it: the first one
-        # carries the offer, one sent after a call is the follow-up the call
-        # agreed to. Same tool, different place on the ladder.
-        rung = "post_call_email" if ladder.climbed(_live_record(payment_id),
-                                                   "voice_call") else "offer"
+        # Which rung an email is depends on what came before it AND on what
+        # broke. One sent after a call is the follow-up the call agreed to. On
+        # a bank decline, a message carrying a FULL-PRICE link is the rail
+        # switch — the customer is being offered another way to pay, not a
+        # cheaper price — and calling that "the offer" made the ladder think
+        # the discount rung was spent when nothing had been discounted.
+        _rec = _live_record(payment_id)
+        if ladder.climbed(_rec, "voice_call"):
+            rung = "post_call_email"
+        else:
+            # Only when we KNOW what the link charges. Defaulting the unknown
+            # case to "the full amount" claimed a rail switch for any message
+            # whose link price was not recorded — the cheap rung would be
+            # marked climbed while the expensive one stayed open, which is the
+            # wrong way round. Unknown price falls back to the offer rung.
+            owed = float(_rec.get("amount") or 0)
+            charged = meta.get("recovery_link_amount")
+            full_price = (owed > 0 and charged is not None
+                          and abs(float(charged) - owed) < 0.01)
+            rung = ("rail_switch"
+                    if full_price and ladder.has_rung(_rec, "rail_switch")
+                    else "offer")
         ladder.record_rung(payment_id, rung, message[:200])
         ladder.record_action(
             payment_id,
             f"notify:{'+'.join(sorted(result.get('channels') or []))}:"
             f"{payment_link or _last_recovery_link(runtime, payment_id)}",
             is_rung=True)
+        _record_contact(payment_id, sorted(result.get("channels") or []))
         return json.dumps({
             "status": "ok",
             "rung": rung,
@@ -1306,7 +1667,14 @@ def retry_in_hours(
         )
         store.flush()
 
-        ladder.record_action(payment_id, f"retry:{round(hours, 1)}h")
+        # A quiet retry IS a rung — the FIRST one for a funds or transient
+        # failure, where contacting the customer cannot fix anything. It used
+        # to record only a free-text action, so the ladder never saw it and a
+        # case that had correctly scheduled a payday retry still read as
+        # "nothing tried yet" and got marched into contact rungs.
+        ladder.record_rung(payment_id, "silent_retry",
+                           f"retry scheduled in {round(hours, 1)}h")
+        ladder.record_action(payment_id, f"retry:{round(hours, 1)}h", is_rung=True)
         return json.dumps({
             "status": "scheduled",
             "job_id": job_id,
@@ -1346,6 +1714,25 @@ def escalate_to_human(
     _rec = _live_record(payment_id)
     _ladder = ladder.state(_rec)
     _barred = ladder.pursuit_barred(_rec)
+
+    # A retry still on the clock is not a stuck case — it is a working one.
+    # Live (C1, 2026-09-03): an insufficient-funds case was handed to a human
+    # while retries were scheduled for the next day AND three days out, and
+    # the closing note claimed both had "failed" when neither had run. For a
+    # short account the pending retry is the single most likely thing to
+    # recover the money; spending a person on it first is pure waste.
+    if ladder.retry_pending(_rec) and not _barred:
+        _job = _rec.get("scheduled_job") or {}
+        return json.dumps({
+            "status": "blocked",
+            "reason": "a retry for this case is already scheduled and has not "
+                      "fired yet, so this is not a case a person needs",
+            "retry_at": _job.get("target_timestamp") or _job.get("target_time"),
+            "guidance": "Call wait_for_customer. You will be started again when "
+                        "the retry runs. Do NOT report the retry as failed — it "
+                        "has not happened yet.",
+        })
+
     if _ladder["remaining"] and not _barred:
         nxt = _ladder["remaining"][0]
         return json.dumps({
@@ -1462,10 +1849,14 @@ def initiate_voice_call(
     # OFF unless explicitly switched on. The tool stays registered and choosable
     # either way — the agent should still learn when a call is the right move,
     # and a disabled result tells it so without spending anything.
-    if os.getenv("VOICE_CALLS_ENABLED", "").strip().lower() not in ("1", "true", "yes", "on"):
+    # Through `ladder.voice_available()`, which reads the operator setting and
+    # falls back to the env var. Reading the env directly here made the
+    # dashboard's voice switch decorative — and worse, it could disagree with
+    # the ladder, so a rung shown as available would refuse when called.
+    if not ladder.voice_available():
         return json.dumps({
             "status": "disabled",
-            "reason": "voice calling is switched off (VOICE_CALLS_ENABLED is not set)",
+            "reason": "voice calling is switched off for this deployment",
             "guidance": "Do not retry this tool. Choose another channel or escalate.",
             "would_have_called": customer_phone,
         })
@@ -1492,9 +1883,13 @@ def initiate_voice_call(
     # the prompt, the agent reached for voice on every follow-up regardless of
     # amount, which would drain a small SuperU allowance in an afternoon.
     try:
-        min_amount = float(os.getenv("VOICE_MIN_AMOUNT_RUPEES", "5000"))
-    except ValueError:
-        min_amount = 5000.0
+        from recovery_agent import guardrail_config
+        min_amount = float(guardrail_config.get("voice_min_amount"))
+    except Exception:
+        try:
+            min_amount = float(os.getenv("VOICE_MIN_AMOUNT_RUPEES", "5000"))
+        except ValueError:
+            min_amount = 5000.0
     if float(amount or 0) < min_amount:
         return json.dumps({
             "status": "blocked",
@@ -1530,6 +1925,7 @@ def initiate_voice_call(
         ladder.record_rung(payment_id, "voice_call",
                            f"called {customer_phone}")
         ladder.record_action(payment_id, f"voice:{customer_phone}", is_rung=True)
+        _record_contact(payment_id, ["voice"])
 
     return json.dumps({
         "status": result.get("status", "unknown"),

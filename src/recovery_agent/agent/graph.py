@@ -15,8 +15,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
-from contextlib import nullcontext
 from typing import Literal
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -29,6 +29,9 @@ from langchain_core.runnables import RunnableConfig
 import opentelemetry
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
+
+from recovery_agent.observability import (KIND_CHAIN, KIND_EVALUATOR,
+                                          KIND_GUARDRAIL, traced_span)
 
 from recovery_agent.agent.tools import (
     RECOVERY_TOOLS, RecoveryContext, TOOLS_BY_NAME,
@@ -195,7 +198,21 @@ YOUR TOOLS (these are the only ones that exist — never invent a name):
                                               link does not charge)
              generate_recovery_payment_link  (customer pays by another method)
              send_recovery_notification      (email/SMS the customer — always
-                                              pass the link_url as payment_link)
+                                              pass the link_url as payment_link.
+                                              YOU write the subject AND the body:
+                                              there is no template, so say what
+                                              actually happened to THIS customer
+                                              ("your bank declined the card, UPI
+                                              works on this link" / "here is 5%
+                                              off to finish"). Every fact is
+                                              checked against the case before it
+                                              sends — a ₹ figure must be what is
+                                              owed or what the link charges, a %
+                                              must be the authorised discount,
+                                              and a method you tell them to use
+                                              must be one the link accepts. Keep
+                                              the subject under 60 characters and
+                                              put no prices in it)
              initiate_voice_call             (AI phone call; best for an
                                               unresponsive customer or a large
                                               amount. May be switched off, in
@@ -227,33 +244,73 @@ HOW TO WORK — follow this order:
 
 2. THEN ACT. After at most one diagnostic round you MUST call a Recover tool.
 
-   THE LADDER — every payment climbs the same rungs, in this order. You choose
-   what to say and when; you do not choose to skip ahead. Each rung is tried
-   only after the one before it has failed to get the money.
+   THE LADDER — there is NOT one ladder. What to try, and in what order,
+   depends on WHAT ACTUALLY BROKE. The briefing above names the ladder for
+   this case and the rung you are on; climb that one. You choose what to say
+   and when; you do not choose to skip ahead, and you do not choose a rung
+   from a different failure's ladder.
 
-     1. page_push          A silent nudge on the checkout page. Costs nothing,
-                           gives nothing away. Always first. Sending it ENDS
-                           YOUR TURN — that is the point of it. You asked the
-                           customer to act; give them the chance. You will be
-                           started again the moment they do, or when the window
-                           closes. Do not prepare the next rung "while you
-                           wait": a customer who is mid-payment does not need a
-                           discount, and offering one gives away money you were
-                           about to receive in full.
-     2. offer              The discount the store policy allows: create the link
-                           at that price, put it on the page with show_page_offer
-                           AND email it with send_recovery_notification. Do both
-                           — the customer may be looking at either.
-     3. voice_call         Ring them, ask why, negotiate inside policy. Only
-                           after the offer has had ~15 minutes to work; the tool
-                           refuses earlier and tells you how long is left.
-     4. post_call_email    Send the link the call agreed to, by email.
-     5. alternate_path     Your call. Something genuinely different from
-                           everything already tried — another rail, a retry
-                           timed to a payday, a different offer shape. There is
-                           no fixed tool for this rung: whatever you choose that
-                           you have not already done counts as it. A repeat of
-                           something that already failed does not.
+     Bank refused the instrument (card declined, expired, mandate dead):
+       page_push -> rail_switch -> offer -> voice_call -> alternate_path
+       They TRIED to pay you. The fix is a different rail at the SAME price —
+       a discount does not make a declined card work. Check
+       get_customer_payment_history for a rail that has worked for them, and
+       create the link at full price. Only if that ALSO fails is a discount
+       the right instrument.
+
+     Account was short (insufficient funds):
+       silent_retry -> page_push -> offer -> alternate_path
+       A timing problem, not a price one. Money off does not put money in
+       their account. Lead with retry_in_hours aimed at when they are likely
+       to be paid (24-72h); do not contact them first.
+
+     Failed in transit (gateway/network timeout, 5xx):
+       silent_retry -> page_push -> alternate_path
+       Nothing was wrong with the customer or their card — our side dropped
+       it. There is NO offer rung here at all: discounting our own outage
+       pays the customer to forgive us. Retry it.
+
+     They chose not to complete (drop-off, cancelled, abandoned):
+       page_push -> offer -> voice_call -> post_call_email -> alternate_path
+       Nothing broke; they walked away. This is the ONE family where price is
+       the honest lever, so this is the only ladder where the discount comes
+       early.
+
+     Anything you cannot classify:
+       page_push -> rail_switch -> offer -> alternate_path
+       Fail closed: full price before any discount.
+
+   What the rungs mean:
+     page_push        A silent nudge on the checkout page. Costs nothing,
+                      gives nothing away. Sending it ENDS YOUR TURN — that is
+                      the point of it. You asked the customer to act; give
+                      them the chance. You will be started again the moment
+                      they do, or when the window closes. Do not prepare the
+                      next rung "while you wait": a customer who is
+                      mid-payment does not need a discount, and offering one
+                      gives away money you were about to receive in full.
+     silent_retry     retry_in_hours. Reaches nobody, costs nothing, and for a
+                      short account or a gateway wobble it is the ONLY thing
+                      that can work. After scheduling it, call
+                      wait_for_customer — the retry needs hours, not minutes.
+     rail_switch      The SAME amount on a different payment method. Create
+                      the link at FULL price and put it in front of them
+                      (show_page_offer with discount_pct=0, and/or email it).
+                      This rung gives nothing away — it is a route, not a deal.
+     offer            The discount the store policy allows: create the link at
+                      that price, put it on the page with show_page_offer AND
+                      email it with send_recovery_notification. Do both — the
+                      customer may be looking at either.
+     voice_call       Ring them, ask why, negotiate inside policy. Only after
+                      the offer has had ~15 minutes to work; the tool refuses
+                      earlier and tells you how long is left.
+     post_call_email  Send the link the call agreed to, by email.
+     alternate_path   Your call. Something genuinely different from everything
+                      already tried — another rail, a retry timed to a payday,
+                      a different offer shape. There is no fixed tool for this
+                      rung: whatever you choose that you have not already done
+                      counts as it. A repeat of something that already failed
+                      does not.
      6. escalate_to_human  ONLY when every rung above has been tried and the
                            money is still not back. Filing the ticket is not the
                            end of your work — follow it with close_case
@@ -575,9 +632,13 @@ def _get_otel_tracer():
     if _OTEL_TRACER is not None:
         return _OTEL_TRACER
     try:
+        # The shared init is idempotent; calling it here means even a bare
+        # graph invocation (evals replay, a script) is traced — not only
+        # runs that entered through the frontend.
+        from recovery_agent.observability import init_observability
+        init_observability("agent-graph")
         # Always use the globally registered provider — never create a second one
         _OTEL_TRACER = trace.get_tracer("recovery-agent")
-        print(f"[OTel] Tracer initialized → recovery-agent", flush=True)
         return _OTEL_TRACER
     except Exception:
         _OTEL_TRACER = trace.get_tracer("recovery-agent")
@@ -620,6 +681,17 @@ def _get_context(config: RunnableConfig | None):
 
     runtime = configurable.get("__pregel_runtime")
     return getattr(runtime, "context", None) if runtime else None
+
+
+#: Errors that mean "this MODEL cannot serve the request" — as opposed to "the
+#: request is wrong". Every one of them should move to the next fallback model
+#: rather than end the run: a 404/model_not_found/credentials error says
+#: nothing about the other five models in the chain.
+_UNAVAILABLE_MODEL = re.compile(
+    r"\b(404|429|502|503|504)\b"
+    r"|model_not_found|no active credentials|not found for (?:api|model)"
+    r"|insufficient_quota|overloaded|unavailable",
+    re.I)
 
 
 def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
@@ -709,11 +781,14 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
     # Putting the facts in front of it every turn is the difference between an
     # agent that cannot act and one that knows it should not.
     briefing = []
+    briefing_facts: dict = {}
+    pid = ""
     try:
         from recovery_agent.agent.perception import ground_truth, as_briefing
         pid = getattr(getattr(case, "payment", None), "payment_id", "") if case else ""
         if pid:
-            briefing = [SystemMessage(content=as_briefing(ground_truth(pid)))]
+            briefing_facts = ground_truth(pid)
+            briefing = [SystemMessage(content=as_briefing(briefing_facts))]
     except Exception:
         pass
 
@@ -749,7 +824,7 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
         "antigravity/gemini-2.5-flash",  # last resort — 5 RPM limit
     ]
 
-    with tracer.start_as_current_span(f"agent_turn_{turn_number}") if tracer else nullcontext():
+    with traced_span(f"agent_turn_{turn_number}", kind=KIND_CHAIN, tracer=tracer):
         last_error = None
         for attempt in range(len(_fallback_models)):
             try:
@@ -767,6 +842,22 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
                 if hasattr(response, "tool_calls") and response.tool_calls:
                     tool_calls = [tc["name"] for tc in response.tool_calls]
 
+                # Two ledgers, written while the facts are still in hand: what
+                # this call cost (unit economics), and what was decided given
+                # what was perceived (the eval corpus).
+                if pid:
+                    try:
+                        from recovery_agent.economics import record_llm_usage
+                        from recovery_agent.agent.decision_log import log_decision
+                        model_label = ((getattr(response, "response_metadata", None) or {})
+                                       .get("model_name") or current_model)
+                        record_llm_usage(pid, model_label,
+                                         getattr(response, "usage_metadata", None))
+                        log_decision(pid, turn_number, model_label, briefing_facts,
+                                     list(getattr(response, "tool_calls", None) or []))
+                    except Exception:
+                        pass
+
                 span = trace.get_current_span()
                 if span and span.is_recording():
                     span.set_attribute("agent.turn", turn_number)
@@ -779,10 +870,18 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
             except Exception as e:
                 err_str = str(e).lower()
                 last_error = e
-                # On 502/429/rate-limit, try next fallback model
-                if "502" in str(e) or "429" in str(e) or "rate" in err_str or "server_error" in err_str:
+                # Anything that means "THIS model cannot serve you" moves to the
+                # next model. A 404 was missing from this list, so a provider
+                # losing its credentials — `404 No active credentials for
+                # provider: gemini`, the single commonest outage signal — was
+                # treated as fatal and killed the whole run on the FIRST model,
+                # with five healthy fallbacks below it never tried. The chain
+                # exists for exactly this and was being bypassed by it.
+                if (_UNAVAILABLE_MODEL.search(str(e))
+                        or "rate" in err_str or "server_error" in err_str):
                     if attempt < len(_fallback_models) - 1:
-                        print(f"[Agent] Rate limit/error on {current_model} ({type(e).__name__}), trying fallback...", flush=True)
+                        print(f"[Agent] {current_model} unavailable ({type(e).__name__}), "
+                              f"trying next fallback...", flush=True)
                         continue
                 # On 400/bad-request, retry with same model (might be transient)
                 if "400" in str(e) or "bad request" in err_str or "invalid_argument" in err_str:
@@ -926,7 +1025,7 @@ def tool_repetition_guard(state: RecoveryState, config: RunnableConfig = None) -
         ctx.case.status = CaseStatus.ACTING
 
     tracer = _get_otel_tracer()
-    with tracer.start_as_current_span("tool_repetition_guard") if tracer else nullcontext():
+    with traced_span("tool_repetition_guard", kind=KIND_GUARDRAIL, tracer=tracer):
         messages = state["messages"]
         last_message = messages[-1]
 
@@ -1110,7 +1209,7 @@ def mask_tool_outputs_node(state: RecoveryState, config: RunnableConfig = None) 
     MANDATE 3: This is a security guardrail (acceptable pipeline), not LLM reasoning.
     """
     tracer = _get_otel_tracer()
-    with tracer.start_as_current_span("mask_tool_outputs") if tracer else nullcontext():
+    with traced_span("mask_tool_outputs", kind=KIND_GUARDRAIL, tracer=tracer):
         messages = state["messages"]
         masked_messages = []
         masked_count = 0
@@ -1278,7 +1377,50 @@ _APPROVAL_REQUIRED_TOOLS: set[str] = set()
 # link for INR 75,981 and escalated instead of offering, so the customer never saw
 # the discount UI at all. Charging someone what they already owe — or less — is not
 # the risk. The risk was the INR 3,999 discount, and that is what is capped now.
-_APPROVAL_DISCOUNT_THRESHOLD = float(os.getenv("APPROVAL_DISCOUNT_THRESHOLD", "5000"))
+# Read per call, not frozen at import. As a module constant this was the most
+# decorative control of the three: an operator moving the ceiling in the
+# dashboard changed nothing, and even an env change needed a full restart —
+# the value was baked in the first time the module loaded.
+_APPROVAL_DISCOUNT_DEFAULT = float(os.getenv("APPROVAL_DISCOUNT_THRESHOLD", "5000"))
+
+
+def approval_discount_threshold() -> float:
+    """The most that may be given away on one order without a human."""
+    try:
+        from recovery_agent import guardrail_config
+        return float(guardrail_config.get("max_discount_giveaway"))
+    except Exception:
+        return _APPROVAL_DISCOUNT_DEFAULT
+
+
+class _Threshold(float):
+    """Back-compat shim: `_APPROVAL_DISCOUNT_THRESHOLD` still reads as a float
+    for the tests and callers that import it, while comparisons and formatting
+    resolve the LIVE value rather than the one captured at import."""
+
+    def __new__(cls):
+        return super().__new__(cls, _APPROVAL_DISCOUNT_DEFAULT)
+
+    def _live(self) -> float:
+        return approval_discount_threshold()
+
+    def __float__(self): return self._live()
+    def __gt__(self, other): return self._live() > other
+    def __lt__(self, other): return self._live() < other
+    def __ge__(self, other): return self._live() >= other
+    def __le__(self, other): return self._live() <= other
+    def __eq__(self, other): return self._live() == other
+    def __ne__(self, other): return self._live() != other
+    def __hash__(self): return hash(self._live())
+    def __rsub__(self, other): return other - self._live()
+    def __sub__(self, other): return self._live() - other
+    def __radd__(self, other): return other + self._live()
+    def __add__(self, other): return self._live() + other
+    def __format__(self, spec): return format(self._live(), spec)
+    def __repr__(self): return repr(self._live())
+
+
+_APPROVAL_DISCOUNT_THRESHOLD = _Threshold()
 
 # Only these create a payment obligation, so only these are subject to the
 # amount threshold. Diagnostics take an `amount` too and must never be gated.
@@ -1321,7 +1463,7 @@ def human_approval_gate(state: RecoveryState, config: RunnableConfig = None) -> 
     """
     ctx = _get_context(config)
     tracer = _get_otel_tracer()
-    with tracer.start_as_current_span("human_approval_gate") if tracer else nullcontext():
+    with traced_span("human_approval_gate", kind=KIND_GUARDRAIL, tracer=tracer):
         messages = state["messages"]
         last_message = messages[-1]
 
@@ -1419,18 +1561,75 @@ def human_approval_gate(state: RecoveryState, config: RunnableConfig = None) -> 
 # SELF-CRITIQUE — agent critiques its own recovery (P0)
 # ═══════════════════════════════════════════════════════════════
 
-SELF_CRITIQUE_PROMPT = """You are a recovery agent reviewing your own performance.
+SELF_CRITIQUE_PROMPT = """This case ended without you recording why. Write the
+lesson that was never written.
 
-Review the conversation above and produce a brief self-critique.
-Focus on:
-1. What recovery strategy did you choose and why?
-2. Did it work? What was the outcome?
-3. What would you do differently next time for this customer/failure type?
+You are not summarising the case. A summary of one payment helps nobody: the
+next recovery is a different customer, a different amount, a different day, and
+what it needs from you is a RULE it can apply, not a story about someone else.
 
-Be specific and actionable. Store lessons that would help future recovery attempts.
-Call manage_memory with your critique as the content."""
+Write ONE lesson, under 60 words, in this shape:
+    "For <kind of failure>, <what to do>, because <what was observed>."
 
-def self_critique_node(state: RecoveryState) -> dict:
+Good:  "For bank declines, switch rails before offering money — this customer
+        had 10 netbanking successes and the decline was the bank, not the price."
+Bad:   "SELF-CRITIQUE — Case pay_abc (Suraj, INR 59,976). Rung 1: sent a page
+        push. Rung 2: created a link..."
+
+If the case ended badly, say what the earlier signal was that should have been
+read differently. If nothing generalisable happened, say so in one line and
+store nothing.
+
+Call manage_memory once with that lesson, or reply with one sentence and no
+tool call."""
+
+
+def _closed_deliberately(messages: list) -> bool:
+    """Did the agent record its own ending this run, via close_case?"""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            break                       # only THIS run's messages count
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "close_case":
+            try:
+                if json.loads(str(msg.content)).get("status") == "closed":
+                    return True
+            except (ValueError, TypeError):
+                continue
+    return False
+
+
+def _route_after_stopping(state: RecoveryState,
+                          config: RunnableConfig = None
+                          ) -> Literal["self_critique", "__end__"]:
+    """Reflect only when the case ended and nobody wrote down why.
+
+    This used to be an unconditional edge, so EVERY run paid for a reflection
+    LLM call — including a run whose only act was a page push and which is now
+    waiting on the customer. Worse, it was mostly redundant: `close_case`
+    already stores the agent's considered lesson at the moment it decides the
+    ending, and those read like rules ("For customer_cancelled failures, a
+    silent page push is highly effective when...") while the critique's read
+    like case files ("SELF-CRITIQUE — Case pay_x. Rung 1: ..."). Both land in
+    the same namespace, so the narration diluted retrieval of the signal.
+
+    The narrow slot where a critique still earns its place: a case that reached
+    a terminal state WITHOUT the agent calling close_case — it hit the turn
+    cap, ran out of moves, or fell silent. Nothing else will record why.
+    """
+    if _closed_deliberately(state["messages"]):
+        return "__end__"                # the better lesson is already stored
+
+    ctx = _get_context(config)
+    case = getattr(ctx, "case", None) if ctx else None
+    if case is None:
+        return "__end__"
+    if getattr(case, "status", None) in (CaseStatus.RECOVERED,
+                                         CaseStatus.ESCALATED,
+                                         CaseStatus.STOPPED):
+        return "self_critique"
+    return "__end__"                    # still in flight; a lesson is premature
+
+def self_critique_node(state: RecoveryState, config: RunnableConfig = None) -> dict:
     """After recovery completes, LLM critiques its own performance.
 
     MANDATE 3: The LLM genuinely decides what to critique — not hardcoded.
@@ -1439,8 +1638,12 @@ def self_critique_node(state: RecoveryState) -> dict:
     """
     from recovery_agent.agent.tools import TOOLS_BY_NAME
 
+    _ctx = _get_context(config)
+    _pid = str(getattr(getattr(getattr(_ctx, "case", None), "payment", None),
+                       "payment_id", "") or "")
+
     tracer = _get_otel_tracer()
-    with tracer.start_as_current_span("self_critique") if tracer else nullcontext():
+    with traced_span("self_critique", kind=KIND_EVALUATOR, tracer=tracer):
         model = _build_model_for_task("self_critique", tools=[TOOLS_BY_NAME["manage_memory"]])
 
         # A blind tail-slice can cut a tool call away from its result, which is
@@ -1473,6 +1676,19 @@ def self_critique_node(state: RecoveryState) -> dict:
                         print(f"[SelfCritique] ignored out-of-scope tool calls: "
                               f"{dropped}", flush=True)
                         response = response.model_copy(update={"tool_calls": keep})
+
+                # The critique burns tokens like any other turn; the case pays
+                # for its own reflection.
+                if _pid:
+                    try:
+                        from recovery_agent.economics import record_llm_usage
+                        record_llm_usage(
+                            _pid,
+                            ((getattr(response, "response_metadata", None) or {})
+                             .get("model_name") or "self_critique"),
+                            getattr(response, "usage_metadata", None))
+                    except Exception:
+                        pass
 
                 span = trace.get_current_span()
                 if span and span.is_recording():
@@ -1515,7 +1731,7 @@ def stopping_check(state: RecoveryState, config: RunnableConfig) -> dict:
     from recovery_agent.agent.stopping import check_stopping_rules, transition_to_active_tier
 
     tracer = _get_otel_tracer()
-    with tracer.start_as_current_span("stopping_check") if tracer else nullcontext():
+    with traced_span("stopping_check", kind=KIND_GUARDRAIL, tracer=tracer):
         ctx = _get_context(config)
         if ctx is None:
             return {}
@@ -1637,7 +1853,7 @@ def _route_after_approval(state: RecoveryState) -> Literal["tools", "agent"]:
 
 def _route_after_guard(
     state: RecoveryState,
-) -> Literal["human_approval_gate", "agent", "stopping_check"]:
+) -> Literal["policy_gate", "agent", "stopping_check"]:
     """Execute the tools, hand back to the agent, or leave the loop.
 
     Sending a blocked agent back to `agent` every time is what produced the doom
@@ -1653,14 +1869,37 @@ def _route_after_guard(
     if isinstance(last_message, SystemMessage) and "[Guardrail]" in last_message.content:
         return "agent"
 
+    return "policy_gate"
+
+
+def _route_after_policy(state: RecoveryState) -> Literal["human_approval_gate", "agent"]:
+    """A policy refusal goes back to the agent with the reason; otherwise the
+    approval gate gets its look. Same contract as _route_after_approval."""
+    last = state["messages"][-1]
+    if isinstance(last, SystemMessage) and "[Guardrail]" in (last.content or ""):
+        return "agent"
     return "human_approval_gate"
 
 
 def _route_after_critique(state: RecoveryState) -> Literal["critique_tools", "__end__"]:
-    """Route self_critique output — if it made tool calls, execute them."""
-    messages = state["messages"]
-    last_message = messages[-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+    """Route self_critique output — only a memory write may run here.
+
+    `critique_tools` holds `manage_memory` and nothing else, so anything else
+    routed into it comes back as "X is not a valid tool". That is not
+    hypothetical: when the critique's own LLM call FAILS, the node returns
+    `{"phase": ...}` with no message, and this function then read
+    `messages[-1]` — which is still the AGENT's last turn, carrying whatever it
+    had asked for. Live (pay_qssihjc5z), an agent that had correctly decided to
+    email a full-price rail switch had that call fed to the memory node and
+    rejected: "send_recovery_notification is not a valid tool, try one of
+    [manage_memory]". The customer got nothing.
+
+    So the gate is what the calls ARE, not merely that some exist.
+    """
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
+        return "__end__"
+    if all(tc.get("name") == "manage_memory" for tc in last_message.tool_calls):
         return "critique_tools"
     return "__end__"
 
@@ -1670,20 +1909,25 @@ def build_graph():
 
     Pattern:
         START → agent → should_continue
-            → [tool_repetition_guard → [human_approval_gate → tools → agent | agent] | stopping_check → END]
+            → [tool_repetition_guard → [policy_gate → [human_approval_gate → tools → agent | agent] | agent] | stopping_check → END]
             → self_critique → END
 
     Guardrails:
         - tool_repetition_guard: prevents same tool+args called twice
-        - human_approval_gate: pauses for approval on high-value recoveries (HITL)
+        - policy_gate: GuardrailEngine on the tool path — quiet hours, frequency
+          cap, opt-out, double-debit lock, monetary cap, hard declines. A
+          refusal is recorded on the case and shows up in the next briefing.
+        - human_approval_gate: refuses give-aways over the discount ceiling
         - stopping_check: enforces tier transitions and max attempts
         - self_critique: agent critiques its own performance after recovery
     """
     builder = StateGraph(RecoveryState, context_schema=RecoveryContext)
 
     # Nodes
+    from recovery_agent.agent.policy_gate import policy_gate
     builder.add_node("agent", agent_node)
     builder.add_node("tool_repetition_guard", tool_repetition_guard)
+    builder.add_node("policy_gate", policy_gate)
     builder.add_node("human_approval_gate", human_approval_gate)
     builder.add_node("tools", _build_tool_node())
     builder.add_node("stopping_check", stopping_check)
@@ -1698,11 +1942,19 @@ def build_graph():
         "stopping_check": "stopping_check",
     })
 
-    # Guard → route (back to agent if blocked, to approval gate if ok)
+    # Guard → route (back to agent if blocked, to the policy gate if ok)
     builder.add_conditional_edges("tool_repetition_guard", _route_after_guard, {
-        "human_approval_gate": "human_approval_gate",
+        "policy_gate": "policy_gate",
         "agent": "agent",
         "stopping_check": "stopping_check",
+    })
+
+    # Policy gate → approval gate, or back to the agent with the refusal.
+    # Order matters: policy first, then money. An action against policy must
+    # never reach the discount arithmetic, let alone the ToolNode.
+    builder.add_conditional_edges("policy_gate", _route_after_policy, {
+        "human_approval_gate": "human_approval_gate",
+        "agent": "agent",
     })
 
     # Approval gate → tools, or back to the agent if it refused the action.
@@ -1721,7 +1973,10 @@ def build_graph():
 
     # Stopping check → self-critique → critique_tools → end
     # ToolNode after self_critique allows manage_memory to actually execute
-    builder.add_edge("stopping_check", "self_critique")
+    builder.add_conditional_edges("stopping_check", _route_after_stopping, {
+        "self_critique": "self_critique",
+        "__end__": END,
+    })
     from recovery_agent.agent.tools import TOOLS_BY_NAME as _TBNAME
     builder.add_node("critique_tools", _build_tool_node(tools=[_TBNAME["manage_memory"]]))
     builder.add_conditional_edges("self_critique", _route_after_critique, {

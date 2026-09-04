@@ -105,7 +105,10 @@ def test_the_briefing_says_when_escalation_is_finally_allowed(tmp_path):
 def test_the_briefing_is_injected_on_every_turn():
     i = GRAPH.index("PERCEPTION — recomputed every turn")
     body = GRAPH[i:i + 1600]
-    assert "as_briefing(ground_truth(pid))" in body
+    # The facts are computed once and kept — the briefing renders them AND the
+    # decision log records them, so what the model saw is what the eval replays.
+    assert "briefing_facts = ground_truth(pid)" in body
+    assert "as_briefing(briefing_facts)" in body
     assert "SystemMessage" in body
 
 

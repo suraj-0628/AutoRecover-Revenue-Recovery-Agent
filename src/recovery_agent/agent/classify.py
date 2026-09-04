@@ -50,6 +50,10 @@ _TRANSIENT_WORDS = ("timeout", "timed out", "network", "gateway", "unavailable",
 _DROPOFF_WORDS = ("cancel", "dropoff", "drop_off", "abandon", "closed")
 _RISK_WORDS = ("fraud", "risk", "dispute", "chargeback", "suspected", "frozen")
 
+#: Values of `decline_strategy` that name a state rather than a cause. Treating
+#: these as a diagnosis would be worse than treating the field as empty.
+_NOT_A_CAUSE = {"", "no_response", "unknown", "none", "null"}
+
 
 def failure_kind(record: dict) -> str:
     """What kind of problem this is — method, funds, transient, dropoff, risk.
@@ -65,17 +69,77 @@ def failure_kind(record: dict) -> str:
     matching is the fallback for codes the catalog has never seen, not the rule.
     """
     code = str(record.get("failure_code") or "").strip().lower()
-    try:
-        from recovery_agent.agent.diagnosis import FAILURE_CODE_MAP
-        known = FAILURE_CODE_MAP.get(code)
-        if known is not None:
-            kind = _KIND_BY_TYPE.get(getattr(known, "value", str(known)))
-            if kind:
-                return kind
-    except Exception:
-        pass
 
-    blob = f"{code} {record.get('failure_reason') or ''}".lower()
+    # `decline_strategy` is where the cause actually lives.
+    #
+    # `failure_code` is set on 14 of 80 live records; `decline_strategy` — which
+    # `frontend.py` writes on every run — is set on 73. Reading only the first
+    # put five cases worth INR 17,995 into the drop-off batch, four of them
+    # `card_expired` and one `insufficient_funds`, in the batch whose whole
+    # premise is "the only lever here is a reason to come back".
+    #
+    # Nothing leaked, because `get_recovery_offer` re-derives the kind from the
+    # same empty field, gets `unknown`, and fails closed. The control held by
+    # accident. A batch plan is decided once and applied many times, so bad
+    # input here is multiplied by the size of the batch.
+    strategy = str(record.get("decline_strategy") or "").strip().lower()
+    if strategy in _NOT_A_CAUSE:
+        strategy = ""
+
+    reason = str(record.get("failure_reason") or "").lower()
+
+    def _catalog(candidate: str) -> str:
+        if not candidate:
+            return ""
+        try:
+            from recovery_agent.agent.diagnosis import FAILURE_CODE_MAP
+            known = FAILURE_CODE_MAP.get(candidate)
+        except Exception:
+            return ""
+        if known is None:
+            return ""
+        return _KIND_BY_TYPE.get(getattr(known, "value", str(known)), "")
+
+    def _words(blob: str) -> str:
+        if any(w in blob for w in _RISK_WORDS):
+            return "risk"
+        if any(w in blob for w in _FUNDS_WORDS):
+            return "funds"
+        if any(w in blob for w in _TRANSIENT_WORDS):
+            return "transient"
+        if any(w in blob for w in _METHOD_WORDS):
+            return "method"
+        if any(w in blob for w in _DROPOFF_WORDS):
+            return "dropoff"
+        return ""
+
+    # PRECEDENCE: evidence about THIS failure beats a field derived from an
+    # earlier one.
+    #
+    # `decline_strategy` used to be consulted right after `failure_code`, ahead
+    # of the failure text. Live (pay_qssihjc5z, INR 12,495): the customer
+    # cancelled once, so the frontend wrote decline_strategy="customer_cancelled";
+    # their next attempt was declined BY THE BANK, arriving as the generic
+    # wrapper code BAD_REQUEST_ERROR with "declined by the bank" in the reason.
+    # The wrapper missed the catalog, the stale strategy hit it, and a bank
+    # decline was classified as a drop-off — which authorised 5% off (INR
+    # 624.75) on a payment the customer had been trying to MAKE.
+    #
+    # The reason text describes the failure in hand; the strategy is a
+    # left-over. So: exact code, then the live text, then the derived field.
+    kind = _catalog(code)
+    if kind:
+        return kind
+
+    kind = _words(f"{code} {reason}")
+    if kind:
+        return kind
+
+    kind = _catalog(strategy)
+    if kind:
+        return kind
+
+    blob = f"{code} {strategy} {reason}"
     if any(w in blob for w in _RISK_WORDS):
         return "risk"
     if any(w in blob for w in _FUNDS_WORDS):
@@ -90,28 +154,44 @@ def failure_kind(record: dict) -> str:
 
 
 #: Ordered so the most actionable batch reads first. `key` is the API/URL id.
+#: `runnable` says whether a single shared plan may act on the whole bucket.
+#: It lives here rather than in the page, because "can this be worked in
+#: bulk" is a property of the failure class, not of how it is displayed.
 BATCHES: list[dict[str, str]] = [
     {"key": "bank_declined", "title": "Bank declined",
      "what": "The instrument was refused. These need a different rail, at full "
-             "price — the price was never the problem."},
+             "price — the price was never the problem.",
+     "runnable": True},
     {"key": "insufficient_funds", "title": "No money at the time",
      "what": "The account was short. These need a different day, not a "
-             "different message — retry timed to when they are likely paid."},
+             "different message — retry timed to when they are likely paid.",
+     "runnable": True},
     {"key": "transient", "title": "Failed in transit",
      "what": "The gateway or the network dropped it — nothing was wrong with "
              "the customer or the card. These want a retry, not a message and "
-             "certainly not a discount."},
+             "certainly not a discount.",
+     "runnable": True},
     {"key": "dropoff", "title": "Chose not to complete",
      "what": "Nothing broke; they walked away. The only lever here is a reason "
-             "to come back, which is what an offer is for."},
+             "to come back, which is what an offer is for.",
+     "runnable": True},
     {"key": "awaiting_retry", "title": "Retry already scheduled",
      "what": "A silent retry is on the clock. Nothing to do until it fires — "
-             "listed so the money is visible, not forgotten."},
+             "listed so the money is visible, not forgotten.",
+     "runnable": False},
     {"key": "escalated", "title": "With a human",
-     "what": "The ladder was exhausted and a person has the case."},
+     "what": "The ladder was exhausted and a person has the case.",
+     "runnable": False},
+    {"key": "unclassified", "title": "Cause not established",
+     "what": "The failure code, the decline strategy and the reason text all "
+             "came back empty or unrecognised. A batch plan needs a shared "
+             "cause to stand on, so these are not planned — they go to the "
+             "agent one at a time.",
+     "runnable": False},
     {"key": "risk", "title": "Risk / dispute",
      "what": "Fraud, risk or a dispute. These are not chased — they go straight "
-             "to a person."},
+             "to a person.",
+     "runnable": False},
 ]
 
 BATCH_BY_KEY = {b["key"]: b for b in BATCHES}
@@ -170,7 +250,15 @@ def classify(record: dict) -> str | None:
         return "bank_declined"
     if kind == "dropoff":
         return "dropoff"
-    return "dropoff"          # an unclassified drop is still a drop
+
+    # An unclassified failure is NOT a drop-off.
+    #
+    # This used to end `return "dropoff"  # an unclassified drop is still a
+    # drop`, and that line is how a card_expired reached the batch whose fix is
+    # a discount. "We do not know why this failed" is precisely the case where a
+    # shared plan has no shared cause to stand on, so it gets its own bucket and
+    # is worked one case at a time.
+    return "unclassified"
 
 
 def summarise(records: list[dict]) -> list[dict[str, Any]]:

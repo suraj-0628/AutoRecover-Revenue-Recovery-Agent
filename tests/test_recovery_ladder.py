@@ -32,8 +32,25 @@ def climb(rec: dict, *rungs: str) -> dict:
 
 # ── order ───────────────────────────────────────────────────────────────
 
-def test_the_first_rung_is_the_silent_push():
-    assert ladder.next_rung(case())["rung"] == "page_push"
+def test_the_first_rung_is_the_silent_push_while_the_page_is_open():
+    """page_push only exists while the customer is on the checkout."""
+    from recovery_agent import presence
+    presence.reset()
+    presence.watch("sid-1", "pay_t")
+    try:
+        assert ladder.next_rung(case(payment_id="pay_t"))["rung"] == "page_push"
+    finally:
+        presence.reset()
+
+
+def test_the_ladder_starts_at_the_offer_once_the_customer_has_left():
+    """Which is every batch case. Claiming page_push for someone who closed the
+    tab hours ago advances the ladder past a contact that never happened."""
+    from recovery_agent import presence
+    presence.reset()
+    assert ladder.next_rung(case(payment_id="pay_t"))["rung"] == "offer"
+    unavailable = {u["rung"] for u in ladder.state(case(payment_id="pay_t"))["unavailable"]}
+    assert "page_push" in unavailable
 
 
 def test_the_offer_follows_the_push():
@@ -111,21 +128,59 @@ def test_an_opted_out_customer_is_not_chased():
 # ── the tool actually enforces it ───────────────────────────────────────
 
 def test_escalation_is_refused_while_rungs_remain(tmp_path, monkeypatch):
-    monkeypatch.setenv("STATE_DIR", str(tmp_path))
+    """A reachable customer with an untried offer must not go to a human."""
+    from recovery_agent import state_store
+    monkeypatch.setattr(state_store, "_DATA_DIR", tmp_path)
+    state_store.StateStore.reset_instances()
     import json
+    from recovery_agent.state_store import StateStore
     from recovery_agent.agent.tools import TOOLS_BY_NAME
+    st = StateStore()
+    st.save_payment("pay_reachable", {"payment_id": "pay_reachable", "amount": 2499.0,
+                                      "status": "awaiting_customer",
+                                      "customer": {"email": "a@b.com"},
+                                      "decline_strategy": "customer_cancelled",
+                                      "ladder": {}})
+    st.flush()
     out = json.loads(TOOLS_BY_NAME["escalate_to_human"].invoke(
-        {"payment_id": "pay_never_seen", "reason": "a tool refused me"}))
+        {"payment_id": "pay_reachable", "reason": "a tool refused me"}))
+    state_store.StateStore.reset_instances()
     assert out["status"] == "blocked"
-    assert out["next_rung"] == "page_push"
+    assert out["next_rung"] == "offer"
     assert "final step" in out["reason"]
 
 
-def test_the_refusal_names_what_to_do_instead():
+def test_a_case_with_nothing_left_to_try_may_escalate(tmp_path, monkeypatch):
+    """No record, no contact, no live page — there is genuinely no rung to climb,
+    and refusing escalation would strand the case."""
+    from recovery_agent import state_store
+    monkeypatch.setattr(state_store, "_DATA_DIR", tmp_path)
+    state_store.StateStore.reset_instances()
     import json
     from recovery_agent.agent.tools import TOOLS_BY_NAME
     out = json.loads(TOOLS_BY_NAME["escalate_to_human"].invoke(
-        {"payment_id": "pay_never_seen_2", "reason": "blocked"}))
+        {"payment_id": "pay_never_seen", "reason": "nothing is possible here"}))
+    state_store.StateStore.reset_instances()
+    assert out["status"] == "escalated"
+
+
+def test_the_refusal_names_what_to_do_instead(tmp_path, monkeypatch):
+    from recovery_agent import state_store
+    monkeypatch.setattr(state_store, "_DATA_DIR", tmp_path)
+    state_store.StateStore.reset_instances()
+    import json
+    from recovery_agent.state_store import StateStore
+    from recovery_agent.agent.tools import TOOLS_BY_NAME
+    st = StateStore()
+    st.save_payment("pay_reach2", {"payment_id": "pay_reach2", "amount": 2499.0,
+                                   "status": "awaiting_customer",
+                                   "customer": {"email": "a@b.com"},
+                                   "decline_strategy": "customer_cancelled",
+                                   "ladder": {}})
+    st.flush()
+    out = json.loads(TOOLS_BY_NAME["escalate_to_human"].invoke(
+        {"payment_id": "pay_reach2", "reason": "blocked"}))
+    state_store.StateStore.reset_instances()
     assert out["next_step"], "a refusal must name the next move"
     assert "guidance" in out
 
@@ -296,7 +351,9 @@ def test_a_daemon_retry_is_watched_to_a_conclusion():
     FRONTEND = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src"
                 / "recovery_agent" / "frontend.py").read_text()
     i = FRONTEND.index("def daemon_retry_complete")
-    body = FRONTEND[i:i + 2600]
+    # Window sized to hold the whole handler: the wake_agent branch (which
+    # honours the agent's own wait_for_customer) sits ahead of the retry watch.
+    body = FRONTEND[i:i + 4200]
     assert "_watch_for_recovery" in body
     assert '"retry_created", "link_created"' in body
 

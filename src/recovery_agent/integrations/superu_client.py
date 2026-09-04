@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import logging
 import sys
+import urllib.parse
 
 import requests
 from dotenv import load_dotenv
@@ -23,11 +24,39 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SUPERU_API_URL = "https://voip-middlware.superu.ai/campaign/outbound/create_call/superu"
+SUPERU_BASE_URL = os.getenv("SUPERU_BASE_URL", "https://voip-middlware.superu.ai")
+SUPERU_API_URL = f"{SUPERU_BASE_URL}/campaign/outbound/create_call/superu"
+
+#: Reading call logs is what turns "we estimated ₹15 a call" into an invoice
+#: line. It is a READ: it starts no call, rings no phone and spends no credit,
+#: so unlike `initiate_recovery_call` it is not blocked in tests — only
+#: guarded by whether credentials exist.
+SUPERU_CALL_LOGS_URL = f"{SUPERU_BASE_URL}/call-logs"
+
+
+def calls_permitted() -> bool:
+    """Only a SERVICE may spend the call allowance — never an ad-hoc script.
+
+    The test-environment sniff below is a heuristic, and heuristics fail open.
+    On 2026-09-04 a verification script run as plain `python -c` placed a REAL
+    call: it was not pytest, PYTEST_CURRENT_TEST was unset, so every branch of
+    `_is_test_environment` said "not a test" and the credit was spent against
+    an explicit instruction never to call SuperU outside the demo.
+
+    So the control is inverted, exactly as it is for the Razorpay payment-link
+    quota (`razorpay_client._writes_allowed`): calls are refused unless the
+    process was started as a service. `start.sh` exports SUPERU_CALLS_OK=1; a
+    script does not inherit it and therefore cannot ring anyone, whatever it
+    calls and whatever the env says.
+    """
+    return os.getenv("SUPERU_CALLS_OK", "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def _is_test_environment() -> bool:
     """Detect if running under pytest or any test runner."""
+    if not calls_permitted():
+        return True                     # not a service: treat as test, refuse
     if os.getenv("PYTEST_CURRENT_TEST"):
         return True
     if os.getenv("SUPERU_DISABLE_IN_TESTS", "").strip() == "1":
@@ -52,6 +81,65 @@ class SuperUClient:
     def is_enabled(self) -> bool:
         """Check if SuperU is configured with valid credentials."""
         return self._enabled
+
+    @property
+    def can_read(self) -> bool:
+        """Log reads need only the API key — no assistant id, no phone
+        number. A deployment that cannot PLACE calls can still account for
+        the ones it already placed."""
+        return bool(self.api_key)
+
+    def get_call_logs(
+        self,
+        assistant_id: str = "all",
+        limit: int = 50,
+        page: int = 1,
+        campaign_id: str = "",
+        after: str = "",
+        timeout: int = 20,
+    ) -> dict[str, Any]:
+        """Fetch billed call records. READ ONLY — never places a call.
+
+        This is the billing source: each record carries SuperU's own `cost`
+        for that call, plus `telecom_total_cost`, the duration, the outcome
+        and the transcript. Because `initiate_recovery_call` tags every call
+        with `campaign_id="recovery_{payment_id}"`, these join straight back
+        to the case that caused them.
+
+        Returns {"status": "ok", "calls": [...], "total_cost": float, ...}
+        or {"status": "error"|"skipped", ...}. Never raises.
+        """
+        if not self.can_read:
+            return {"status": "skipped", "reason": "superu_not_configured",
+                    "detail": "SUPERU_API_KEY is not set, so billed voice "
+                              "costs cannot be read.", "calls": []}
+
+        params: list[str] = [f"limit={int(limit)}", f"page={int(page)}"]
+        if campaign_id:
+            params.append(f"campaign_id={urllib.parse.quote(campaign_id)}")
+        if after:
+            params.append(f"after={urllib.parse.quote(after)}")
+        url = f"{SUPERU_CALL_LOGS_URL}/{assistant_id or 'all'}?" + "&".join(params)
+
+        try:
+            # POST with no body — SuperU's call-logs endpoint takes all of its
+            # arguments as query parameters despite the verb.
+            response = requests.post(
+                url, headers={"superU-Api-Key": self.api_key}, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as e:
+            logger.warning("[SuperU] call-logs read failed: %s", e)
+            return {"status": "error", "error": str(e)[:200], "calls": []}
+
+        data = payload.get("data") or {}
+        return {
+            "status": "ok",
+            "calls": data.get("calls") or [],
+            "total": data.get("total", 0),
+            "total_cost": data.get("total_cost", 0),
+            "total_duration": data.get("total_duration", 0),
+        }
 
     def initiate_recovery_call(
         self,

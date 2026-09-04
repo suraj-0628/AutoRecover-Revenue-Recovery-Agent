@@ -212,6 +212,8 @@ def superu_call_complete():
 
 
 def main():
+    from recovery_agent.observability import init_observability
+    init_observability("webhook")
     port = int(os.getenv("WEBHOOK_PORT", "5000"))
     if not WEBHOOK_SECRET:
         print("[webhook] WARNING: RAZORPAY_WEBHOOK_SECRET is empty. All requests will be REJECTED.", file=sys.stderr)

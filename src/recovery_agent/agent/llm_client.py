@@ -27,21 +27,16 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 # --- Arize Phoenix Observability (LangChain) ---
-_phoenix_initialized = False
 
 def _ensure_phoenix():
-    """Lazy-init Phoenix OTel on first LLM call (avoids blocking at import time)."""
-    global _phoenix_initialized
-    if _phoenix_initialized:
-        return
-    _phoenix_initialized = True
-    try:
-        from phoenix.otel import register
-        from openinference.instrumentation.langchain import LangChainInstrumentor
-        register(endpoint="http://localhost:6006/v1/traces")
-        LangChainInstrumentor().instrument()
-    except Exception as e:
-        print(f"Observability disabled: {e}")
+    """Tracing init is shared and idempotent — observability.py owns it.
+
+    This used to register its OWN Phoenix provider lazily on the first
+    invoke_llm call, racing frontend's homegrown provider for OTel's single
+    global slot. One init point, or no init point.
+    """
+    from recovery_agent.observability import init_observability
+    init_observability("llm-client")
 
 # Total budget for ALL LLM fallback models combined.
 # Override via LLM_TIMEOUT env var (e.g., LLM_TIMEOUT=15).

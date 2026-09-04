@@ -2,6 +2,10 @@
 # Only a service may spend the account's 30-link lifetime quota.
 # An ad-hoc script does not inherit this and therefore cannot.
 export RAZORPAY_WRITES_OK=1
+# Same control for the paid SuperU call allowance: only a service may spend it.
+# A verification script run as `python -c` once placed a real call because the
+# test-environment sniff failed open; this cannot fail open.
+export SUPERU_CALLS_OK=1
 
 # Start all recovery agent services
 # Usage: ./start.sh
@@ -71,14 +75,40 @@ pkill -f "recovery_agent.dashboard" 2>/dev/null
 pkill -f "recovery_agent.webhook" 2>/dev/null
 pkill -f "recovery_agent.frontend" 2>/dev/null
 pkill -f "recovery_agent.daemon_worker" 2>/dev/null
-pkill -f "phoenix.server" 2>/dev/null
+# Was "phoenix.server" — as a pkill -f regex that never matches the actual
+# command line ("phoenix serve": a space, not a dot, and "serve" is one
+# character short of "server"). The old process outlived every restart,
+# including ones meant to pick up PHOENIX_WORKING_DIR — traces and the
+# price table kept going to Phoenix's default location, silently orphaned
+# by the next "restart".
+pkill -f "\.venv/bin/phoenix serve" 2>/dev/null
 sleep 1
 
-# Start Phoenix observability server
+# Start Phoenix observability server.
+# PHOENIX_WORKING_DIR pins its SQLite to the repo's data dir — without it,
+# traces (and the custom model price table the cost view depends on) live
+# wherever the default lands and a restart can orphan them.
 export PHOENIX_PORT=6006
+export PHOENIX_WORKING_DIR="$(pwd)/data/phoenix"
+mkdir -p "$PHOENIX_WORKING_DIR"
 setsid .venv/bin/phoenix serve > /tmp/phoenix.log 2>&1 &
 PHOENIX_PID=$!
-sleep 2
+
+# Wait for Phoenix to actually answer instead of guessing at a sleep.
+# It runs schema migrations on first boot against a fresh working dir, which
+# takes far longer than any fixed pause — so a 2-second sleep meant the
+# startup banner reported "Phoenix: [NO]" and the price seeder below died
+# with "Connection refused", on a server that was perfectly healthy moments
+# later. Bounded, so a genuinely dead Phoenix still fails fast-ish.
+echo -n "Waiting for Phoenix"
+for _ in $(seq 1 60); do
+    if curl -s -o /dev/null --max-time 2 "http://localhost:${PHOENIX_PORT}/" 2>/dev/null; then
+        echo " up."
+        break
+    fi
+    echo -n "."
+    sleep 2
+done
 
 # Start dashboard
 setsid .venv/bin/python3 -m recovery_agent.dashboard < /dev/null > /tmp/dashboard.log 2>&1 &
@@ -98,11 +128,40 @@ DAEMON_PID=$!
 
 sleep 3
 
-# Verify services
-PHOENIX_OK=$(curl -s http://localhost:6006/ | grep -q "" && echo "YES" || echo "NO")
-DASHBOARD_OK=$(curl -s http://localhost:${DASHBOARD_PORT:-5001}/api/metrics | grep -q "total_cases" && echo "YES" || echo "NO")
-WEBHOOK_OK=$(curl -s http://localhost:${WEBHOOK_PORT:-5000}/health | grep -q "status" && echo "YES" || echo "NO")
-FRONTEND_OK=$(curl -s http://localhost:5002/health | grep -q "status" && echo "YES" || echo "NO")
+# Seed Phoenix's model price table with the proxy fleet (idempotent, fast).
+# Without prices, spans carry tokens but no cost — and the per-case cost
+# rollup in the Sessions view stays empty.
+.venv/bin/python3 -m recovery_agent.scripts.seed_phoenix_model_costs || true
+
+# Verify services.
+#
+# Each check RETRIES for a few seconds instead of asking once. A service that
+# is merely still binding its port is not a failed service, and a banner that
+# reports one as [NO] while it serves traffic a second later teaches you to
+# distrust the banner — the worst possible thing to hand someone on demo day.
+wait_ok() {              # wait_ok <url> <expected-substring> [attempts]
+    local url="$1" want="$2" tries="${3:-10}"
+    for _ in $(seq 1 "$tries"); do
+        if curl -s --max-time 2 "$url" 2>/dev/null | grep -q "$want"; then
+            echo "YES"; return
+        fi
+        sleep 1
+    done
+    echo "NO"
+}
+
+# Phoenix serves HTML, so match on the status code rather than piping a body
+# into `grep -q ""` — an empty body from a server that IS up reads as failure.
+PHOENIX_OK=$(for _ in $(seq 1 10); do
+    if curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:${PHOENIX_PORT}/" 2>/dev/null | grep -q "^2"; then
+        echo "YES"; break
+    fi
+    sleep 1
+done)
+PHOENIX_OK=${PHOENIX_OK:-NO}
+DASHBOARD_OK=$(wait_ok "http://localhost:${DASHBOARD_PORT:-5001}/api/metrics" "total_cases")
+WEBHOOK_OK=$(wait_ok "http://localhost:${WEBHOOK_PORT:-5000}/health" "status")
+FRONTEND_OK=$(wait_ok "http://localhost:5002/health" "status")
 DAEMON_OK=$(pgrep -f "recovery_agent.daemon_worker" > /dev/null && echo "YES" || echo "NO")
 
 echo ""

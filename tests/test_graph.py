@@ -19,7 +19,8 @@ class TestGraphStructure:
         expected = {
             "__start__", "__end__",
             "agent", "tools", "stopping_check", "self_critique",
-            "tool_repetition_guard", "human_approval_gate", "mask_outputs",
+            "tool_repetition_guard", "policy_gate", "human_approval_gate",
+            "mask_outputs",
         }
         assert expected.issubset(nodes), f"Missing nodes: {expected - nodes}"
 

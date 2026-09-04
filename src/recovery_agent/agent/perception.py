@@ -115,12 +115,87 @@ def ground_truth(payment_id: str, verify: bool = False) -> dict:
         facts["actions_tried"] = ladder.actions_tried(rec)
         nxt = st["remaining"][0] if st["remaining"] else None
         facts["next_rung"] = nxt["rung"] if nxt else None
-        facts["ladder_exhausted"] = not st["remaining"]
+        # WHICH ladder this case is on. There is one per failure kind, so the
+        # agent has to be told the sequence it is climbing — otherwise it
+        # reasons about "the ladder" from the prompt and reaches for a rung
+        # that belongs to a different failure.
+        facts["ladder_rungs"] = [k for k, _ in ladder.rungs_for(rec)]
+        facts["retry_pending"] = ladder.retry_pending(rec)
+        facts["ladder_exhausted"] = ladder.exhausted(rec)
         facts["unavailable"] = [f"{u['rung']} ({u['why_not']})"
                                 for u in st["unavailable"]]
     except Exception:
         pass
+
+    # Memory, perceived rather than remembered-to-ask-for. search_memory
+    # existed and the model could call it — which means on most cases it did
+    # not, and every case started from zero. The digest is deterministic, cheap
+    # (two local store reads), and lands in the same briefing as the money.
+    try:
+        history = _history_digest(rec, facts.get("failure_kind") or "unknown")
+        if history:
+            facts["history"] = history
+    except Exception:
+        pass
     return facts
+
+
+def _history_digest(rec: dict, kind: str) -> dict:
+    """What this customer and cases like this one have actually done.
+
+    Two sources: the customer profile (channel win-rates learned across their
+    own cases) and the episode store (every closed case of the same failure
+    kind). Both computed to short factual lines — the model gets numbers, not a
+    lecture. Returns {} when there is nothing real to say; a briefing line
+    built on zero data is noise wearing a memory's clothes.
+    """
+    out: dict[str, str] = {}
+
+    customer = (rec.get("customer") or {}).get("email") \
+        or rec.get("customer_email") or ""
+    if customer:
+        try:
+            from recovery_agent.agent.memory import CustomerMemoryStore
+            profile = CustomerMemoryStore.live().get_or_create_profile(customer)
+            by_channel: dict[str, list[int]] = {}
+            for p in profile.payment_history:
+                if p.status in ("success", "failed") and p.channel_used:
+                    stats = by_channel.setdefault(p.channel_used, [0, 0])
+                    stats[1] += 1
+                    if p.status == "success":
+                        stats[0] += 1
+            parts = [f"{ch} recovered {w}/{t}"
+                     for ch, (w, t) in sorted(by_channel.items()) if t]
+            if parts:
+                out["customer_line"] = "this customer before now: " + ", ".join(parts)
+        except Exception:
+            pass
+
+    try:
+        from recovery_agent.agent.graph import get_memory_store
+        from recovery_agent.agent.tools import ns_safe
+        episodes = [item.value or {} for item in
+                    get_memory_store().search(("recovery", "episodes",
+                                               ns_safe(kind)), limit=50)]
+        # This case may already have an episode mid-write; exclude itself.
+        pid = str(rec.get("payment_id") or "")
+        episodes = [e for e in episodes if e.get("payment_id") != pid]
+        if episodes:
+            recovered = [e for e in episodes if e.get("outcome") == "recovered"]
+            line = (f"of {len(episodes)} past {kind} case(s), "
+                    f"{len(recovered)} recovered")
+            if recovered:
+                full = sum(1 for e in recovered
+                           if float(e.get("discount_pct") or 0) == 0)
+                line += f" — {full} at full price"
+                discounted = len(recovered) - full
+                if discounted:
+                    line += f", {discounted} needed a discount"
+            out["similar_line"] = line
+    except Exception:
+        pass
+
+    return out
 
 
 def as_briefing(facts: dict) -> str:
@@ -155,11 +230,20 @@ def as_briefing(facts: dict) -> str:
             f"  {money}\n"
             "  The money is NOT back. This case is still open."
         )
+        if facts.get("ladder_rungs"):
+            head += (f"\n  The ladder for THIS failure: "
+                     f"{' -> '.join(facts['ladder_rungs'])}")
         if facts.get("climbed"):
             head += f"\n  Already climbed: {', '.join(facts['climbed'])}"
         if facts.get("actions_tried"):
             head += (f"\n  Already tried: {', '.join(facts['actions_tried'])}"
                      f"\n  Do not repeat any of those — they did not work.")
+        if facts.get("retry_pending"):
+            head += ("\n  A retry is ALREADY SCHEDULED and has not fired yet. "
+                     "That is the most likely thing to recover this, so the "
+                     "case is waiting, not stuck: do not escalate, do not "
+                     "claim the retry failed, and do not start another rung "
+                     "on top of it. Call wait_for_customer.")
         head += (f"\n  Next rung: {nxt}" if nxt else
                  "\n  Every rung has been tried. escalate_to_human will accept "
                  "this case now.")
@@ -189,6 +273,16 @@ def as_briefing(facts: dict) -> str:
     elif kind == "dropoff":
         head += ("\n  The customer chose not to complete. Nothing is broken, so "
                  "the question is what would make them come back.")
+
+    history = facts.get("history") or {}
+    if history and not facts.get("settled") and not facts.get("escalated"):
+        head += "\n  WHAT HAS WORKED BEFORE:"
+        if history.get("customer_line"):
+            head += f"\n    - {history['customer_line']}"
+        if history.get("similar_line"):
+            head += f"\n    - {history['similar_line']}"
+        head += ("\n  Weigh this before choosing a channel or an offer — it is "
+                 "measured, not guessed.")
 
     repeated = {k: n for k, n in (facts.get("refusals") or {}).items() if n >= 2}
     if repeated:

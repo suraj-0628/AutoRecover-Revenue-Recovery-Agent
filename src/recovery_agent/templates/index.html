@@ -884,6 +884,41 @@
       display: none;
     }
     .batchview.on { display: block }
+
+    /* Guardrail policy controls. The description sits beside the control, not
+       behind a tooltip: someone raising a contact cap mid-incident should not
+       have to hover to find out what it governs. */
+    .pol-row { display: flex; gap: 20px; align-items: flex-start;
+               padding: 13px 0; border-bottom: 1px solid rgba(48,54,61,.55) }
+    .pol-row:last-child { border-bottom: 0 }
+    .pol-row.danger .pol-label { color: #d29922 }
+    .pol-meta { flex: 1; min-width: 0 }
+    .pol-label { font-size: 12.5px; font-weight: 600; color: var(--text-main);
+                 margin-bottom: 3px }
+    .pol-src { font-size: 9.5px; font-weight: 500; color: var(--text-muted);
+               border: 1px solid var(--border-color); border-radius: 999px;
+               padding: 1px 6px; margin-left: 4px; vertical-align: 1px }
+    .pol-lock { font-size: 9.5px; color: #d29922; border: 1px solid #d29922;
+                border-radius: 999px; padding: 1px 6px; margin-left: 4px }
+    .pol-what { font-size: 11px; color: var(--text-muted); line-height: 1.5 }
+    .pol-why { font-size: 10.5px; color: var(--text-muted); opacity: .78;
+               line-height: 1.5; margin-top: 4px; font-style: italic }
+    .pol-ctl { flex: 0 0 210px; display: flex; justify-content: flex-end;
+               align-items: center; padding-top: 2px }
+    .pol-slide { display: flex; align-items: center; gap: 10px; width: 100% }
+    .pol-slide input[type=range] { flex: 1; accent-color: var(--accent-blue) }
+    .pol-val { min-width: 24px; text-align: right; font-size: 13px;
+               font-weight: 600; color: var(--accent-blue);
+               font-variant-numeric: tabular-nums }
+    .pol-input { background: #0d1117; border: 1px solid var(--border-color);
+                 color: var(--text-main); border-radius: 6px; padding: 6px 9px;
+                 font-size: 12px; width: 130px; font-family: inherit }
+    .pol-num { display: flex; align-items: center; gap: 6px;
+               color: var(--text-muted); font-size: 12px }
+    .pol-switch { display: flex; align-items: center; gap: 8px; cursor: pointer;
+                  font-size: 12px; color: var(--text-muted) }
+    .pol-switch input { accent-color: var(--accent-blue); width: 15px; height: 15px }
+    .pol-switch input:disabled { cursor: not-allowed; opacity: .5 }
     .batch-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 6px }
     .batch-head h2 { font-size: 14px; color: var(--text-bright); font-weight: 600;
                      letter-spacing: -0.2px }
@@ -954,6 +989,16 @@
                           color: var(--text-muted); opacity: .55 }
     .batch-note { font-size: 10px; color: var(--accent-amber); text-align: right;
                   flex: 1 }
+    /* Preview is the safe half of the pair, so it must not compete with Run.
+       Abort replaces Run in place while a batch is going — a stop control the
+       eye has to hunt for is not a stop control. */
+    .btn-batch.ghost { border-color: var(--border-color); color: var(--text-muted) }
+    .btn-batch.ghost:hover:enabled { background: var(--border-color);
+                                     color: var(--text-primary) }
+    .btn-batch.stop { border-color: var(--accent-red); color: var(--accent-red) }
+    .btn-batch.stop:hover:enabled { background: var(--accent-red); color: #0d1117 }
+    .batch-note.settled { color: var(--text-muted) }
+    .batch-note .won { color: var(--accent-green) }
 
     /* Batches with nothing in them collapse to one quiet row: still visible —
        an empty batch says that failure class is not happening — without four
@@ -967,6 +1012,134 @@
                            padding: 3px 10px; border: 1px solid var(--border-color);
                            border-radius: 999px; background: var(--card-bg) }
     .batch-quiet .q-item svg { width: 11px; height: 11px; opacity: .7 }
+
+    /* ── Ops view ───────────────────────────────────────────────────
+       Unit economics, policy refusals, memory and eval scores — the
+       numbers behind the agent, in the same visual system as the
+       batch view: panel cards, stroke icons, tabular figures. */
+    .ops-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+                gap: 14px; align-items: start }
+    .ops-table { width: 100%; border-collapse: collapse; font-size: 10.5px }
+    .ops-table th { text-align: left; padding: 6px 14px; color: var(--text-muted);
+                    font-size: 9px; text-transform: uppercase; letter-spacing: .07em;
+                    border-bottom: 1px solid var(--border-color); font-weight: 600 }
+    .ops-table td { padding: 5px 14px; border-bottom: 1px solid rgba(48,54,61,.5);
+                    color: var(--text-main); font-variant-numeric: tabular-nums }
+    .ops-table th.num, .ops-table td.num { text-align: right }
+    .ops-table tr:last-child td { border-bottom: 0 }
+    .ops-table td.dim { color: var(--text-muted) }
+    .ops-note { padding: 8px 14px 12px; font-size: 9.5px; color: var(--text-muted);
+                line-height: 1.5 }
+    .ops-empty { padding: 16px 14px; font-size: 10.5px; color: var(--text-muted);
+                 line-height: 1.6 }
+    .ops-pill { display: inline-block; padding: 1px 8px; border-radius: 999px;
+                font-size: 9px; font-weight: 600; border: 1px solid;
+                letter-spacing: .03em }
+    .ops-pill.ok { color: var(--accent-green); border-color: rgba(126,231,135,.35);
+                   background: rgba(126,231,135,.07) }
+    .ops-pill.block { color: var(--accent-amber); border-color: rgba(255,166,87,.4);
+                      background: rgba(255,166,87,.08) }
+    .ops-pill.bad { color: var(--accent-red); border-color: rgba(255,123,114,.4);
+                    background: rgba(255,123,114,.08) }
+    .ops-block-row { padding: 6px 14px; border-bottom: 1px solid rgba(48,54,61,.5);
+                     font-size: 10px; line-height: 1.55 }
+    .ops-block-row:last-child { border-bottom: 0 }
+    .ops-block-row b { color: var(--text-main); font-weight: 500 }
+    .ops-block-row .why { color: var(--text-muted) }
+
+    /* ── Ops view, second pass ──────────────────────────────────────
+       The first cut put a spend table, an allowance meter, a case table
+       and two paragraphs of prose in ONE card, and let currency values
+       wrap mid-number ("INR" on one line, "251.77" on the next). Scoped
+       under #view-ops so the batch view, which shares .batch-card, is
+       untouched. */
+
+    /* A figure must never break across lines. */
+    #view-ops .ops-table td.num, #view-ops .ops-table th.num,
+    #view-ops .num { white-space: nowrap; font-variant-numeric: tabular-nums }
+    #view-ops .ops-table td { padding: 6px 14px }
+    #view-ops .ops-table th { padding: 8px 14px 6px }
+    /* Row labels are short and known; let the long RESULT prose wrap instead
+       of breaking "Recorded decisions" across two lines. */
+    #view-ops .ops-table td:first-child { white-space: nowrap }
+    #view-ops .ops-table td.wrap { white-space: normal; font-size: 9.5px;
+                                   line-height: 1.5 }
+
+    /* Cards were forced to 460px and left a dead column on wide screens. */
+    #view-ops .ops-grid { grid-template-columns: repeat(auto-fit, minmax(370px, 1fr)) }
+    #view-ops .batch-card { overflow: hidden }
+    #view-ops .batch-card-top { padding: 11px 14px }
+
+    /* Header: one line of orientation, not three paragraphs. */
+    .ops-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+                font-size: 10.5px; color: var(--text-muted); margin-bottom: 14px }
+    .ops-meta b { color: var(--text-main); font-weight: 600 }
+    .ops-meta .sep { color: var(--border-color) }
+    .ops-help { border: 0; background: transparent; cursor: pointer;
+                color: var(--accent-blue); font-family: var(--font-mono);
+                font-size: 10.5px; padding: 0; text-decoration: underline;
+                text-underline-offset: 2px }
+    .ops-help-body { display: none; margin: -6px 0 14px; padding: 10px 14px;
+                     border: 1px dashed var(--border-color); border-radius: 8px;
+                     font-size: 10.5px; color: var(--text-muted); line-height: 1.65;
+                     max-width: 900px }
+    .ops-help-body.on { display: block }
+    .ops-help-body b { color: var(--text-main) }
+
+    /* KPI strip: one number leads, the rest support it. */
+    #view-ops .batch-stats { gap: 0; padding: 0 }
+    #view-ops .bstat { flex: 1; padding: 14px 18px;
+                       border-right: 1px solid var(--border-color) }
+    #view-ops .bstat:last-child { border-right: 0 }
+    #view-ops .bstat.lead .v { font-size: 24px; letter-spacing: -0.5px }
+    #view-ops .bstat .sub { font-size: 9px; color: var(--text-muted);
+                            margin-top: 2px }
+
+    /* Spend: a stacked bar makes "95% of this is discounts" visible at a
+       glance, which a table row never did. */
+    .ops-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden;
+               background: #21262d; margin: 12px 14px 10px }
+    .ops-bar span { display: block; height: 100% }
+    .ops-legend { padding: 0 14px 10px }
+    .ops-leg { display: flex; align-items: center; gap: 8px; padding: 4px 0;
+               font-size: 10.5px }
+    .ops-leg .dot { width: 8px; height: 8px; border-radius: 2px; flex: 0 0 auto }
+    .ops-leg .lab { color: var(--text-main); flex: 1 }
+    .ops-leg .qty { color: var(--text-muted); font-size: 9.5px }
+    .ops-leg .amt { color: var(--text-bright); font-variant-numeric: tabular-nums;
+                    white-space: nowrap }
+    .ops-leg .pc { color: var(--text-muted); width: 34px; text-align: right;
+                   font-variant-numeric: tabular-nums; white-space: nowrap }
+
+    /* Budget meters: the agent's remaining ammunition. */
+    .ops-budget { padding: 11px 14px; border-bottom: 1px solid rgba(48,54,61,.5) }
+    .ops-budget:last-child { border-bottom: 0 }
+    .ops-budget-top { display: flex; justify-content: space-between;
+                      align-items: baseline; gap: 10px; font-size: 10.5px;
+                      margin-bottom: 6px }
+    .ops-budget-top .lab { color: var(--text-main) }
+    .ops-budget-top .val { color: var(--text-bright); white-space: nowrap;
+                           font-variant-numeric: tabular-nums }
+    .ops-track { height: 6px; border-radius: 3px; background: #21262d;
+                 overflow: hidden; display: flex }
+    .ops-track .used { height: 100% }
+    .ops-track .held {
+      height: 100%;
+      background: repeating-linear-gradient(45deg, #30363d, #30363d 3px,
+                                            transparent 3px, transparent 6px);
+    }
+    .ops-budget .cap { font-size: 9.5px; color: var(--text-muted);
+                       margin-top: 5px; line-height: 1.5 }
+
+    /* Footnotes belong under the grid, once — not stacked inside a card. */
+    .ops-foot { margin-top: 14px; padding: 11px 16px; border-radius: 8px;
+                border: 1px solid var(--border-color); background: var(--panel-bg);
+                font-size: 9.5px; color: var(--text-muted); line-height: 1.7;
+                display: flex; flex-wrap: wrap; gap: 6px 18px }
+    .ops-foot b { color: var(--text-main) }
+    .ops-foot a { color: var(--accent-blue) }
+    .bstat .v.green { color: var(--accent-green) }
+    .bstat .v.red { color: var(--accent-red) }
 
     /* Native scrollbars glow white on a dark panel; the whole page needs the
        treatment, not just the batch lists. Firefox first, then WebKit. */
@@ -988,6 +1161,12 @@
     <button class="rail-btn" id="rail-batches" onclick="showView('batches')">
       <span class="ico">&#9776;</span>BATCH
       <span class="rail-count" id="rail-batch-count" style="display:none">0</span>
+    </button>
+    <button class="rail-btn" id="rail-ops" onclick="showView('ops')">
+      <span class="ico">&#931;</span>OPS
+    </button>
+    <button class="rail-btn" id="rail-policy" onclick="showView('policy')">
+      <span class="ico">&#9881;</span>POLICY
     </button>
   </nav>
 
@@ -2090,14 +2269,124 @@
 function showView(which) {
   const live = document.querySelector(".workspace");
   const batches = document.getElementById("view-batches");
+  const ops = document.getElementById("view-ops");
+  const policy = document.getElementById("view-policy");
   const hdr = document.querySelector("header");
   const isBatch = which === "batches";
-  if (live) live.style.display = isBatch ? "none" : "";
-  if (hdr) hdr.style.display = isBatch ? "none" : "";
+  const isOps = which === "ops";
+  const isPolicy = which === "policy";
+  const away = isBatch || isOps || isPolicy;
+  if (live) live.style.display = away ? "none" : "";
+  if (hdr) hdr.style.display = away ? "none" : "";
   batches.classList.toggle("on", isBatch);
-  document.getElementById("rail-live").classList.toggle("active", !isBatch);
+  if (ops) ops.classList.toggle("on", isOps);
+  if (policy) policy.classList.toggle("on", isPolicy);
+  document.getElementById("rail-live").classList.toggle("active", !away);
   document.getElementById("rail-batches").classList.toggle("active", isBatch);
+  document.getElementById("rail-ops").classList.toggle("active", isOps);
+  document.getElementById("rail-policy").classList.toggle("active", isPolicy);
   if (isBatch) loadBatches();
+  if (isOps) loadOps();
+  if (isPolicy) loadPolicy();
+}
+
+/* ── Guardrail policy ──────────────────────────────────────────────────────
+   One control per setting, matched to what it edits. A contact count has a
+   natural range, so it slides; a rupee figure does not, so it is typed; an
+   hour is picked from 24; a policy is on or off. `locked` settings render
+   disabled with the reason visible — opt-out is a legal obligation, not a
+   tuning parameter, and a panel that can switch it off is a liability. */
+let _policySpec = [];
+
+function loadPolicy() {
+  fetch("/api/guardrails").then(r => r.json()).then(d => {
+    _policySpec = d.settings || [];
+    renderPolicy();
+  }).catch(() => {
+    document.getElementById("policy-groups").innerHTML =
+      '<div style="color:var(--text-muted)">Could not load policy.</div>';
+  });
+}
+
+function policyControl(s) {
+  const id = "pol-" + s.key;
+  if (s.kind === "toggle") {
+    return '<label class="pol-switch">' +
+      '<input type="checkbox" id="' + id + '"' + (s.value ? " checked" : "") +
+      (s.locked ? " disabled" : "") +
+      ' onchange="setPolicy(\'' + s.key + '\', this.checked)">' +
+      '<span>' + (s.value ? "On" : "Off") + '</span></label>';
+  }
+  if (s.kind === "slider") {
+    return '<div class="pol-slide">' +
+      '<input type="range" id="' + id + '" min="' + s.min + '" max="' + s.max +
+      '" step="' + (s.step || 1) + '" value="' + s.value +
+      '" oninput="document.getElementById(\'' + id + '-v\').textContent=this.value"' +
+      ' onchange="setPolicy(\'' + s.key + '\', Number(this.value))">' +
+      '<span class="pol-val" id="' + id + '-v">' + s.value + '</span></div>';
+  }
+  if (s.kind === "hour") {
+    let opts = "";
+    for (let h = 0; h < 24; h++) {
+      opts += '<option value="' + h + '"' + (h === s.value ? " selected" : "") +
+        '>' + String(h).padStart(2, "0") + ':00</option>';
+    }
+    return '<select id="' + id + '" class="pol-input"' +
+      ' onchange="setPolicy(\'' + s.key + '\', Number(this.value))">' + opts + '</select>';
+  }
+  return '<div class="pol-num"><span>' + (s.unit || "") + '</span>' +
+    '<input type="number" id="' + id + '" class="pol-input" value="' + s.value +
+    '" min="0" step="100"' +
+    ' onchange="setPolicy(\'' + s.key + '\', Number(this.value))"></div>';
+}
+
+function renderPolicy() {
+  const groups = {};
+  _policySpec.forEach(s => { (groups[s.group] = groups[s.group] || []).push(s); });
+  let html = "";
+  Object.keys(groups).forEach(g => {
+    html += '<div class="panel" style="margin-bottom:14px"><div class="panel-header">' +
+      '<span class="panel-title">' + esc(g) + '</span></div><div class="panel-body">';
+    groups[g].forEach(s => {
+      const src = s.source === "operator" ? "changed here"
+                : s.source === "env" ? "from .env" : "default";
+      html += '<div class="pol-row' + (s.danger ? " danger" : "") + '">' +
+        '<div class="pol-meta"><div class="pol-label">' + esc(s.label) +
+        (s.locked ? ' <span class="pol-lock">locked</span>' : "") +
+        ' <span class="pol-src">' + src + '</span></div>' +
+        '<div class="pol-what">' + esc(s.what) + '</div>' +
+        (s.why ? '<div class="pol-why">' + esc(s.why) + '</div>' : "") +
+        '</div><div class="pol-ctl">' + policyControl(s) + '</div></div>';
+    });
+    html += "</div></div>";
+  });
+  document.getElementById("policy-groups").innerHTML = html;
+}
+
+function setPolicy(key, value) {
+  const el = document.getElementById("policy-status");
+  el.textContent = "saving…";
+  fetch("/api/guardrails", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({changes: {[key]: value}})})
+    .then(r => r.json()).then(d => {
+      if ((d.rejected || []).length) {
+        el.textContent = d.rejected[0];
+        el.style.color = "var(--accent-red, #f85149)";
+      } else {
+        el.textContent = "saved — applies to the next agent turn";
+        el.style.color = "var(--text-muted)";
+      }
+      loadPolicy();
+      setTimeout(() => { el.textContent = ""; }, 4000);
+    }).catch(() => { el.textContent = "save failed"; });
+}
+
+function resetPolicy() {
+  fetch("/api/guardrails", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({reset: true})})
+    .then(() => loadPolicy());
 }
 
 function inr(n) {
@@ -2119,11 +2408,12 @@ var BATCH_ICONS = {
   dropoff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
   awaiting_retry: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
   escalated: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+  unclassified: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
   risk: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>'
 };
 
 function loadBatches() {
-  fetch("/api/batches").then(r => r.json()).then(d => {
+  return fetch("/api/batches").then(r => r.json()).then(d => {
     const badge = document.getElementById("rail-batch-count");
     badge.textContent = d.total_cases;
     badge.style.display = d.total_cases ? "" : "none";
@@ -2140,8 +2430,10 @@ function loadBatches() {
         '<span class="v">' + active.length + ' of ' + d.batches.length + '</span></div>';
 
     document.getElementById("batch-grid").innerHTML = active.map(function (b) {
-      const runnable = b.key !== "awaiting_retry" && b.key !== "escalated" &&
-                       b.key !== "risk";
+      /* Whether a bucket can be worked in bulk is a property of the failure
+         class, so it comes from the classifier rather than a list kept here
+         that has to be remembered when a batch is added. */
+      const runnable = b.runnable !== false;
       const shown = b.payments.slice(0, 30);
       const cases = shown.map(function (p) {
         return '<div class="batch-case"><b>' + esc(p.payment_id) + '</b><span>' +
@@ -2161,6 +2453,10 @@ function loadBatches() {
           '<div class="batch-what">' + esc(b.what) + '</div></div>' +
         '<div class="batch-cases">' + cases + '</div>' +
         '<div class="batch-foot">' +
+          (runnable ?
+            '<button class="btn-batch ghost" id="dry-' + b.key + '" ' +
+              'title="Runs every check and shows what would happen. Sends nothing." ' +
+              'onclick="previewBatch(\'' + b.key + '\')">Preview</button>' : '') +
           '<button class="btn-batch" id="run-' + b.key + '" ' +
             (runnable ? '' : 'disabled title="Nothing to do here — these wait on a clock or a person" ') +
             'onclick="runBatch(\'' + b.key + '\')">' +
@@ -2184,22 +2480,119 @@ function loadBatches() {
   }).catch(function () {});
 }
 
+/* A batch run is one decision applied to many cases, so the two things worth
+   showing are what it decided and what it cost. Preview answers the first for
+   free; the report answers the second with money that arrived, not money that
+   was owed. */
+
+function batchNote(key) { return document.getElementById("note-" + key); }
+
+function previewBatch(key) {
+  const btn = document.getElementById("dry-" + key);
+  const note = batchNote(key);
+  btn.disabled = true;
+  note.className = "batch-note"; note.textContent = "checking...";
+  fetch("/api/batches/" + key + "/plan", {method: "POST",
+        headers: {"Content-Type": "application/json"}, body: "{}"})
+    .then(r => r.json()).then(function (d) {
+      btn.disabled = false;
+      if (d.error) { note.textContent = d.error; return; }
+      const r = d.report, held = r.skipped + r.deferred + r.exceptions;
+      note.className = "batch-note settled";
+      note.textContent = "would work " + r.acted + " of " + r.candidates +
+        " \u00b7 " + r.links_created + " links \u00b7 " +
+        Object.keys(d.plans).length + " plans" +
+        (held ? " \u00b7 " + held + " held back" : "") + " \u00b7 nothing sent";
+    }).catch(function () { btn.disabled = false; note.textContent = "could not check"; });
+}
+
 function runBatch(key) {
   const btn = document.getElementById("run-" + key);
-  const note = document.getElementById("note-" + key);
-  btn.disabled = true; note.textContent = "starting...";
+  const note = batchNote(key);
+  btn.disabled = true;
+  note.className = "batch-note"; note.textContent = "starting...";
   fetch("/api/batches/" + key + "/run", {method: "POST",
         headers: {"Content-Type": "application/json"}, body: "{}"})
     .then(r => r.json()).then(function (d) {
-      if (d.error) { note.textContent = d.error; btn.disabled = false; return; }
-      /* Say plainly when a run was capped, or a partial run reads as a whole one. */
-      let msg = "started " + d.started.length + " of " + d.total_in_batch;
-      if (d.total_in_batch > d.started.length) {
-        msg += " (limit " + d.limit + " per run)";
+      if (d.error) {
+        note.textContent = d.error; btn.disabled = false; return;
       }
-      note.textContent = msg + " \u2014 watch LIVE";
-      setTimeout(loadBatches, 4000);
+      /* The run outlives the request, so the button becomes the way to stop
+         it rather than the way to start another one. */
+      btn.disabled = false;
+      btn.className = "btn-batch stop";
+      btn.textContent = "Abort";
+      btn.onclick = function () { abortBatch(key, d.batch_run_id); };
+      pollBatchRun(key, d.batch_run_id);
     }).catch(function () { note.textContent = "could not start"; btn.disabled = false; });
+}
+
+function abortBatch(key, runId) {
+  const btn = document.getElementById("run-" + key);
+  btn.disabled = true;
+  fetch("/api/batch-runs/" + runId + "/abort", {method: "POST",
+        headers: {"Content-Type": "application/json"}, body: "{}"})
+    .then(r => r.json()).catch(function () {});
+}
+
+function pollBatchRun(key, runId, tries, refreshed) {
+  tries = tries || 0;
+  fetch("/api/batch-runs/" + runId).then(r => r.json()).then(function (r) {
+    const note = batchNote(key);
+    if (!note) { return; }                     /* the grid re-rendered */
+    if (r.error) { note.textContent = r.error; return; }
+    note.className = "batch-note" + (r.status === "running" ? "" : " settled");
+    note.innerHTML = batchLine(r);
+    if (r.status === "running" && tries < 300) {
+      setTimeout(function () {
+        pollBatchRun(key, runId, tries + 1, refreshed);
+      }, 2000);
+      return;
+    }
+
+    const btn = document.getElementById("run-" + key);
+    if (btn) {
+      btn.className = "btn-batch"; btn.textContent = "Run this batch";
+      btn.disabled = false;
+      btn.onclick = function () { runBatch(key); };
+    }
+
+    /* Refreshing the grid rebuilds the cards and throws away the line we just
+       wrote, so the result is put back *after* the refresh settles rather than
+       racing it — otherwise the operator clicks Run and ends up looking at a
+       blank note where their result was. Once only. */
+    if (!refreshed) {
+      loadBatches().then(function () {
+        pollBatchRun(key, runId, tries, true);
+      });
+      return;
+    }
+
+    /* Money keeps arriving after the sending stops, so the line goes on
+       updating for a while. A total frozen at the last email sent would be
+       wrong in the direction that flatters us. */
+    if (tries < 60) {
+      setTimeout(function () {
+        pollBatchRun(key, runId, tries + 1, true);
+      }, 15000);
+    }
+  }).catch(function () {});
+}
+
+function batchLine(r) {
+  const bits = ["acted " + r.acted + " of " + r.candidates];
+  if (r.deferred) { bits.push(r.deferred + " deferred"); }
+  if (r.exceptions) { bits.push(r.exceptions + " to the agent"); }
+  if (r.escalations) { bits.push(r.escalations + " escalated"); }
+  if (r.recovered_paise) {
+    let money = "<span class=\"won\">recovered " + inr(r.recovered_rupees) + "</span>";
+    if (r.discount_paise) {
+      money += " less " + inr(r.discount_rupees) + " given away";
+    }
+    bits.push(money);
+  }
+  if (r.stop_reason) { bits.push("stopped: " + esc(r.stop_reason)); }
+  return bits.join(" \u00b7 ");
 }
 
 /* Keep the rail badge honest even while you are on the live view. */
@@ -2227,13 +2620,419 @@ loadBatches();
     </div>
     <div class="batch-sub">
       Cases the real-time ladder could not close while the customer was still
-      there. Each batch shares a cause, so it shares a fix. Running one opens a
-      separate agent session per payment &mdash; never two on the same case.
+      there. Each batch shares a cause, so it shares a fix: one plan per cause
+      and amount band, then every case re-checked against it before anything is
+      sent. Preview runs all of that and sends nothing.
     </div>
     <div class="batch-stats" id="batch-stats"></div>
     <div class="batch-grid" id="batch-grid"></div>
     <div class="batch-quiet" id="batch-quiet" style="display:none"></div>
   </section>
+
+  <!-- ── OPS VIEW ──────────────────────────────────────────────────
+       The numbers behind the agent: what a recovered rupee costs to
+       recover, what policy refused and why, what the agent has
+       learned, and what the last eval run scored. Everything here is
+       measured — tokens, calls, contacts, links, discounts — only the
+       INR rates are configured estimates. -->
+  <!-- Guardrail policy. These were env-only, so moving a boundary meant shell
+       access and restarting four services — the wrong audience at the wrong
+       moment. Live on pay_ls1dep23k a real bank-decline recovery was refused
+       at "4/3 contacts in 24h" while the operator watched it happen here.
+       Each control matches what it edits: a bounded count slides, money is
+       typed, an hour is picked, a policy switches. -->
+  <section class="batchview" id="view-policy">
+    <div class="batch-head" style="justify-content:space-between;width:100%">
+      <h2>Guardrail policy</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="policy-status" style="font-size:11px;color:var(--text-muted)"></span>
+        <button class="toggle-btn" onclick="resetPolicy()">Reset to defaults</button>
+      </div>
+    </div>
+    <p style="font-size:11.5px;color:var(--text-muted);max-width:760px;margin:0 0 14px">
+      Changes apply to the next agent turn — no restart. The engine is rebuilt
+      per run, so a case already mid-flight finishes under the policy it started
+      with.
+    </p>
+    <div id="policy-groups"></div>
+  </section>
+
+  <section class="batchview" id="view-ops">
+    <div class="batch-head" style="justify-content:space-between;width:100%">
+      <h2>Agent operations &mdash; cost, policy, memory, evals</h2>
+      <!-- Two populations, never averaged together silently. LIVE is what
+           the agent actually worked end to end; SEEDED is demo and batch
+           volume. A seeded case the agent never touched costs nothing, so
+           blending them would flatter every per-recovery figure. -->
+      <div class="view-toggle-bar" id="ops-scope-toggle">
+        <button class="toggle-btn active" id="scope-live"
+                onclick="setOpsScope('live')">Live runs</button>
+        <button class="toggle-btn" id="scope-seeded"
+                onclick="setOpsScope('seeded')">Seeded volume</button>
+        <button class="toggle-btn" id="scope-all"
+                onclick="setOpsScope('all')">Both</button>
+      </div>
+    </div>
+    <!-- One line of orientation. The essay lives behind "How to read this",
+         closed by default — a dashboard should lead with its numbers. -->
+    <div class="ops-meta" id="ops-meta"></div>
+    <div class="ops-help-body" id="ops-help-body">
+      <b>Recovery that costs more than it brings back is not recovery.</b>
+      This view prices every case the agent worked &mdash; tokens, calls,
+      messages and discounts against the revenue returned.<br><br>
+      <b>Live runs</b> are cases the agent worked end to end against a real
+      gateway order: the population to judge behaviour and cost on.
+      <b>Seeded volume</b> is demo, batch and fixture cases &mdash; it shows the
+      system holding up at scale, but many were never worked, so per-case cost
+      there means little. <b>Both</b> blends them, weighted by how much each
+      recovered; useful for totals, misleading as an average.<br><br>
+      <b>Every payment here is Razorpay test mode</b> &mdash; the transactions
+      are real gateway calls, but no money moved. The infrastructure spend
+      (tokens, voice, email) is real in both populations, and each figure below
+      says whether it was <b>billed</b> by the provider or measured by us and
+      priced at a configured rate.
+    </div>
+    <div class="batch-stats" id="ops-kpis"></div>
+    <div class="ops-grid" id="ops-grid" style="margin-top:14px"></div>
+    <div class="ops-foot" id="ops-foot"></div>
+  </section>
+
+<script>
+var OPS_ICONS = {
+  econ: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>',
+  anatomy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>',
+  shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
+  db: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+  evals: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+  budget: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="14" y="8" width="3" height="10"/></svg>',
+  cases: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>'
+};
+
+function toggleOpsHelp() {
+  var el = document.getElementById("ops-help-body");
+  if (el) el.classList.toggle("on");
+}
+
+/* The two metered resources the agent has to work inside. Both fail QUIETLY
+   when exhausted — the 301st email simply never arrives, and the 31st link
+   cannot be minted — so the remaining headroom belongs on screen rather than
+   in a log nobody reads. */
+function budgetMeter(email, links) {
+  var out = "";
+
+  if (email) {
+    var used = email.limit ? Math.min(100, (email.sent_today / email.limit) * 100) : 0;
+    var held = email.limit ? Math.min(100 - used, (email.reserve / email.limit) * 100) : 0;
+    var col = email.exhausted ? "var(--accent-red)"
+            : (email.spendable < email.limit * 0.2 ? "var(--accent-amber)"
+                                                   : "var(--accent-green)");
+    out +=
+      '<div class="ops-budget">' +
+        '<div class="ops-budget-top"><span class="lab">Email today ' +
+          (email.source === "local"
+            ? '<span class="ops-pill block">local count</span>'
+            : '<span class="ops-pill ok">Brevo</span>') +
+          '</span><span class="val">' + email.sent_today + ' / ' +
+          email.limit + '</span></div>' +
+        '<div class="ops-track">' +
+          '<span class="used" style="width:' + used + '%;background:' + col + '"></span>' +
+          '<span class="held" style="width:' + held + '%"></span></div>' +
+        '<div class="cap">' +
+          (email.exhausted
+            ? '<b style="color:var(--accent-red)">Spent</b> &mdash; the policy ' +
+              'gate is refusing sends and telling the agent to come back tomorrow.'
+            : '<b>' + email.spendable + '</b> spendable, ' + email.reserve +
+              ' held in reserve (hatched) so a demo is never the send that ' +
+              'finds the ceiling.') +
+        '</div></div>';
+  }
+
+  if (links) {
+    var lUsed = links.limit ? Math.min(100, (links.minted / links.limit) * 100) : 0;
+    var lCol = links.exhausted ? "var(--accent-red)"
+             : (links.remaining <= 5 ? "var(--accent-amber)" : "var(--accent-blue)");
+    out +=
+      '<div class="ops-budget">' +
+        '<div class="ops-budget-top">' +
+          '<span class="lab">Razorpay payment links</span>' +
+          '<span class="val">' + links.minted + ' / ' + links.limit + '</span></div>' +
+        '<div class="ops-track">' +
+          '<span class="used" style="width:' + lUsed + '%;background:' + lCol + '"></span>' +
+        '</div>' +
+        '<div class="cap"><b>' + links.remaining + '</b> left on this account, ' +
+          '<b>ever</b> &mdash; cancelling one does not give it back. Counted ' +
+          'across every case, not just this view.</div>' +
+      '</div>';
+  }
+  return out;
+}
+
+
+function opsCard(icon, title, body) {
+  return '<div class="batch-card">' +
+    '<div class="batch-card-top"><span class="batch-ico">' + OPS_ICONS[icon] +
+    '</span><span class="batch-title">' + esc(title) + '</span></div>' +
+    body + '</div>';
+}
+
+function pct(x) { return x == null ? "&mdash;" : (100 * x).toFixed(1) + "%"; }
+
+var OPS_SCOPE = "live";
+
+function setOpsScope(scope) {
+  OPS_SCOPE = scope;
+  ["live", "seeded", "all"].forEach(function (s) {
+    var b = document.getElementById("scope-" + s);
+    if (b) b.classList.toggle("active", s === scope);
+  });
+  loadOps();
+}
+
+function loadOps() {
+  fetch("/api/economics?scope=" + encodeURIComponent(OPS_SCOPE))
+    .then(function (r) { return r.json(); }).then(renderOps)
+    .catch(function () {
+      document.getElementById("ops-grid").innerHTML =
+        '<div class="ops-empty">Could not load /api/economics.</div>';
+    });
+}
+
+function renderOps(d) {
+  var eco = d.economics || {}, t = eco.totals || {};
+  var net = t.net_recovered || 0;
+  var sc = d.scopes || {counts: {}};
+
+  /* One compact line: which population, how big, and the test-mode caveat
+     that must never be out of sight. The essay is behind the toggle. */
+  var counts = sc.counts || {};
+  var scopeName = {live: "Live runs", seeded: "Seeded volume",
+                   all: "Both populations"}[eco.scope] || "";
+  var scopeSize = eco.scope === "all"
+    ? (counts.live || 0) + " live + " + (counts.seeded || 0) + " seeded"
+    : (counts[eco.scope] || 0) + " case(s)";
+  var meta = document.getElementById("ops-meta");
+  if (meta) {
+    meta.innerHTML =
+      '<b>' + scopeName + '</b><span>' + scopeSize + '</span>' +
+      '<span class="sep">|</span>' +
+      (eco.test_mode
+        ? '<span class="ops-pill block">Razorpay test mode</span>' +
+          '<span>no money moved &mdash; infrastructure spend is real</span>'
+        : '<span class="ops-pill ok">live keys</span>') +
+      '<span class="sep">|</span>' +
+      '<button class="ops-help" onclick="toggleOpsHelp()">How to read this</button>';
+  }
+
+  /* Cost per rupee recovered is the number a merchant reads first, so it
+     leads; the rest support it. */
+  var per100 = t.cost_per_100_recovered;
+  document.getElementById("ops-kpis").innerHTML =
+    '<div class="bstat lead"><span class="k">Cost per &#8377;100 recovered</span>' +
+      '<span class="v">' + (per100 == null ? "&mdash;"
+        : "&#8377;" + per100.toFixed(2)) + '</span>' +
+      '<span class="sub">' + (t.cases || 0) + ' cases &middot; ' +
+      (t.recovered_cases || 0) + ' recovered</span></div>' +
+    '<div class="bstat"><span class="k">Recovered</span><span class="v green">' +
+      inr(t.recovered) + '</span>' +
+      '<span class="sub">gross, before cost</span></div>' +
+    '<div class="bstat"><span class="k">Cost to recover</span><span class="v">' +
+      inr(t.total_cost) + '</span>' +
+      '<span class="sub">agent + channels + discounts</span></div>' +
+    '<div class="bstat"><span class="k">Net</span><span class="v ' +
+      (net >= 0 ? "green" : "red") + '">' + inr(net) + '</span>' +
+      '<span class="sub">what the merchant keeps</span></div>';
+
+  var kinds = eco.by_failure_kind || {};
+  var kindRows = Object.keys(kinds).map(function (k) {
+    var b = kinds[k];
+    return '<tr><td>' + esc(k) + '</td><td class="num">' + b.cases +
+      '</td><td class="num">' + inr(b.recovered) + '</td><td class="num">' +
+      inr(b.total_cost) + '</td><td class="num">' +
+      (b.cost_per_100_recovered == null ? '<span class="dim">&mdash;</span>'
+        : "&#8377;" + b.cost_per_100_recovered.toFixed(2)) + '</td></tr>';
+  }).join("");
+  var econBody = kindRows
+    ? '<table class="ops-table"><tr><th>Failure kind</th><th class="num">Cases</th>' +
+      '<th class="num">Recovered</th><th class="num">Cost</th>' +
+      '<th class="num">&#8377;/100</th></tr>' + kindRows + '</table>' +
+      '<div class="ops-note">' + esc(eco.pricing_note || "") + '</div>'
+    : '<div class="ops-empty">No worked cases yet.</div>';
+
+  var caseRows = (eco.cases || []).slice(0, 10).map(function (c) {
+    return '<tr><td>' + esc(c.payment_id) + '</td><td class="dim">' +
+      esc(c.failure_kind) + '</td><td class="num">' + c.llm_calls +
+      '</td><td class="num">' + ((c.tokens_in + c.tokens_out) / 1000).toFixed(1) +
+      'k</td><td class="num">' + inr(c.total_cost) + '</td><td class="num">' +
+      inr(c.recovered) + '</td></tr>';
+  }).join("");
+  /* Spend, as proportions. A table row said "discounts ₹1,069.50" and buried
+     the actual finding — that ~95% of the cost of recovery is margin given
+     away, not the AI. A stacked bar says it before you read a number. */
+  var prov = eco.provenance || {};
+  var msgCost = (t.comms_cost || 0) - (t.voice_cost || 0);
+  var parts = [
+    {lab: "Discounts accepted", amt: t.discount_given || 0,
+     col: "var(--accent-amber)", qty: "margin given away to close"},
+    {lab: "LLM tokens", amt: t.llm_cost || 0, col: "var(--accent-blue)",
+     qty: ((t.tokens || 0) / 1000).toFixed(0) + "k tokens &middot; " +
+          (t.llm_calls || 0) + " calls"},
+    {lab: "Voice calls", amt: t.voice_cost || 0, col: "var(--accent-purple)",
+     qty: (prov.voice_billed_cases ? "billed by SuperU" : "none in this scope")},
+    {lab: "Messages", amt: msgCost, col: "var(--accent-green)",
+     qty: (t.messages || 0) + " delivered"}
+  ];
+  var spendTotal = parts.reduce(function (a, x) { return a + x.amt; }, 0);
+  var anatomyBody = spendTotal > 0
+    ? '<div class="ops-bar">' +
+        parts.filter(function (x) { return x.amt > 0; }).map(function (x) {
+          return '<span style="width:' + (x.amt / spendTotal * 100) +
+                 '%;background:' + x.col + '"></span>';
+        }).join("") +
+      '</div><div class="ops-legend">' +
+        parts.map(function (x) {
+          return '<div class="ops-leg">' +
+            '<span class="dot" style="background:' + x.col + '"></span>' +
+            '<span class="lab">' + x.lab +
+              '<div class="qty">' + x.qty + '</div></span>' +
+            '<span class="amt">' + inr(x.amt) + '</span>' +
+            '<span class="pc">' +
+              (spendTotal ? (x.amt / spendTotal * 100).toFixed(0) : 0) + '%</span>' +
+          '</div>';
+        }).join("") +
+      '</div>'
+    : '<div class="ops-empty">No spend recorded in this scope yet.</div>';
+
+  /* The agent's remaining ammunition, in one place: both are metered
+     resources it must work inside, and both fail quietly when exhausted. */
+  var bg = d.budgets || {};
+  var budgetsBody = budgetMeter(bg.email, bg.links) ||
+    '<div class="ops-empty">No budget meters available.</div>';
+
+  var casesBody = caseRows
+    ? '<table class="ops-table"><tr><th>Payment</th><th>Kind</th>' +
+      '<th class="num">Calls</th><th class="num">Tokens</th>' +
+      '<th class="num">Cost</th><th class="num">Recovered</th></tr>' +
+      caseRows + '</table>'
+    : '<div class="ops-empty">No cases in this scope yet.</div>';
+
+  var g = d.guardrails || {}, tallies = g.tallies || {};
+  var tallyRows = Object.keys(tallies).filter(function (k) { return k !== "all_passed"; })
+    .map(function (k) {
+      return '<tr><td>' + esc(k) + '</td><td class="num">' +
+        (tallies[k].blocked || 0) + '</td></tr>';
+    }).join("");
+  var blocks = (g.recent_blocks || []).slice(0, 6).map(function (b) {
+    var guard = "policy";
+    (b.checks || []).some(function (c) {
+      if (c.verdict === "blocked" || c.verdict === "modified") { guard = c.guardrail; return true; }
+      return false;
+    });
+    /* Tool and guardrail on one line, the reason indented under it — the
+       flat version wrapped the reason around the pill and read as rubble. */
+    return '<div class="ops-block-row">' +
+      '<b>' + esc(b.tool) + '</b> ' +
+      '<span class="ops-pill block">' + esc(guard) + '</span>' +
+      '<div class="why" style="margin-top:3px">' +
+        esc((b.reason || "").slice(0, 120)) + '</div></div>';
+  }).join("");
+  var guardBody =
+    (tallyRows ? '<table class="ops-table"><tr><th>Guardrail</th>' +
+      '<th class="num">Refusals</th></tr>' + tallyRows + '</table>' : '') +
+    (blocks || '') +
+    '<div class="ops-note">' + (g.evaluations || 0) + ' tool call(s) evaluated' +
+    (tallyRows ? '' : ' &mdash; nothing refused yet') + '.</div>';
+
+  var m = d.memory || {}, prof = m.profiles || {};
+  var epi = m.episodes_by_kind || {};
+  /* Biggest kinds first — alphabetical order buried the interesting ones
+     under whichever happened to start with an early letter. */
+  var epiRows = Object.keys(epi)
+    .sort(function (a, b) { return epi[b] - epi[a]; })
+    .map(function (k) {
+      return '<tr><td>' + esc(k) + '</td><td class="num">' + epi[k] + '</td></tr>';
+    }).join("");
+  var memBody =
+    '<table class="ops-table"><tr><th>Store</th><th class="num">Count</th></tr>' +
+    '<tr><td>Customer profiles</td><td class="num">' + (prof.total_customers || 0) + '</td></tr>' +
+    '<tr><td>Closed-case episodes</td><td class="num">' + (m.episodes_total || 0) + '</td></tr>' +
+    '<tr><td>Promises tracked / kept</td><td class="num">' + (prof.total_promises || 0) +
+    ' / ' + (prof.fulfilled_promises || 0) + '</td></tr></table>' +
+    (epiRows ? '<table class="ops-table" style="margin-top:6px">' +
+      '<tr><th>Episodes by failure kind</th><th class="num"></th></tr>' + epiRows + '</table>'
+      : '<div class="ops-note">Episodes are written when close_case runs; they feed the ' +
+        '"what has worked before" line in every briefing.</div>');
+
+  var ev = d.evals, evalBody;
+  if (!ev || !ev.modes) {
+    evalBody = '<div class="ops-empty">No eval run recorded. Run ' +
+      '<b>make evals</b> (scores recorded decisions and the red-team baits) ' +
+      'and this panel fills itself.</div>';
+  } else {
+    var rows = "";
+    var md = ev.modes;
+    if (md.recorded) {
+      rows += '<tr><td>Recorded decisions</td><td class="num">' + md.recorded.decisions +
+        '</td><td class="num wrap">' + pct(md.recorded.conformance_rate) + ' conformant</td></tr>';
+    }
+    if (md.replay) {
+      rows += '<tr><td>Replayed decisions</td><td class="num">' + md.replay.decisions +
+        '</td><td class="num wrap">' + pct(md.replay.conformance_rate) + ' conformant, ' +
+        pct(md.replay.agreement_rate) + ' stable</td></tr>';
+    }
+    if (md.redteam) {
+      rows += '<tr><td>Red-team baits</td><td class="num">' + md.redteam.baits +
+        '</td><td class="num wrap">' + md.redteam.held + ' held, ' + md.redteam.caught_by_gate +
+        ' caught by rails, ' + md.redteam.leaked + ' leaked</td></tr>';
+    }
+    if (md.memory_ab) {
+      var used = md.memory_ab.memory_used != null ? md.memory_ab.memory_used
+                                                  : md.memory_ab.diverged;
+      rows += '<tr><td>Memory A/B</td><td class="num">' + md.memory_ab.decisions +
+        '</td><td class="num wrap">memory demonstrably used in ' + used + ' of ' +
+        md.memory_ab.decisions + '</td></tr>';
+    }
+    evalBody = '<table class="ops-table"><tr><th>Suite</th><th class="num">N</th>' +
+      '<th class="num">Result</th></tr>' + rows + '</table>' +
+      '<div class="ops-note">Last run ' + esc(ev.ran_at || "") + '</div>';
+  }
+
+  document.getElementById("ops-grid").innerHTML =
+    opsCard("anatomy", "Where the money goes", anatomyBody) +
+    opsCard("econ", "Cost by failure kind", econBody) +
+    opsCard("budget", "Resource budgets", budgetsBody) +
+    opsCard("shield", "Policy gate refusals", guardBody) +
+    opsCard("cases", "Costliest cases", casesBody) +
+    opsCard("db", "What the agent remembers", memBody) +
+    opsCard("evals", "Behavioural evals", evalBody);
+
+  /* Provenance and drill-down live once, under the grid — as a strip rather
+     than three paragraphs stacked inside a card. */
+  var foot = document.getElementById("ops-foot");
+  if (foot) {
+    foot.innerHTML =
+      '<span>' + (prov.voice_billed_total_inr
+        ? '<b>' + inr(prov.voice_billed_total_inr) + '</b> of voice spend is ' +
+          '<b>billed</b> by SuperU' +
+          (prov.voice_billed_unattributed_inr
+            ? ' (' + inr(prov.voice_billed_unattributed_inr) + ' for calls whose ' +
+              'case record is gone &mdash; still real money, still counted)'
+            : '') + '.'
+        : 'No billed voice costs reconciled yet.') +
+      ' Everything else is measured quantity &times; configured rate.</span>' +
+      (d.phoenix && d.phoenix.sessions_url
+        ? '<span>Per-case traces and token cost: ' +
+          '<a href="' + esc(d.phoenix.sessions_url) + '" target="_blank">' +
+          'Phoenix sessions</a> &mdash; find a case as ' +
+          '<b>case:&lt;payment_id&gt;</b>.</span>'
+        : '<span>Phoenix unreachable &mdash; no per-case trace drill-down.</span>');
+  }
+}
+
+setInterval(function () {
+  var ops = document.getElementById("view-ops");
+  if (ops && ops.classList.contains("on")) loadOps();
+}, 20000);
+</script>
 
 </body>
 </html>

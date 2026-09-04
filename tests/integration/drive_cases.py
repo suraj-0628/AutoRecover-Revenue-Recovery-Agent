@@ -26,6 +26,12 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "data-test"
 REG = STATE / "fake_gateway.json"
 OBS_JSON = STATE / "observations.json"
+# The rig's stack processes set this for themselves (fake_stack.py), but the
+# DRIVER also reads the queue to verify tickets — without the same default,
+# D1's "ticket exists" check looks in the live data/ queue and fails a case
+# the agent actually handled perfectly.
+os.environ.setdefault("ESCALATION_QUEUE_PATH",
+                      str(STATE / "escalations" / "queue.jsonl"))
 OBS_MD = ROOT / "OBSERVATIONS-CASE-MATRIX.md"
 BASE = os.getenv("FAKE_STACK_URL", "http://localhost:6002")
 LLM_URL = "http://localhost:20128/v1/models"
@@ -97,24 +103,52 @@ def wait_for(pred, timeout: float, poll: float = 5.0, label: str = ""):
 
 
 def llm_starved(pid: str) -> bool:
-    return any("AGENT RUN FAILED" in str(t.get("msg", ""))
-               for t in rec(pid).get("trail", []))
+    return bool(llm_failure_reason(pid))
 
 
-def wait_llm_proxy():
+def llm_failure_reason(pid: str) -> str:
+    """Why the agent could not run — quoted, not guessed.
+
+    This used to report every failure as "LLM quota", which mislabelled the
+    2026-09-03 run: the real error was `404 No active credentials for provider:
+    gemini`, a provider outage the fallback chain should have walked past. A
+    test rig that names the wrong cause sends you to the wrong bug.
+    """
+    for t in rec(pid).get("trail", []):
+        if "AGENT RUN FAILED" in str(t.get("msg", "")):
+            return str(t.get("detail", ""))[:180] or "agent run failed"
+    return ""
+
+
+#: How long to wait for the LLM proxy before giving up on a case. Bounded on
+#: purpose: this used to be `while True: sleep(10)` with no timeout and no
+#: attempt cap, called before EVERY case — so with the proxy down the driver
+#: printed one line and blocked forever. It never failed, never exited and
+#: never reported, which is indistinguishable from a run that is merely slow.
+#: A test harness that can hang forever cannot tell you anything.
+PROXY_WAIT_SECONDS = int(os.getenv("PROXY_WAIT_SECONDS", "180"))
+
+
+def wait_llm_proxy() -> bool:
+    """Wait (boundedly) for the LLM proxy. False if it never came up."""
+    deadline = time.time() + PROXY_WAIT_SECONDS
     said = False
-    while True:
+    while time.time() < deadline:
         try:
             urllib.request.urlopen(LLM_URL, timeout=3)
             if said:
                 print("[driver] LLM proxy is up — continuing", flush=True)
-            return
+            return True
         except Exception:
             if not said:
-                print("[driver] waiting for the LLM proxy on :20128 "
-                      "(start OmniRoute/antigravity) ...", flush=True)
+                print(f"[driver] waiting up to {PROXY_WAIT_SECONDS}s for the LLM "
+                      f"proxy on :20128 (start OmniRoute/antigravity) ...",
+                      flush=True)
                 said = True
             time.sleep(10)
+    print(f"[driver] LLM proxy still down after {PROXY_WAIT_SECONDS}s — "
+          f"recording the remaining cases as blocked and stopping.", flush=True)
+    return False
 
 
 _case_n = 0
@@ -245,9 +279,10 @@ class Case:
         self.checks.append((name, bool(ok)))
 
     def finish(self, note=""):
-        starved = self.pid and llm_starved(self.pid)
-        if starved:
-            verdict = "INCONCLUSIVE (LLM quota)"
+        why = llm_failure_reason(self.pid) if self.pid else ""
+        if why:
+            verdict = "INCONCLUSIVE (agent could not run)"
+            note = (note + f"  Agent never ran: {why}").strip()
         elif not self.checks:
             verdict = "OBSERVED"
         elif all(ok for _, ok in self.checks):
@@ -292,7 +327,15 @@ def wait_status(pid, statuses, t=RUN_T):
 
 
 def wait_quiet(pid, t=RUN_T):
-    """Run finished: status left 'recovering' and stayed put twice."""
+    """Wait for an agent run to START and then FINISH.
+
+    Waiting only for "status != recovering" returned instantly when called
+    before the run had begun — which is how B1 posted its modal-dismissal in
+    the same second as the decline, hit the `already_recovering` guard, and
+    never exercised the signal-precedence path at all.
+    """
+    wait_for(lambda: rec(pid).get("status") == "recovering"
+             or (rec(pid).get("ladder") or {}), 90, poll=2)
     def _q():
         s = rec(pid).get("status")
         return s if s and s != "recovering" else None
@@ -362,17 +405,20 @@ def case_C1():
 
 def case_C4(c1_pid):
     c = Case("C4", "Scheduled retry fires through the daemon (cross-process)")
-    c.pid = c1_pid
-    if not c1_pid or not rec(c1_pid).get("scheduled_job"):
-        c.step("no C1 job available — skipped")
-        c.finish("needs C1 to have scheduled a job")
-        return
     all_jobs = jobs()
     jid = None
+    # Any pending job will do; what matters is that it was scheduled AFTER the
+    # daemon process started, which is the blindness refresh() exists to cure.
     for j_id, j in all_jobs.items():
-        if j.get("payment_id") == c1_pid and j.get("status") == "pending":
+        if j.get("status") == "pending" and (not c1_pid
+                                             or j.get("payment_id") == c1_pid):
+            jid, c.pid = j_id, j.get("payment_id")
             j["target_time"] = "2020-01-01T00:00:00+00:00"
-            jid = j_id
+            break
+    if not jid:
+        c.step("no pending job exists — skipped")
+        c.finish("needs a scheduled retry to exist")
+        return
     (STATE / "live_jobs.json").write_text(json.dumps(all_jobs, indent=2))
     c.step(f"rewound job {jid} to the past; waiting on the daemon poll (60s)")
     done = wait_for(lambda: (jobs().get(jid, {}).get("status") == "completed"),
@@ -486,13 +532,30 @@ def case_A2():
 
 def case_E2(a2_pid):
     c = Case("E2", "Recovered is absorbing: late signals cannot reopen or double-count")
-    c.pid = a2_pid
     if not a2_pid or rec(a2_pid).get("status") != "recovered":
-        c.step("no recovered A2 case available — skipped")
-        c.finish("needs A2 recovered")
+        # Fall back to any recovered case on disk, so E2 can be re-run on its
+        # own without re-driving A2.
+        try:
+            allrecs = json.loads((STATE / "live_payments.json").read_text())
+            a2_pid = next((k for k, v in allrecs.items()
+                           if v.get("status") == "recovered"
+                           and v.get("recovered_amount")), None)
+        except Exception:
+            a2_pid = None
+    c.pid = a2_pid
+    if not a2_pid:
+        c.step("no recovered case available — skipped")
+        c.finish("needs a recovered case")
         return
     before = rec(a2_pid).get("recovered_amount")
-    r = succeed(a2_pid, f"pay_fake_{a2_pid}", "order_whatever")
+    # Register the capture so the route reaches the already-recorded guard
+    # instead of stopping earlier at "not_captured".
+    cap = str(rec(a2_pid).get("recovered_payment_id") or f"pay_fake_{a2_pid}")
+    order_id = str(rec(a2_pid).get("original_order_id") or "")
+    reg_update(lambda r: r.setdefault("captured", {}).update(
+        {cap: {"amount": int(round(float(before or 0) * 100)),
+               "order_id": order_id}}))
+    r = succeed(a2_pid, cap, order_id)
     c.step(f"duplicate payment-succeeded -> {r.get('status')}")
     c.check("no double count", r.get("status") in ("already_recorded",
                                                    "order_mismatch"))
@@ -668,8 +731,12 @@ def case_A3():
     if not wait_push(pid):
         c.check("push delivered", False); c.finish(); return
     c.step("push delivered; customer does NOTHING (waiting out the window)")
+    # The push carries its OWN wait (wait_minutes, typically 15), and
+    # _watch_push_response only records "ignored" once that expires — so the
+    # driver has to outlast the agent's window plus a follow-up run, or it
+    # scores the agent's correct patience as a failure to advance.
     got = wait_for(lambda: len((rec(pid).get("ladder") or {})) >= 2
-                   or llm_starved(pid), 900, poll=15)
+                   or llm_starved(pid), 1500, poll=15)
     r = rec(pid)
     c.check("agent advanced past the ignored push",
             len((r.get("ladder") or {})) >= 2)
@@ -687,8 +754,62 @@ ORDER = ["E1", "D1", "C1", "C4", "C2", "E4", "B5", "A1", "A2", "E2",
          "B1", "B2", "A7", "B4", "B3", "A6", "A4", "A3"]
 
 
+BASELINE = Path(__file__).with_name("baseline.json")
+
+
+def _verdicts() -> dict[str, str]:
+    try:
+        return {cid: o.get("verdict", "") for cid, o in
+                json.loads(OBS_JSON.read_text()).items()}
+    except Exception:
+        return {}
+
+
+def check_baseline(current: dict[str, str],
+                   baseline: dict[str, str]) -> list[str]:
+    """A case the baseline had PASSing that now is not — and was not starved.
+
+    INCONCLUSIVE on either side is skipped, same contract as everywhere else
+    in this rig: an LLM-quota casualty is not a regression. Pure, so the unit
+    suite can pin the semantics without driving a single journey.
+    """
+    regressions = []
+    for cid, base in sorted(baseline.items()):
+        cur = current.get(cid, "")
+        if not base.startswith("PASS"):
+            continue
+        if not cur or "INCONCLUSIVE" in cur:
+            continue
+        if not cur.startswith("PASS"):
+            regressions.append(f"{cid}: {base} -> {cur}")
+    return regressions
+
+
+def run_baseline_gate(write: bool, check: bool) -> int:
+    current = _verdicts()
+    if write:
+        BASELINE.write_text(json.dumps(current, indent=1, sort_keys=True))
+        print(f"[driver] baseline written: {BASELINE} ({len(current)} cases)",
+              flush=True)
+    if check and BASELINE.exists():
+        try:
+            baseline = json.loads(BASELINE.read_text())
+        except Exception:
+            baseline = {}
+        regressions = check_baseline(current, baseline)
+        if regressions:
+            print("[driver] REGRESSIONS vs baseline:", flush=True)
+            for r in regressions:
+                print(f"  - {r}", flush=True)
+            return 1
+        print("[driver] no regressions vs baseline", flush=True)
+    return 0
+
+
 def main():
-    only = set(a.upper() for a in sys.argv[1:]) or set(ORDER)
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    only = set(a.upper() for a in sys.argv[1:]
+               if not a.startswith("--")) or set(ORDER)
     done = set()
     if OBS_JSON.exists():
         try:
@@ -699,7 +820,14 @@ def main():
     for cid in ORDER:
         if cid not in only or cid in done:
             continue
-        wait_llm_proxy()
+        if not wait_llm_proxy():
+            # Say so and stop, rather than hanging. The case stays absent from
+            # observations.json, so a later run resumes exactly here.
+            c = Case(cid, "blocked before it could run")
+            c.step(f"LLM proxy unreachable for {PROXY_WAIT_SECONDS}s")
+            c.finish("Not a product result — the harness could not start the "
+                     "agent. Re-run this case once the proxy is up.")
+            break
         print(f"\n[driver] ══ {cid} ══", flush=True)
         try:
             if cid == "C4":
@@ -718,6 +846,8 @@ def main():
             c.finish(str(e))
         time.sleep(5)
     print(f"\n[driver] run complete — see {OBS_MD}", flush=True)
+    sys.exit(run_baseline_gate(write="--write-baseline" in flags,
+                               check="--check" in flags))
 
 
 if __name__ == "__main__":

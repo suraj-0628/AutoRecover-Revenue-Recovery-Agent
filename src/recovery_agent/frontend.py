@@ -21,34 +21,23 @@ import threading
 from flask import Flask, render_template, render_template_string, request, jsonify
 from flask_socketio import SocketIO
 
+from recovery_agent import audit
 from recovery_agent.razorpay_client import RazorpayClient
 from recovery_agent.state_store import StateStore
 import json
 from langchain_core.messages import AIMessage, ToolMessage
 
-# --- OpenTelemetry: Manual spans for coherent parent→child trace hierarchy ---
-_otel_tracer = None
+# --- OpenTelemetry: manual spans for the parent→child hierarchy ---
+#
+# This used to build its OWN TracerProvider with a bare OTLP exporter and set
+# it as the global — racing llm_client's lazy Phoenix register for the one
+# global slot OTel allows. Whoever lost, silently: spans without OpenInference
+# conventions, no project, no LangChain instrumentation, no cost attributes.
+# All tracing now goes through the single shared init in observability.py.
 
 def _get_tracer():
-    """Lazy-init a tracer for frontend agent spans (parent→child)."""
-    global _otel_tracer
-    if _otel_tracer is not None:
-        return _otel_tracer
-    try:
-        from opentelemetry import trace
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        provider = TracerProvider()
-        exporter = OTLPSpanExporter(endpoint="http://localhost:6006/v1/traces")
-        provider.add_span_processor(SimpleSpanProcessor(exporter))
-        trace.set_tracer_provider(provider)
-        _otel_tracer = trace.get_tracer("recovery-agent")
-    except Exception:
-        # Graceful degradation — spans become no-ops
-        from opentelemetry import trace
-        _otel_tracer = trace.get_tracer("recovery-agent")
-    return _otel_tracer
+    from recovery_agent.observability import get_tracer
+    return get_tracer("recovery-agent")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.urandom(24).hex()
@@ -290,6 +279,11 @@ def deliver_page_push(payload: dict) -> dict:
         )
         store.flush()
 
+    if not presence.is_live(payment_id):
+        return {"status": "no_active_session",
+                "note": "no checkout page is listening for this payment — "
+                        "nothing was shown, so no rung was climbed"}
+
     socketio.emit("agent_push", payload)
     push_event(payment_id, "page_push", {
         "detail": payload.get("headline", ""), "body": payload.get("body", ""),
@@ -529,6 +523,11 @@ def _mark_recovered(payment_id: str, amount: float, rzp_payment_id: str,
     sp["status"] = "recovered"
     sp["recovered_amount"] = amount
     sp["recovered_payment_id"] = rzp_payment_id
+    # The money is in, so any wake-up this case set for itself is moot. Left
+    # pending it fires later and is refused by the hand-off guard — harmless,
+    # but a settled case should not keep its own alarms set.
+    store.cancel_jobs_for(payment_id, reason="recovered")
+    sp["waiting_for"] = None
     sp.setdefault("trail", []).append({
         "step": "recovery_confirmed",
         "msg": f"Payment captured: INR {amount:,.2f}",
@@ -536,6 +535,15 @@ def _mark_recovered(payment_id: str, amount: float, rzp_payment_id: str,
         "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
     })
     store.flush()
+    # The join that makes money measurable per batch. The run id was stamped on
+    # the record by the executor when it acted; carrying it onto the event is
+    # what lets a run's total be a sum over the log rather than a guess from
+    # timestamps. A case recovered outside any batch carries an empty id and is
+    # simply not counted against one.
+    audit.record(audit.MONEY_RECOVERED, payment_id=payment_id,
+                 batch_run_id=sp.get("batch_run_id") or "",
+                 actor="observer", result=how, amount_rupees=amount,
+                 rzp_payment_id=rzp_payment_id, seconds=seconds)
     push_event(payment_id, "recovery_confirmed", {
         "status": "recovered", "payment_id": payment_id, "amount": amount,
         "captured_payment_id": rzp_payment_id, "detail": f"{how} after {seconds}s",
@@ -623,66 +631,309 @@ def api_batches():
     })
 
 
-#: How many cases one batch run will work. A batch can hold hundreds; a run that
-#: quietly worked all of them would send hundreds of emails and burn the payment
-#: link quota in one click. The cap is visible in the UI and in the response, so
-#: a partial run never reads as a complete one.
-BATCH_RUN_LIMIT = int(os.getenv("BATCH_RUN_LIMIT", "5"))
+@app.route("/api/guardrails", methods=["GET", "POST"])
+def api_guardrails():
+    """Read or change the guardrail policy at runtime.
+
+    These were env-only, so the only way to move a boundary was shell access
+    and a restart of four services — which is the wrong audience and the wrong
+    moment. Live on pay_ls1dep23k a real bank-decline recovery was refused at
+    "4/3 contacts in 24h" and there was nothing the operator could do about it
+    from the dashboard they were watching it fail in.
+    """
+    from recovery_agent import guardrail_config as gc
+
+    if request.method == "GET":
+        return jsonify({"settings": gc.describe()})
+
+    data = request.get_json(silent=True) or {}
+    if data.get("reset"):
+        return jsonify({"values": gc.reset(), "rejected": [], "reset": True})
+
+    values, rejected = gc.update(data.get("changes") or {})
+    # Say plainly what is now in force. The engine is rebuilt per run, so a
+    # change applies to the next agent turn without a restart.
+    push_event("guardrails", "policy_changed", {
+        "detail": ", ".join(f"{k}={v}" for k, v in
+                            (data.get("changes") or {}).items())[:300],
+        "rejected": rejected,
+    })
+    return jsonify({"values": values, "rejected": rejected})
+
+
+@app.route("/api/economics", methods=["GET"])
+def api_economics():
+    """Everything the ops view shows: what recovery costs, what policy refused,
+    what the agent remembers, and what the last eval run scored."""
+    from recovery_agent import economics
+    from recovery_agent.agent.policy_gate import read_verdicts
+    from recovery_agent.agent.memory import CustomerMemoryStore
+
+    # ?scope=live shows only cases the agent worked end to end against a real
+    # gateway order; ?scope=seeded shows the demo/batch volume. Blended by
+    # default would flatter the cost-per-recovery, because a seeded case the
+    # agent never touched costs nothing.
+    scope = (request.args.get("scope") or "live").strip().lower()
+    if scope not in ("live", "seeded", "all"):
+        scope = "live"
+    records = list(store.payment_values())
+    out = {"economics": economics.summarise(records, scope=scope)}
+    counts = {"live": 0, "seeded": 0}
+    for r in records:
+        counts[economics.case_origin(r)] += 1
+    out["scopes"] = {"selected": scope, "counts": counts}
+
+    verdicts = read_verdicts(300)
+    tallies: dict[str, dict[str, int]] = {}
+    for v in verdicts:
+        if v.get("outcome") == "blocked":
+            name = next((c["guardrail"] for c in (v.get("checks") or [])
+                         if c.get("verdict") in ("blocked", "modified")), "policy")
+        else:
+            name = "all_passed"
+        t = tallies.setdefault(name, {"pass": 0, "blocked": 0})
+        t[v.get("outcome", "pass")] = t.get(v.get("outcome", "pass"), 0) + 1
+    out["guardrails"] = {
+        "tallies": tallies,
+        "recent_blocks": [v for v in verdicts if v.get("outcome") == "blocked"][:12],
+        "evaluations": len(verdicts),
+    }
+
+    try:
+        mem = CustomerMemoryStore.live().get_stats()
+    except Exception:
+        mem = {}
+    episodes: dict[str, int] = {}
+    try:
+        from recovery_agent.agent.graph import get_memory_store
+        for item in get_memory_store().search(("recovery", "episodes"), limit=500):
+            kind = (item.value or {}).get("failure_kind", "unknown")
+            episodes[kind] = episodes.get(kind, 0) + 1
+    except Exception:
+        pass
+    out["memory"] = {"profiles": mem, "episodes_by_kind": episodes,
+                     "episodes_total": sum(episodes.values())}
+
+    try:
+        from pathlib import Path as _P
+        scorecard = _P(__file__).resolve().parents[2] / "evals" / "results" / "scorecard.json"
+        out["evals"] = json.loads(scorecard.read_text()) if scorecard.exists() else None
+    except Exception:
+        out["evals"] = None
+
+    # Deep links into Phoenix: every case is a session there, with tokens AND
+    # dollar cost rolled up by its price table. None while Phoenix is down.
+    try:
+        from recovery_agent.observability import phoenix_project_info
+        out["phoenix"] = phoenix_project_info()
+    except Exception:
+        out["phoenix"] = None
+
+    # What the agent has left to spend today. The email allowance is the one
+    # that runs out quietly — a send over the cap simply never arrives.
+    try:
+        from recovery_agent import email_quota
+        out["budgets"] = {"email": email_quota.status()}
+    except Exception:
+        out["budgets"] = {}
+
+    # Payment links are an ACCOUNT-wide lifetime quota, so it is counted over
+    # every record regardless of the scope being viewed — a link spent by a
+    # seeded case is just as gone.
+    try:
+        minted = sum(len(r.get("recovery_links") or []) for r in records)
+        limit = int(os.getenv("RAZORPAY_LINK_LIFETIME_LIMIT", "30"))
+        out["budgets"]["links"] = {
+            "minted": minted, "limit": limit,
+            "remaining": max(0, limit - minted),
+            "exhausted": minted >= limit,
+        }
+    except Exception:
+        pass
+
+    return jsonify(out)
+
+
+def _batch_candidates(key: str) -> list[dict]:
+    """The cases in a batch, as the classifier sorts them right now.
+
+    Read fresh on every call rather than carried from the plan: a case can
+    settle, be reclassified or climb a rung between planning and its turn, and
+    the whole point of re-checking per case is that the batch is not frozen.
+    """
+    from recovery_agent.agent.classify import classify
+    return [r for r in store.payment_values()
+            if classify(r) == key and r.get("payment_id")]
+
+
+@app.route("/api/batches/<key>/plan", methods=["GET", "POST"])
+def api_plan_batch(key: str):
+    """What this batch would do, and to whom — without doing any of it.
+
+    Costs nothing and spends no payment-link quota, because it runs the same
+    twelve prechecks the live run does and stops before the first side effect.
+    That is what makes it possible to show a two-hundred-case batch's plan on a
+    test account that owns five links.
+    """
+    from recovery_agent.agent.classify import BATCH_BY_KEY
+    from recovery_agent.batch import run as batch_run
+    from recovery_agent.batch.plan import BatchBudget
+    from recovery_agent.batch.planner import plans_for
+
+    meta = BATCH_BY_KEY.get(key)
+    if not meta:
+        return jsonify({"error": f"unknown batch {key!r}"}), 404
+    if not meta.get("runnable"):
+        return jsonify({"error": f"{key} is not worked as a batch",
+                        "why": meta.get("what", "")}), 400
+
+    data = request.get_json(silent=True) or {}
+    records = _batch_candidates(key)
+    plans, rejected = plans_for(key, records)
+    for entry in rejected:
+        audit.record(audit.BATCH_PLAN_REJECTED, subject_type=audit.BATCH_RUN,
+                     subject_id=f"plan:{key}", actor="planner",
+                     reason=entry["why"], batch_key=key, tier=entry["tier"])
+
+    run = batch_run.BatchRun(batch_key=key, plans=plans, dry_run=True,
+                             budget=BatchBudget.from_request(data.get("budget")),
+                             started_by="dry_run")
+    report = run.execute(records)
+    return jsonify({"batch": key, "title": meta["title"], "report": report,
+                    "plans": {t: p.as_dict() for t, p in plans.items()},
+                    "rejected": rejected})
 
 
 @app.route("/api/batches/<key>/run", methods=["POST"])
 def api_run_batch(key: str):
-    """Work a batch: one agent session per payment, never two on one case."""
-    from recovery_agent.agent.classify import BATCH_BY_KEY, classify
+    """Work a batch: one decision per band, applied to every case in it.
+
+    Returns as soon as the run is registered. The report is resolved on read
+    from the audit log, so `GET /api/batch-runs/<id>` is correct while the run
+    is still going and keeps climbing after it finishes as customers pay.
+    """
+    from recovery_agent.agent.classify import BATCH_BY_KEY
+    from recovery_agent.batch import run as batch_run
+    from recovery_agent.batch.plan import BatchBudget
+    from recovery_agent.batch.planner import plans_for
+
     meta = BATCH_BY_KEY.get(key)
     if not meta:
         return jsonify({"error": f"unknown batch {key!r}"}), 404
+    if not meta.get("runnable"):
+        return jsonify({"error": f"{key} is not worked as a batch",
+                        "why": meta.get("what", "")}), 400
 
     data = request.get_json(silent=True) or {}
-    limit = max(1, min(int(data.get("limit") or BATCH_RUN_LIMIT), 50))
+    if data.get("dry_run"):
+        return api_plan_batch(key)
 
-    candidates = [r for r in store.payment_values() if classify(r) == key]
-    started, skipped = [], []
-    for rec in candidates:
-        pid = rec.get("payment_id") or ""
-        if not pid:
-            continue
-        if len(started) >= limit:
-            skipped.append({"payment_id": pid, "why": "over this run's limit"})
-            continue
-        # Sessions are per payment. A case the real-time agent is already
-        # working must not get a second run — that is the one rule the whole
-        # session model rests on.
-        if pid in active_agent_payments:
-            skipped.append({"payment_id": pid, "why": "already being worked"})
-            continue
-        customer = {k: v for k, v in (rec.get("customer") or {}).items() if v} or {
-            k: v for k, v in {"email": rec.get("customer_email", ""),
-                              "name": rec.get("customer_name", ""),
-                              "contact": rec.get("customer_phone", "")}.items() if v}
-        if not (customer.get("email") or customer.get("contact")):
-            skipped.append({"payment_id": pid, "why": "no way to contact them"})
-            continue
+    # One live run per batch. A second click while the first is going would
+    # spend a second budget against the same cases.
+    for existing in batch_run.live():
+        if existing.batch_key == key:
+            return jsonify({"error": "that batch is already running",
+                            "batch_run_id": existing.run_id}), 409
 
-        # The batch is the context. The agent is told what this group has in
-        # common and what that implies, so it does not re-derive the category
-        # for every case — which is the whole reason for sorting them first.
-        socketio.start_background_task(
-            run_agent_for_payment, pid, float(rec.get("amount") or 0),
-            f"BATCH: {meta['title']}. {meta['what']} "
-            f"This payment is one of {len(candidates)} in that batch. Work it on "
-            f"its own merits — the batch says what kind of problem it is, not "
-            f"what to do about this particular customer.",
-            customer, f"batch_{key}",
-            rec.get("failure_code", "") or "",
-        )
-        started.append(pid)
+    records = _batch_candidates(key)
+    plans, rejected = plans_for(key, records)
+    if not plans:
+        return jsonify({"error": "no plan could be made for this batch",
+                        "rejected": rejected}), 422
 
-    push_event("batch", "batch_started", {"batch": key, "started": len(started),
-                                          "skipped": len(skipped)})
+    run = batch_run.register(batch_run.BatchRun(
+        batch_key=key, plans=plans,
+        budget=BatchBudget.from_request(data.get("budget")),
+        started_by=str(data.get("started_by") or "dashboard")))
+
+    def _on_decision(decision):
+        """Watch every link this run creates, the way the agent path does.
+
+        Without this the batch is a send-only system: links go out, customers
+        pay them, and nothing ever notices — so "measured money recovered"
+        reports zero however much actually came back. The watcher keys off
+        `order_id`, which is where the agent path also puts the link id.
+        """
+        link_id = decision.detail.get("link_id")
+        if decision.outcome != "acted" or not link_id:
+            return
+        try:
+            store.update_payment(decision.payment_id, order_id=link_id,
+                                 recovery_link=decision.detail.get("link_url", ""))
+            store.flush()
+            socketio.start_background_task(_watch_for_recovery,
+                                           decision.payment_id, 900)
+        except Exception:
+            pass
+
+    def _work():
+        try:
+            report = run.execute(records, on_decision=_on_decision)
+        except Exception as exc:                      # pragma: no cover
+            run.stop_reason = f"{type(exc).__name__}: {exc}"
+            report = run.report()
+        push_event("batch", "batch_finished",
+                   {"batch": key, "batch_run_id": run.run_id, **report})
+
+    socketio.start_background_task(_work)
+    push_event("batch", "batch_started",
+               {"batch": key, "batch_run_id": run.run_id,
+                "candidates": len(records), "tiers": sorted(plans)})
     return jsonify({"batch": key, "title": meta["title"],
-                    "started": started, "skipped": skipped,
-                    "limit": limit, "total_in_batch": len(candidates)})
+                    "batch_run_id": run.run_id, "candidates": len(records),
+                    "plans": {t: p.as_dict() for t, p in plans.items()},
+                    "rejected": rejected,
+                    "budget": run.budget.as_dict()}), 202
+
+
+@app.route("/api/batch-runs", methods=["GET"])
+def api_batch_runs():
+    """Every run, newest first, each with its money resolved as of now."""
+    from recovery_agent.batch import run as batch_run
+    opened = audit.log().of_kind(audit.BATCH_OPENED, limit=200)
+    runs = [batch_run.projection(e["batch_run_id"]) for e in reversed(opened)
+            if e.get("batch_run_id")]
+    return jsonify({"runs": runs, "live": [r.run_id for r in batch_run.live()]})
+
+
+@app.route("/api/batch-runs/<run_id>", methods=["GET"])
+def api_batch_run(run_id: str):
+    """One run's report, recomputed from the log.
+
+    A batch finishes sending in seconds and customers pay over the following
+    minutes, so this number climbs after the run has closed. That is correct: a
+    total frozen at `finished_at` would be wrong in the flattering direction.
+    """
+    from recovery_agent.batch import run as batch_run
+    report = batch_run.projection(run_id)
+    live = batch_run.get(run_id)
+    # A run is answered from the moment it is registered, not from its first
+    # event: `POST /run` returns before the background task has opened the log,
+    # and a caller that polls immediately — which is every caller — would
+    # otherwise be told its own run does not exist.
+    if not report["events"] and live is None:
+        return jsonify({"error": f"unknown run {run_id!r}"}), 404
+    if live is not None:
+        report.update(status=live.status, stop_reason=live.stop_reason,
+                      spend=live.spend.as_dict(),
+                      decisions=[d.as_dict() for d in live.decisions])
+    if request.args.get("events"):
+        report["trail"] = audit.log().for_run(run_id)
+    return jsonify(report)
+
+
+@app.route("/api/batch-runs/<run_id>/abort", methods=["POST"])
+def api_abort_batch_run(run_id: str):
+    """Stop a run. An action already in flight finishes — a payment link created
+    and never mentioned to the customer is worse than one extra email."""
+    from recovery_agent.batch import run as batch_run
+    live = batch_run.get(run_id)
+    if live is None or live.status != batch_run.OPEN:
+        return jsonify({"error": f"no live run {run_id!r}"}), 404
+    data = request.get_json(silent=True) or {}
+    live.abort(str(data.get("reason") or "aborted from the dashboard"))
+    return jsonify({"batch_run_id": run_id, "status": "aborting",
+                    "stop_reason": live.stop_reason})
 
 
 @app.route("/api/escalations", methods=["GET"])
@@ -739,6 +990,20 @@ active_agent_payments: set[str] = set()
 # tool_call id, which is unique per real call, so a genuine repeat still shows.
 _emitted_tool_events: dict[str, set[str]] = {}
 _EMITTED_CASES_MAX = 500
+
+
+from recovery_agent import presence
+
+
+@socketio.on("watch_payment")
+def _on_watch_payment(data):
+    """A checkout page announcing itself. See `presence` for why this matters."""
+    presence.watch(request.sid, str((data or {}).get("payment_id") or ""))
+
+
+@socketio.on("disconnect")
+def _on_disconnect(*_a, **_k):
+    presence.forget(request.sid)
 
 
 def push_event(payment_id: str, event_type: str, data: dict):
@@ -1004,8 +1269,23 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         "currency": "INR",
     }
 
-    with tracer.start_as_current_span("agent_recovery", attributes=parent_attrs) as parent_span:
-      memory_store = CustomerMemoryStore()
+    # One case = one Phoenix session. The context manager stamps
+    # session.id onto every instrumented child span (each LLM turn, each
+    # tool call), and the root span carries it too — so Phoenix groups all
+    # of this case's runs together and rolls tokens and cost up per case.
+    from recovery_agent.observability import case_session, session_id_for
+    parent_attrs["session.id"] = session_id_for(payment_id)
+
+    from recovery_agent.observability import (KIND_AGENT, KIND_CHAIN,
+                                              traced_span)
+
+    with case_session(payment_id, failure_code=failure_code,
+                      scenario=scenario_type, amount=amount), \
+         traced_span("agent_recovery", kind=KIND_AGENT, tracer=tracer,
+                     attributes=parent_attrs) as parent_span:
+      # The shared persistent store — a profile learned on one run must exist
+      # on the next, or channel win-rates and contact caps are theatre.
+      memory_store = CustomerMemoryStore.live()
       guardrail_engine = GuardrailEngine()
 
       customer_email = customer.get("email", "")
@@ -1052,7 +1332,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
           push_event(payment_id, step, entry)
 
       # ── INITIALIZE CASE ──
-      with tracer.start_as_current_span("init_case") as init_span:
+      with traced_span("init_case", kind=KIND_CHAIN, tracer=tracer) as init_span:
         raw_reason = failure_reason or "Payment failed during checkout"
         norm = {}
         try:
@@ -1127,7 +1407,8 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
         )
 
       # ── RUN LANGGRAPH REACT AGENT ──
-      with tracer.start_as_current_span("graph_execution") as graph_span:
+      with traced_span("graph_execution", kind=KIND_CHAIN,
+                       tracer=tracer) as graph_span:
         from recovery_agent.agent import RecoveryAgent
         from recovery_agent.agent.graph import build_initial_state, RecoveryContext
         
@@ -1170,6 +1451,8 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             thought="Launching ReAct Agent — LLM will reason, call tools, and adapt",
             detail=f"Loop: agent → tools → agent → ... → END",
         )
+
+        _run_started = time.monotonic()
 
         try:
             # Only THIS run's messages count.
@@ -1258,8 +1541,15 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
                                     thought=f"[AGENT] {msg.content[:300]}",
                                     detail="",
                                 )
+            from recovery_agent.economics import record_run_wall
+            record_run_wall(payment_id, time.monotonic() - _run_started)
         except Exception as e:
             # Graph error or LLM unavailable — surface the real error
+            try:
+                from recovery_agent.economics import record_run_wall
+                record_run_wall(payment_id, time.monotonic() - _run_started)
+            except Exception:
+                pass
             print(f"[Frontend] Graph stream error for {payment_id}: {type(e).__name__}: {e}", flush=True)
             import traceback as _tb; _tb.print_exc()
             # Say what actually happened. There is no bandit fallback here and
@@ -1295,7 +1585,7 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             }
 
       # ── EXTRACT RESULTS FROM REACT AGENT ──
-      with tracer.start_as_current_span("act") as act_span:
+      with traced_span("act", kind=KIND_CHAIN, tracer=tracer) as act_span:
         cause = case.payment.failure_code or "unknown"
         strategy_source = "react_agent"
         recovery_tier = case.payment.metadata.get("recovery_tier", "active")
@@ -2058,6 +2348,13 @@ function showStore() {
 const paymentId = "pay_" + Math.random().toString(36).substr(2,9);
 const socket = io();
 
+/* Tell the server this page exists. Without it the server cannot know whether
+   anyone is on the checkout, and an in-page push would be recorded as a
+   contact that never happened. Re-sent on every reconnect. */
+socket.on("connect", function () {
+  socket.emit("watch_payment", {payment_id: paymentId});
+});
+
 function getCustomerData() {
   return {
     name: (document.getElementById("cust-name").value || "").trim(),
@@ -2112,6 +2409,13 @@ function startPayment() {
     theme: {color:"#2563eb"},
     modal: {ondismiss: function() {
       _rzpModalOpen = false;
+      /* WE closed it, because their payment had already failed. That is not a
+         customer changing their mind, and reporting it as one is how a bank
+         decline became a "drop-off": live on pay_qssihjc5z the stale
+         customer_cancelled outranked the real reason and authorised 5% off a
+         payment the customer had been TRYING to make. The failure was already
+         reported by the payment.failed handler below. */
+      if (_closedAfterFailure) { _closedAfterFailure = false; _flushHeldPush(); return; }
       showStatus("failed", "Payment cancelled. Our agent will help you recover it.");
       btn.disabled = false; btn.innerHTML = "Retry Payment";
       triggerRecovery({code:"customer_cancelled", reason:"Payment cancelled by customer", source:"customer", step:"payment_processing"});
@@ -2122,6 +2426,17 @@ function startPayment() {
       btn.disabled = false; btn.innerHTML = "Retry Payment";
       showDeclineWall(r.error.code || "failed", r.error.description);
       triggerRecovery({code:r.error.code || "technical_error", reason:r.error.description || r.error.reason || "Payment failed", source:r.error.source || "gateway", step:r.error.step || "payment_processing"});
+      /* Get them OUT of the Razorpay window. Its iframe owns the top of the
+         z-order, so every recovery surface we draw renders underneath it —
+         unclickable and invisible. The customer sits on a dead rail-selection
+         screen while the agent talks to a page they cannot reach, and their
+         only way out is to close the modal, which used to be recorded as a
+         drop-off. Closing it ourselves puts them back on the checkout where
+         the offer is visible, and keeps the diagnosis truthful. */
+      _closedAfterFailure = true;
+      try { rzp.close(); } catch (e) {}
+      _rzpModalOpen = false;
+      setTimeout(_flushHeldPush, 300);
     });
     _rzpModalOpen = true;
     rzp.open();
@@ -2201,6 +2516,9 @@ function closePush(action, detail) {
    held when the payment SUCCEEDS is dropped: it belongs to a case that just
    ended. */
 let _rzpModalOpen = false;
+//: Set when WE close the checkout because the payment failed, so the dismiss
+//: that follows is not misread as the customer walking away.
+let _closedAfterFailure = false;
 let _heldAgentPush = null;
 
 function _flushHeldPush() {
@@ -2680,9 +2998,13 @@ def payment_failed():
     # said `failure_code: None` and the only trace of a bank decline was prose
     # in a message — which is why the agent reached for a discount on what was
     # a payment-method problem.
+    # `decline_strategy` is refreshed with the code, not left from the previous
+    # attempt. It is a DERIVED field that `failure_kind` consults, so a stale
+    # one silently re-diagnoses the new failure as the old one.
     store.update_payment(payment_id, status="recovering", push_outcome=None,
                          failure_code=failure_code or "",
-                         failure_reason=failure_reason or "")
+                         failure_reason=failure_reason or "",
+                         decline_strategy=failure_code or "")
 
 
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)
@@ -2893,9 +3215,49 @@ def daemon_retry_complete():
     # hands the case back — and by this point the ladder is exhausted, so the
     # agent's escalate_to_human is finally permitted and the case reaches a
     # person instead of silence.
+    # The agent asked to be woken and the wait has elapsed. Hand it back with
+    # what it said it was waiting for, so it resumes its own plan instead of
+    # re-deriving one — and so a case that deferred (quiet hours, a pending
+    # response) cannot sit at `awaiting_customer` for ever.
+    if result.get("status") == "woken":
+        rec = store.get_payment(payment_id) or {}
+        why = (result.get("reason")
+               or (rec.get("waiting_for") or {}).get("reason")
+               or "the wait you asked for")
+        store.update_payment(payment_id, waiting_for=None)
+        store.flush()
+        _handoff_to_agent(
+            payment_id,
+            f"THE WAIT YOU ASKED FOR IS OVER. You said you were waiting for: "
+            f"{why}. Check where the case stands now, then either take the next "
+            f"rung or wait again with a fresh reason — do not repeat anything "
+            f"already tried.",
+            scenario=f"wait_elapsed:{job_id}",
+        )
+
     if result.get("status") in ("retry_created", "link_created"):
         window = int(os.getenv("RETRY_WATCH_MINUTES", "30")) * 60
         socketio.start_background_task(_watch_for_recovery, payment_id, window)
+
+    # The agent asked to be woken and the wait has elapsed. Hand it back with
+    # what it said it was waiting for, so it resumes its own plan instead of
+    # re-deriving one — and so a case that deferred (quiet hours, a pending
+    # response) cannot sit at `awaiting_customer` for ever.
+    if result.get("status") == "woken":
+        rec = store.get_payment(payment_id) or {}
+        why = (result.get("reason")
+               or (rec.get("waiting_for") or {}).get("reason")
+               or "the wait you asked for")
+        store.update_payment(payment_id, waiting_for=None)
+        store.flush()
+        _handoff_to_agent(
+            payment_id,
+            f"THE WAIT YOU ASKED FOR IS OVER. You said you were waiting for: "
+            f"{why}. Check where the case stands now, then either take the next "
+            f"rung or wait again with a fresh reason — do not repeat anything "
+            f"already tried.",
+            scenario=f"wait_elapsed:{job_id}",
+        )
 
     return jsonify({"status": "received", "payment_id": payment_id})
 
@@ -2919,8 +3281,13 @@ def api_payments():
         return p.get("status") == "recovered" or float(p.get("recovered_amount") or 0) > 0
 
     total_at_risk = sum(float(p.get("amount") or 0) for p in p_list if not _settled(p))
-    total_recovered = sum(float(p.get("recovered_amount") or p.get("amount") or 0)
+    # No fallback to the owed amount. A settled case without a recovered figure
+    # is a data defect, and crediting it at face value hides both the defect and
+    # any discount that was given away. Count it as zero and report it.
+    total_recovered = sum(float(p.get("recovered_amount") or 0)
                           for p in p_list if _settled(p))
+    unattributed = [p.get("payment_id") for p in p_list
+                    if _settled(p) and not p.get("recovered_amount")]
     rec_count = sum(1 for p in p_list if _settled(p))
     rate = (rec_count / len(p_list) * 100) if p_list else 0.0
     total_penalties = sum(p.get("penalties_prevented", 0) for p in p_list)
@@ -2928,6 +3295,7 @@ def api_payments():
         "payments": p_list,
         "total_at_risk": total_at_risk,
         "total_recovered": total_recovered,
+        "unattributed_settled": unattributed,
         "recovery_rate": round(rate, 1),
         "total_penalties_prevented": total_penalties,
         "penalties_saved_usd": round(total_penalties * NETWORK_FINE_PER_ATTEMPT, 2),

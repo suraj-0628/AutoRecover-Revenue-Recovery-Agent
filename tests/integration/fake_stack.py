@@ -44,6 +44,10 @@ os.environ.setdefault("ESCALATION_QUEUE_PATH",
 # Belt and braces: even if a patch were missed, real Razorpay writes stay
 # refused because the service flag is absent.
 os.environ.pop("RAZORPAY_WRITES_OK", None)
+# The case matrix runs at whatever hour the driver is started; a journey that
+# passes at noon must not fail at 22:00 because the policy gate deferred every
+# contact into the morning. Quiet hours stay ON in the live stack.
+os.environ.setdefault("GUARDRAIL_QUIET_DISABLED", "1")
 
 sys.path.insert(0, str(ROOT / "src"))
 

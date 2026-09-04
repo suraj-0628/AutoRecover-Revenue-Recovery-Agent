@@ -101,6 +101,24 @@ def enqueue(
                 return existing
         with _QUEUE_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(ticket) + "\n")
+
+    # Compliant escalation has to be demonstrable, not asserted: the log records
+    # who was handed to a human, on what grounds, and after which rungs — so a
+    # batch report can show its escalations came at the end of the ladder rather
+    # than instead of it.
+    try:
+        from recovery_agent import audit
+        from recovery_agent.state_store import StateStore
+        rec = StateStore().get_payment(payment_id) or {}
+        audit.record(audit.ESCALATION_RAISED, payment_id=payment_id,
+                     batch_run_id=rec.get("batch_run_id") or "",
+                     actor=source, reason=reason, amount_rupees=amount,
+                     ticket_id=ticket["ticket_id"],
+                     climbed=sorted(rec.get("ladder") or {}),
+                     customer_signals=customer_signals or [])
+    except Exception:
+        pass                        # a queue write must not fail on logging
+
     return ticket
 
 

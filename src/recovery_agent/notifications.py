@@ -163,6 +163,8 @@ class NotificationDispatcher:
         failure_reason: str = "",
         amount: float = 0.0,
         attempt_count: int = 0,
+        subject: str = "",
+        body: str = "",
     ) -> dict[str, Any]:
         """Route to appropriate channel based on action type.
 
@@ -170,8 +172,20 @@ class NotificationDispatcher:
         """
         results: list[dict[str, Any]] = []
 
-        # Generate message content based on action
-        if action == "update_payment_method":
+        # The agent's own subject and body, when it wrote them.
+        #
+        # Everything below is the fallback for callers that pass neither. It
+        # used to be the ONLY path: the agent's carefully written message was
+        # injected as `Reason: <prose>` inside a fixed template, under a
+        # subject line identical for every failure in the system. A bank
+        # decline and an abandoned cart both got "Payment Recovery: Complete
+        # Your Pending Payment" — the least openable line available.
+        if body:
+            subject = subject or "Complete your payment"
+            body = str(body)
+            if recovery_link and recovery_link not in body:
+                body += f"\n\nComplete payment: {recovery_link}\n"
+        elif action == "update_payment_method":
             subject = "Action Required: Update Your Payment Method"
             body = (
                 f"Hi,\n\n"
@@ -215,8 +229,23 @@ class NotificationDispatcher:
             )
             results.append(email_result)
 
+        # SMS buzzes a phone; email waits to be opened. So overnight the email
+        # still goes and only the SMS leg is held back — a blanket refusal
+        # would have stopped a message that wakes nobody.
+        sms_ok = True
+        try:
+            from recovery_agent.agent.guardrails import sms_allowed_now
+            sms_ok = sms_allowed_now()
+        except Exception:
+            pass
+        if customer_phone and not sms_ok:
+            results.append({
+                "channel": "sms", "to": customer_phone, "payment_id": payment_id,
+                "delivered": False, "suppressed": "quiet_hours",
+            })
+
         # Send via SMS if phone available
-        if customer_phone:
+        if customer_phone and sms_ok:
             sms_body = f"Razorpay: Your payment of INR {amount:,.2f} is pending."
             if recovery_link:
                 sms_body += f" Pay now: {recovery_link}"
@@ -247,9 +276,11 @@ class NotificationDispatcher:
         # 49 of 87 "dispatched" emails were .eml files only.
         delivered = [r["channel"] for r in results if r.get("delivered")]
         undelivered = {
-            r["channel"]: (r.get("smtp_error") or
-                           ("smtp not configured" if r["channel"] == "email"
-                            else "no sms provider integrated; payload recorded only"))
+            r["channel"]: (r.get("smtp_error")
+                           or ("held until quiet hours end"
+                               if r.get("suppressed") == "quiet_hours" else None)
+                           or ("smtp not configured" if r["channel"] == "email"
+                               else "no sms provider integrated; payload recorded only"))
             for r in results if not r.get("delivered")
         }
         return {

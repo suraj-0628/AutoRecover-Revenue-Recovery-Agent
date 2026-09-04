@@ -70,3 +70,8 @@ data/ledger.db
 data/ledger.db-wal
 data/ledger.db-shm
 data-test/
+
+# Eval harness: generated scorecards are runtime output; the corpus and
+# baseline are deliberately committed (CI scores them on a fresh checkout).
+evals/results/
+data/phoenix/

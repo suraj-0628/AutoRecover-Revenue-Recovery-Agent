@@ -39,7 +39,12 @@ def test_no_smtp_means_not_delivered_even_though_the_eml_exists(tmp_path):
         "the inspectable artifact is still written"
 
 
-def test_sms_is_never_reported_as_delivered(tmp_path):
+def test_sms_is_never_reported_as_delivered(tmp_path, monkeypatch):
+    # Pin daytime: overnight the SMS leg is suppressed for quiet hours, which
+    # is a different (also honest) shape — see
+    # test_quiet_hours_gate_what_interrupts.py.
+    from recovery_agent.agent import guardrails as G
+    monkeypatch.setattr(G, "in_quiet_hours", lambda now=None: False)
     r = _dispatcher(tmp_path).dispatch(
         payment_id="pay_x", customer_phone="+919999999999", amount=100.0)
     assert r["status"] == "not_delivered"
@@ -118,7 +123,11 @@ def _send(payment_id):
         "payment_id": payment_id,
         "customer_email": "c@example.com",
         "customer_phone": "+919999999999",
-        "message": "5% off if you finish your order",
+        # Deliberately claim-free: this file tests DELIVERY honesty. Whether
+        # the words are grounded is test_message_is_grounded.py's job, and a
+        # 5% claim here would (correctly) be refused for lack of an authorised
+        # discount on the fixture.
+        "message": "Your order is still waiting. Use the link to finish it.",
         "payment_link": "https://rzp.io/offer",
         "amount": 2374.05,
     }))
