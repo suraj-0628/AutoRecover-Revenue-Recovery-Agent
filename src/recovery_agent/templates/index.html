@@ -29,6 +29,18 @@
       --accent-amber: #ffa657;
       --accent-red: #ff7b72;
 
+      /* Razorpay Agent Studio's own primary, read off the live page. Kept
+         SEPARATE from --accent-blue: #58a6ff is tuned for legibility as text
+         on dark, while #305EFF is a brand colour meant for fills and
+         emphasis. Using the brand blue on the things that carry identity —
+         the mark, the active tab, the headline metric — reads as Razorpay
+         without repainting a HUD that is deliberately terminal-monospace.
+         Their deep surface (#00141D) is kept for accents rather than the
+         page, which would fight the GitHub-derived borders. */
+      --rzp-blue: #305EFF;
+      --rzp-blue-deep: #2950DA;
+      --rzp-surface: #00141D;
+
       --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
     }
 
@@ -799,9 +811,9 @@
     }
     .toggle-btn:hover { color: var(--text-bright); }
     .toggle-btn.active {
-      background: #21262d;
-      color: var(--accent-blue);
-      border: 1px solid #30363d;
+      background: rgba(48,94,255,.16);
+      color: #9db4ff;
+      border: 1px solid rgba(48,94,255,.45);
     }
 
     /* Live Recovery Step Progress Bar */
@@ -858,8 +870,8 @@
     }
     .rail-mark {
       width: 30px; height: 30px; border-radius: 8px; margin-bottom: 10px;
-      background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-      color: #0d1117; font-weight: 700; font-size: 13px;
+      background: linear-gradient(135deg, var(--rzp-blue), var(--rzp-blue-deep));
+      color: #fff; font-weight: 700; font-size: 13px;
       display: flex; align-items: center; justify-content: center;
     }
     .rail-btn {
@@ -871,7 +883,8 @@
     }
     .rail-btn .ico { font-size: 15px }
     .rail-btn:hover { background: rgba(88,166,255,.08); color: var(--text-main) }
-    .rail-btn.active { background: rgba(88,166,255,.14); color: var(--accent-blue) }
+    .rail-btn.active { background: rgba(48,94,255,.16); color: #9db4ff;
+                       box-shadow: inset 2px 0 0 var(--rzp-blue) }
     .rail-count {
       min-width: 16px; padding: 0 4px; border-radius: 7px; font-size: 8.5px;
       background: var(--accent-amber); color: #0d1117; font-weight: 700;
@@ -1076,7 +1089,7 @@
     .ops-meta b { color: var(--text-main); font-weight: 600 }
     .ops-meta .sep { color: var(--border-color) }
     .ops-help { border: 0; background: transparent; cursor: pointer;
-                color: var(--accent-blue); font-family: var(--font-mono);
+                color: #9db4ff; font-family: var(--font-mono);
                 font-size: 10.5px; padding: 0; text-decoration: underline;
                 text-underline-offset: 2px }
     .ops-help-body { display: none; margin: -6px 0 14px; padding: 10px 14px;
@@ -1086,14 +1099,22 @@
     .ops-help-body.on { display: block }
     .ops-help-body b { color: var(--text-main) }
 
-    /* KPI strip: one number leads, the rest support it. */
+    /* KPI strip: one number leads, the rest support it.
+       Razorpay sets headlines at roughly -1.9px tracking and uppercase
+       micro-labels at +3px — tight figures against wide small caps. That
+       rhythm is the most portable part of their system, and it costs
+       nothing but two letter-spacing values. */
     #view-ops .batch-stats { gap: 0; padding: 0 }
     #view-ops .bstat { flex: 1; padding: 14px 18px;
                        border-right: 1px solid var(--border-color) }
     #view-ops .bstat:last-child { border-right: 0 }
-    #view-ops .bstat.lead .v { font-size: 24px; letter-spacing: -0.5px }
+    #view-ops .bstat .k { letter-spacing: .14em }
+    #view-ops .bstat.lead { border-left: 2px solid var(--rzp-blue) }
+    #view-ops .bstat.lead .v { font-size: 26px; letter-spacing: -1px;
+                               color: var(--rzp-blue) }
     #view-ops .bstat .sub { font-size: 9px; color: var(--text-muted);
                             margin-top: 2px }
+    #view-ops .ops-table th { letter-spacing: .12em }
 
     /* Spend: a stacked bar makes "95% of this is discounts" visible at a
        glance, which a table row never did. */
@@ -2750,7 +2771,7 @@ function budgetMeter(email, links) {
   if (links) {
     var lUsed = links.limit ? Math.min(100, (links.minted / links.limit) * 100) : 0;
     var lCol = links.exhausted ? "var(--accent-red)"
-             : (links.remaining <= 5 ? "var(--accent-amber)" : "var(--accent-blue)");
+             : (links.remaining <= 5 ? "var(--accent-amber)" : "var(--rzp-blue)");
     out +=
       '<div class="ops-budget">' +
         '<div class="ops-budget-top">' +
@@ -2873,7 +2894,7 @@ function renderOps(d) {
   var parts = [
     {lab: "Discounts accepted", amt: t.discount_given || 0,
      col: "var(--accent-amber)", qty: "margin given away to close"},
-    {lab: "LLM tokens", amt: t.llm_cost || 0, col: "var(--accent-blue)",
+    {lab: "LLM tokens", amt: t.llm_cost || 0, col: "var(--rzp-blue)",
      qty: ((t.tokens || 0) / 1000).toFixed(0) + "k tokens &middot; " +
           (t.llm_calls || 0) + " calls"},
     {lab: "Voice calls", amt: t.voice_cost || 0, col: "var(--accent-purple)",
