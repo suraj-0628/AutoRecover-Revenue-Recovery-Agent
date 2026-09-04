@@ -852,9 +852,24 @@
     #view-evals .ev-k { letter-spacing: .14em }
     #view-evals .ev-v { white-space: nowrap }
 
-    /* Section headings, sized against the ops cards rather than the page. */
-    #view-evals .ev-block h3 { letter-spacing: -0.1px }
-    #view-evals .ev-block-sub, #view-evals .ev-foot { max-width: 86ch }
+    /* One type scale across every view. Batch, ops and guardrail already
+       agreed on 12 / 10.5 / 9.5 / 9 with a 26px lead figure; evals had been
+       set 1-2.5px larger at every level, which reads as a different app
+       rather than a different screen. Only the sizes move — the hierarchy
+       the view was designed with is preserved, one step down. */
+    #view-evals .ev-block h3 { font-size: 12px; letter-spacing: -0.1px }
+    #view-evals .ev-block-sub, #view-evals .ev-foot,
+    #view-evals .ev-card-note { font-size: 9.5px; max-width: 86ch }
+    #view-evals .ev-card-label { font-size: 9.5px }
+    #view-evals .ev-card-sub { font-size: 9px }
+    #view-evals .ev-strip-bits { font-size: 10.5px }
+    #view-evals .ev-verdict { font-size: 14px }
+    #view-evals .ev-table { font-size: 10.5px }
+    #view-evals .ev-table th { font-size: 9px }
+    #view-evals .ev-row-name, #view-evals .ev-row-val { font-size: 10.5px }
+    #view-evals .ev-row-side, #view-evals .ev-chip { font-size: 9.5px }
+    #view-evals .ev-k { font-size: 9.5px }
+    #view-evals .ev-v { font-size: 18px }
 
     .ev-health {
       display: grid; gap: 10px; margin-bottom: 12px;
@@ -933,6 +948,9 @@
       justify-content: space-between;
       align-items: center;
     }
+    /* Pinned to the shared scale; the monologue above it stays as it is,
+       because a log is read line by line and 0.48px is not worth the loss. */
+    .railnav ~ .workspace .panel-title, .panel-header .panel-title { font-size: 12px }
     .step-pill {
       font-size: 0.68rem;
       font-weight: 600;
