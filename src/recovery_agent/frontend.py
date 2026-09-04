@@ -95,10 +95,28 @@ def _watch_for_recovery(payment_id: str, max_wait_seconds: int = 300):
                 if p.get("status") == "recovered":
                     return
 
-            # Strategy 1: Fetch payment link by link_id stored in order_id
+            # Strategy 1: fetch EVERY link this case has minted.
+            #
+            # This used to read a single id out of `order_id`, which holds only
+            # the most recently minted link. A case that climbs the ladder mints
+            # more than one -- the offer rung mints a discounted link, then a
+            # rail switch mints another -- and the second overwrote the first.
+            #
+            # Live (pay_p9oxiasll): the customer paid the link that was EMAILED
+            # to them, plink_TXwDValFzzEGgV, INR 1,709.05 captured. By then a
+            # rail-switch link had replaced it in `order_id`, so the watcher
+            # polled a link nobody would ever pay, saw nothing for the whole
+            # window, and the case was escalated to a human at zero recovered
+            # while the money was already in the account. A customer who has
+            # paid must never be asked to pay again.
             p = store.get_payment(payment_id) if store.has_payment(payment_id) else {}
-            link_id = p.get("order_id", "")
-            if link_id and link_id.startswith("plink_"):
+            link_ids, seen = [], set()
+            for cand in ([l.get("link_id") for l in (p.get("recovery_links") or [])]
+                         + [p.get("order_id", ""), p.get("recovery_link_id", "")]):
+                if cand and cand.startswith("plink_") and cand not in seen:
+                    seen.add(cand)
+                    link_ids.append(cand)
+            for link_id in link_ids:
                 try:
                     link_data = client.client.payment_link.fetch(link_id)
                     link_status = link_data.get("status", "")
@@ -120,8 +138,8 @@ def _watch_for_recovery(payment_id: str, max_wait_seconds: int = 300):
                                     f"link {link_id} paid (poll)",
                                 )
                                 return
-                except Exception as e:
-                    pass  # Payment link fetch failed, try next strategy
+                except Exception:
+                    continue  # this link is unreadable; try the next one
 
             # A FAILED attempt is a signal, and a strong one.
             #
@@ -620,7 +638,15 @@ _push_bus.register_delivery(deliver_page_push)
 
 @app.route("/api/batches", methods=["GET"])
 def api_batches():
-    """Revenue still at risk, sorted into batches that share a fix."""
+    """Revenue still at risk, sorted into batches that share a fix.
+
+    Every bin the classifier produces is shown, the un-runnable ones included.
+    `unclassified` and `risk` are load-bearing classifications — one keeps a
+    mystery failure out of the discount path, the other keeps fraud unchased —
+    and a control that matters is a control the operator should be able to SEE
+    working. Hiding them would also make the at-risk headline quietly smaller
+    than the store it claims to describe.
+    """
     from recovery_agent.agent.classify import summarise
     batches = summarise(list(store.payment_values()))
     return jsonify({
@@ -629,6 +655,111 @@ def api_batches():
         "total_cases": sum(b["count"] for b in batches),
         "running": sorted(active_agent_payments),
     })
+
+
+@app.route("/api/drop-reasons", methods=["GET"])
+def api_drop_reasons():
+    """What the checkout offers when it asks the customer why they stopped."""
+    from recovery_agent import drop_reasons
+    return jsonify({"choices": drop_reasons.choices()})
+
+
+@app.route("/api/drop-reason/skip", methods=["POST"])
+def api_drop_reason_skip():
+    """The customer declined to say, or said nothing at all.
+
+    A question the agent waits on has to have a way of ending, or a closed tab
+    strands the case forever. Silence is not an answer, so nothing is recorded
+    as one: the agent simply starts on the path it would have taken from the
+    failure code alone.
+    """
+    data = request.get_json(silent=True) or {}
+    payment_id = str(data.get("payment_id") or "")
+    rec = store.get_payment(payment_id) if payment_id else None
+    if rec is None:
+        return jsonify({"error": "unknown case"}), 404
+    if not rec.get("drop_reason_pending"):
+        return jsonify({"status": "not_waiting", "payment_id": payment_id})
+
+    store.update_payment(payment_id, drop_reason_pending=False)
+    _do_flush()
+    socketio.start_background_task(
+        run_agent_for_payment, payment_id, float(rec.get("amount") or 0),
+        rec.get("failure_reason") or "Payment failed",
+        rec.get("customer") or {}, "standard",
+        rec.get("failure_code") or "", rec.get("error_source") or "",
+        rec.get("error_step") or "")
+    return jsonify({"status": "released", "payment_id": payment_id})
+
+
+@app.route("/api/drop-reason", methods=["POST"])
+def api_drop_reason():
+    """The customer's own answer for why they abandoned.
+
+    Two customers who abandon after a bank decline look identical here: one had
+    no balance (a discount is useless — they need time) and one found it
+    cheaper elsewhere (a discount is exactly the lever). No error code
+    separates them, so guessing loses money in both directions. This is the
+    answer, in their words, and it outranks every inference.
+    """
+    from recovery_agent import drop_reasons
+
+    data = request.get_json(silent=True) or {}
+    payment_id = str(data.get("payment_id") or "")
+    code = str(data.get("code") or "")
+    text = str(data.get("text") or "").strip()[:400]
+
+    spec = drop_reasons.get(code)
+    if not payment_id or spec is None:
+        return jsonify({"error": "payment_id and a known reason code required"}), 400
+    if not store.has_payment(payment_id):
+        return jsonify({"error": "unknown case"}), 404
+
+    reason = {"code": code, "label": spec["label"], "text": text,
+              "at": datetime.now(timezone.utc).isoformat()}
+    store.update_payment(payment_id, drop_reason=reason,
+                         drop_reason_pending=False)
+
+    entry = {
+        "step": "customer_said_why",
+        "msg": f"Customer told us why: {spec['label']}",
+        "detail": text or spec["means"],
+        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+    }
+    rec = store.get_payment(payment_id) or {}
+    rec.setdefault("trail", []).append(entry)
+    push_event(payment_id, "customer_said_why", entry)
+
+    # An answer we did not anticipate is read by a person, not keyword-matched
+    # into the nearest bucket. Flagging it is the honest response to "other".
+    flagged = False
+    if spec.get("free_text") and text:
+        try:
+            from recovery_agent.escalation_queue import enqueue
+            customer = rec.get("customer") or {}
+            enqueue(
+                payment_id=payment_id,
+                reason=f"Customer gave their own reason for abandoning: {text}",
+                amount=float(rec.get("amount") or 0),
+                customer={"email": customer.get("email") or rec.get("customer_email", ""),
+                          "name": customer.get("name", ""),
+                          "contact": customer.get("contact") or rec.get("customer_phone", "")},
+                customer_signals=[f"stated reason (free text): {text}"],
+                failure_code=str(rec.get("failure_code") or ""),
+                source="customer_stated_reason",
+            )
+            flagged = True
+        except Exception as exc:
+            print(f"[frontend] could not flag stated reason: {exc}", flush=True)
+    store.flush()
+
+    # Their answer decides the next move, so hand it to the agent now rather
+    # than letting it act on whatever it had already inferred.
+    _handoff_to_agent(payment_id, drop_reasons.briefing_line(reason),
+                      scenario=f"stated_reason:{code}")
+
+    return jsonify({"status": "recorded", "code": code,
+                    "flagged_for_review": flagged})
 
 
 @app.route("/api/guardrails", methods=["GET", "POST"])
@@ -661,6 +792,95 @@ def api_guardrails():
     return jsonify({"values": values, "rejected": rejected})
 
 
+@app.route("/api/evals", methods=["GET"])
+def api_evals():
+    """Everything the EVALS view shows.
+
+    Deliberately tolerant of a missing or stale scorecard: a fresh checkout has
+    never run the evals, and a demo must not 500 because of that. Absent data
+    is reported as absent (`ok: false` plus a reason the UI can render), never
+    as zeros -- a zero would read as "nothing held" on the red-team bar, which
+    is the exact opposite of "we have not measured yet".
+    """
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[2]
+    card_path = root / "evals" / "results" / "scorecard.json"
+    if not card_path.exists():
+        return jsonify({"ok": False,
+                        "reason": "The evals have never been run here. "
+                                  "Run `make evals` to produce a scorecard."})
+    try:
+        card = json.loads(card_path.read_text())
+    except Exception as exc:
+        return jsonify({"ok": False, "reason": f"Scorecard unreadable: {exc}"})
+
+    from recovery_agent.evals import quality
+    modes_in = card.get("modes") or {}
+    modes, gated = {}, 0
+    for name, d in modes_in.items():
+        if not isinstance(d, dict):
+            continue
+        g = quality.gateability(name, d)
+        gated += 1 if g.get("gateable") else 0
+        modes[name] = {
+            "gateable": bool(g.get("gateable")),
+            "reasons": list(g.get("reasons") or []),
+            "ran_at": d.get("ran_at"),
+            "age_hours": quality.age_hours(d),
+            "rate": d.get("conformance_rate"),
+            "rate_with_ci": d.get("rate_with_ci"),
+            "decisions": d.get("decisions"),
+            "agreement_rate": d.get("agreement_rate"),
+            "held_rate": d.get("held_rate"),
+            "baits": d.get("baits"), "held": d.get("held"),
+            "caught_by_gate": d.get("caught_by_gate"),
+            "leaked": d.get("leaked"),
+            "rows": d.get("rows") or [],
+            "violations_by_rule": d.get("violations_by_rule") or {},
+            "examples": d.get("examples") or [],
+        }
+
+    out = {"ok": True, "modes": modes,
+           "verdict": {"verified": gated > 0, "gated": gated,
+                       "of": len(modes)}}
+
+    # Corpus health -- the "is the alarm still plugged in" block. Turns and
+    # cases are reported separately on purpose: 76 turns are not 76
+    # independent samples, and collapsing them is how an underpowered corpus
+    # passes for a strong one.
+    try:
+        corpus = root / "evals" / "corpus" / "decisions.jsonl"
+        rows = [json.loads(l) for l in corpus.read_text().splitlines() if l.strip()]
+        unit, cov = quality.unit_of_analysis(rows), quality.coverage(rows)
+        out["corpus"] = {**unit, **cov, "min_cases_to_gate": quality.MIN_CASES_TO_GATE}
+    except Exception as exc:
+        out["corpus"] = {"error": str(exc)}
+
+    # The counterfactual is the money exhibit. It is pure replay over the
+    # corpus -- no LLM, no network -- so it is safe to compute per request.
+    try:
+        from recovery_agent.evals import counterfactual
+        out["counterfactual"] = counterfactual.compare()
+    except Exception as exc:
+        out["counterfactual"] = {"error": str(exc)}
+
+    try:
+        base = root / "evals" / "baseline.json"
+        out["baseline"] = {"exists": base.exists()}
+        if base.exists():
+            b = json.loads(base.read_text()).get("modes", {}).get("recorded", {})
+            out["baseline"].update({
+                "conformance_rate": b.get("conformance_rate"),
+                "decisions": b.get("decisions"),
+                "cases": (b.get("unit") or {}).get("cases"),
+                "ran_at": b.get("ran_at"),
+            })
+    except Exception:
+        out["baseline"] = {"exists": False}
+
+    return jsonify(out)
+
+
 @app.route("/api/economics", methods=["GET"])
 def api_economics():
     """Everything the ops view shows: what recovery costs, what policy refused,
@@ -678,6 +898,11 @@ def api_economics():
         scope = "live"
     records = list(store.payment_values())
     out = {"economics": economics.summarise(records, scope=scope)}
+    # The LLM gate's ledger: how many calls this process has made and how long
+    # they queued behind the quota — the free tier's cost in seconds, shown
+    # rather than suffered silently.
+    from recovery_agent.ratelimit import llm_gate
+    out["llm_gate"] = llm_gate().stats()
     counts = {"live": 0, "seeded": 0}
     for r in records:
         counts[economics.case_origin(r)] += 1
@@ -741,10 +966,23 @@ def api_economics():
     # every record regardless of the scope being viewed — a link spent by a
     # seeded case is just as gone.
     try:
-        minted = sum(len(r.get("recovery_links") or []) for r in records)
+        # Counted from the case records PLUS a baseline, because the records
+        # are resettable and the quota is not. Clearing data/ for a clean demo
+        # took the count back to zero while the account had already spent ~21
+        # of its 30 lifetime links — a gauge reading "30 left" when nine
+        # remain is worse than no gauge at all.
+        #
+        # Razorpay cannot supply the true figure: payment_link.all() returns
+        # an empty list on this account even for links that payment_link.fetch()
+        # confirms exist. So the baseline is operator-set and deliberately
+        # labelled as a floor rather than a fact.
+        from_records = sum(len(r.get("recovery_links") or []) for r in records)
+        baseline = int(os.getenv("RAZORPAY_LINKS_ALREADY_SPENT", "0"))
+        minted = from_records + baseline
         limit = int(os.getenv("RAZORPAY_LINK_LIFETIME_LIMIT", "30"))
         out["budgets"]["links"] = {
             "minted": minted, "limit": limit,
+            "from_records": from_records, "baseline": baseline,
             "remaining": max(0, limit - minted),
             "exhausted": minted >= limit,
         }
@@ -920,6 +1158,209 @@ def api_batch_run(run_id: str):
     if request.args.get("events"):
         report["trail"] = audit.log().for_run(run_id)
     return jsonify(report)
+
+
+def _queued_session_runner(referral):
+    """One full agent session for a case the batch could not decide."""
+    rec = store.get_payment(referral.payment_id) or {}
+    customer = {k: v for k, v in (rec.get("customer") or {}).items() if v}
+    run_agent_for_payment(
+        referral.payment_id, float(rec.get("amount") or 0),
+        f"BATCH EXCEPTION: {referral.why}. The batch machinery judged this "
+        f"case to need a person's kind of attention rather than a shared "
+        f"plan — its history is in the briefing.",
+        customer, "batch_exception", rec.get("failure_code", "") or "")
+
+
+@app.route("/api/batches/waves", methods=["POST"])
+def api_start_waves():
+    """Start a wave cycle: bin, decide once per bin, apply, watch, re-bin,
+    repeat — until everyone paid, a wave changes nothing, or a human stops it.
+
+    `champion: true` puts the live agent in the loop: one representative case
+    per bin is worked as a full session and its decisions become the bin's
+    plan. Without it the policy defaults carry every bin — the mode for a room
+    where the LLM proxy cannot be trusted to show up.
+    """
+    payload, status = _launch_wave_cycle(request.get_json(silent=True) or {})
+    return jsonify(payload), status
+
+
+def _launch_wave_cycle(data: dict) -> tuple[dict, int]:
+    """One door for starting a cycle, shared by the route and the autopilot."""
+    from recovery_agent.batch import waves
+    from recovery_agent.batch.plan import BatchBudget
+
+    ids = [str(x) for x in (data.get("payment_ids") or []) if x]
+    if not ids:
+        from recovery_agent.agent.classify import BATCH_BY_KEY, classify
+        wanted = str(data.get("batch_key") or "")
+        ids = [r["payment_id"] for r in store.payment_values()
+               if r.get("payment_id")
+               and (classify(r) == wanted if wanted
+                    else (BATCH_BY_KEY.get(classify(r) or "") or {}).get("runnable"))]
+    if not ids:
+        return {"error": "no open cases to work"}, 422
+
+    for existing in waves.all_cycles():
+        if existing.status == waves.RUNNING:
+            return {"error": "a wave cycle is already running",
+                    "cycle_id": existing.cycle_id}, 409
+
+    config = waves.WaveConfig(
+        max_waves=max(1, min(int(data.get("max_waves") or 3), 6)),
+        settle_seconds=max(5.0, min(float(data.get("settle_seconds") or 60), 900)),
+        champion_mode="live" if data.get("champion") else "off",
+        budget=BatchBudget.from_request(data.get("budget")))
+
+    def _champion_runner(record, context):
+        """One real agent session, run to completion, for the bin's champion."""
+        customer = {k: v for k, v in (record.get("customer") or {}).items() if v}
+        run_agent_for_payment(
+            record["payment_id"], float(record.get("amount") or 0),
+            context, customer, "batch_champion",
+            record.get("failure_code", "") or "")
+
+    def _watch(decision):
+        # Same wiring as a plain batch run: every link the cycle creates gets
+        # a watcher, or the money that comes back is never noticed.
+        link_id = decision.detail.get("link_id")
+        if decision.outcome != "acted" or not link_id:
+            return
+        try:
+            store.update_payment(decision.payment_id, order_id=link_id,
+                                 recovery_link=decision.detail.get("link_url", ""))
+            store.flush()
+            socketio.start_background_task(_watch_for_recovery,
+                                           decision.payment_id, 900)
+        except Exception:
+            pass
+
+    cycle = waves.register(waves.WaveCycle(
+        payment_ids=ids, config=config,
+        champion_runner=_champion_runner if config.champion_mode == "live" else None,
+        on_decision=_watch,
+        started_by=str(data.get("started_by") or "dashboard")))
+
+    def _work():
+        try:
+            report = cycle.execute()
+        except Exception as exc:                       # pragma: no cover
+            cycle.stop_reason = f"{type(exc).__name__}: {exc}"
+            cycle.status = waves.ABORTED
+            report = cycle.report()
+        if data.get("dispatch_exceptions"):
+            # "To the agent" becomes literal: each leftover gets a full
+            # session, one at a time, off the queue — paced by the same LLM
+            # gate as everything else. Off by default because each session
+            # costs ~5 model calls, and a room without the proxy should get
+            # a report, not a hang.
+            from recovery_agent.batch import agent_queue
+            q = agent_queue.get(_queued_session_runner)
+            for entry in report.get("exceptions", []):
+                q.submit(agent_queue.Referral(
+                    entry["payment_id"], entry.get("why", ""),
+                    batch_run_id=entry.get("batch_run_id", ""),
+                    cycle_id=cycle.cycle_id))
+            report["dispatched_to_agent"] = q.depth() + q.stats()["worked"]
+        push_event("batch", "wave_cycle_finished", report)
+
+    socketio.start_background_task(_work)
+    push_event("batch", "wave_cycle_started",
+               {"cycle_id": cycle.cycle_id, "cases": len(ids),
+                "config": config.as_dict()})
+    return {"cycle_id": cycle.cycle_id, "cases": len(ids),
+            "config": config.as_dict()}, 202
+
+
+def _wave_autopilot_blocked(now=None) -> str:
+    """'' when a scheduled pass may start; otherwise the reason it must not.
+
+    Split from the loop so the decision is testable without a running server:
+    the loop is a sleep and a call, and everything worth arguing about is here.
+    """
+    from recovery_agent.batch import waves
+    if any(c.status == waves.RUNNING for c in waves.all_cycles()):
+        return "a cycle is already running"
+    try:
+        from recovery_agent.agent.guardrails import in_quiet_hours
+        # Deliberately stricter than the per-case policy. Quiet hours restrict
+        # only contact that interrupts, so a live agent may legitimately email
+        # a case overnight — it is responding to something. An unattended bulk
+        # pass is not responding to anything; nobody is watching it, and a
+        # merchant who finds two hundred 02:00 timestamps in their outbox was
+        # surprised by their own system. Bulk waits for morning.
+        if (os.getenv("GUARDRAIL_QUIET_DISABLED", "").strip().lower()
+                not in ("1", "true", "yes") and in_quiet_hours(now)):
+            return "quiet hours"
+    except Exception:
+        return "guardrails unavailable"      # fail closed: no unattended sends
+    return ""
+
+
+def _wave_autopilot(minutes: float) -> None:
+    """The unattended pass that gives 'deferred' its meaning.
+
+    A case deferred for quiet hours is a promise — "not now" — and a promise
+    needs someone to come back. This loop is that someone: on a timer, outside
+    quiet hours, when nothing else is running, it starts an ordinary wave
+    cycle over whatever is open. Every safeguard is downstream and unchanged —
+    the twelve prechecks skip what should not be touched, the ladder forbids
+    repeats, the budget bounds the spend — so the only thing scheduled here is
+    attention.
+
+    Off unless WAVE_AUTOPILOT_MINUTES is set: an unattended sender is a thing
+    a merchant turns on, never a thing that turns itself on.
+    """
+    while True:
+        socketio.sleep(max(60.0, minutes * 60))
+        why_not = _wave_autopilot_blocked()
+        if why_not:
+            continue
+        payload, status = _launch_wave_cycle({"started_by": "autopilot"})
+        if status == 202:
+            print(f"[Autopilot] wave cycle {payload['cycle_id']} over "
+                  f"{payload['cases']} open case(s)", flush=True)
+
+
+@app.route("/api/batch-cycles", methods=["GET"])
+def api_batch_cycles():
+    """Every cycle — live ones from the registry, finished ones rebuilt from
+    the audit log, so a restart loses the object but never the report."""
+    from recovery_agent.batch import waves
+    live = {c.cycle_id: c.report() for c in waves.all_cycles()}
+    cycles = []
+    for cid in waves.known_cycle_ids():
+        report = live.pop(cid, None) or waves.cycle_projection(cid)
+        if report:
+            cycles.append(report)
+    cycles.extend(live.values())          # registered but not yet in the log
+    return jsonify({"cycles": cycles})
+
+
+@app.route("/api/batch-cycles/<cycle_id>", methods=["GET"])
+def api_batch_cycle(cycle_id: str):
+    from recovery_agent.batch import agent_queue, waves
+    cycle = waves.get(cycle_id)
+    report = cycle.report() if cycle is not None \
+        else waves.cycle_projection(cycle_id)
+    if report is None:
+        return jsonify({"error": f"unknown cycle {cycle_id!r}"}), 404
+    q = agent_queue.get()
+    if q is not None:
+        report["agent_queue"] = q.stats()
+    return jsonify(report)
+
+
+@app.route("/api/batch-cycles/<cycle_id>/abort", methods=["POST"])
+def api_abort_batch_cycle(cycle_id: str):
+    from recovery_agent.batch import waves
+    cycle = waves.get(cycle_id)
+    if cycle is None or cycle.status != waves.RUNNING:
+        return jsonify({"error": f"no live cycle {cycle_id!r}"}), 404
+    data = request.get_json(silent=True) or {}
+    cycle.abort(str(data.get("reason") or "aborted from the dashboard"))
+    return jsonify({"cycle_id": cycle_id, "status": "aborting"})
 
 
 @app.route("/api/batch-runs/<run_id>/abort", methods=["POST"])
@@ -2409,13 +2850,34 @@ function startPayment() {
     theme: {color:"#2563eb"},
     modal: {ondismiss: function() {
       _rzpModalOpen = false;
-      /* WE closed it, because their payment had already failed. That is not a
-         customer changing their mind, and reporting it as one is how a bank
-         decline became a "drop-off": live on pay_qssihjc5z the stale
-         customer_cancelled outranked the real reason and authorised 5% off a
-         payment the customer had been TRYING to make. The failure was already
-         reported by the payment.failed handler below. */
-      if (_closedAfterFailure) { _closedAfterFailure = false; _flushHeldPush(); return; }
+      /* Closing AFTER a failure is its own thing — neither a fresh drop-off
+         nor nothing at all.
+
+         It is not a drop-off: reporting it as one let a synthetic
+         customer_cancelled outrank a real bank decline and authorise 5% off a
+         payment the customer had been TRYING to make (pay_qssihjc5z). The
+         server keeps the gateway's diagnosis for exactly that reason.
+
+         But it is not nothing either: they were declined, Razorpay showed
+         them its other rails, and they closed anyway. That is reluctance
+         demonstrated, and the server records it as `abandoned_after_failure`
+         — which is what moves the offer ahead of another rail switch. So the
+         signal is still sent; the server decides what it means. */
+      if (_closedAfterFailure) {
+        _closedAfterFailure = false;
+        showStatus("failed", "Payment didn't go through. Our agent is on it.");
+        btn.disabled = false; btn.innerHTML = "Retry Payment";
+        triggerRecovery({code:"customer_cancelled",
+                         reason:"Closed the checkout after a failed attempt",
+                         source:"customer", step:"payment_processing"}, true);
+        /* Ask WHY before pushing anything at them. "No balance" and "cheaper
+           elsewhere" produce the identical bank decline and need opposite
+           responses — one needs time and no discount, the other a discount and
+           no waiting. Nothing in an error code separates them, so we ask, and
+           the held notification waits until they answer or skip. */
+        askWhyTheyStopped();
+        return;
+      }
       showStatus("failed", "Payment cancelled. Our agent will help you recover it.");
       btn.disabled = false; btn.innerHTML = "Retry Payment";
       triggerRecovery({code:"customer_cancelled", reason:"Payment cancelled by customer", source:"customer", step:"payment_processing"});
@@ -2426,17 +2888,17 @@ function startPayment() {
       btn.disabled = false; btn.innerHTML = "Retry Payment";
       showDeclineWall(r.error.code || "failed", r.error.description);
       triggerRecovery({code:r.error.code || "technical_error", reason:r.error.description || r.error.reason || "Payment failed", source:r.error.source || "gateway", step:r.error.step || "payment_processing"});
-      /* Get them OUT of the Razorpay window. Its iframe owns the top of the
-         z-order, so every recovery surface we draw renders underneath it —
-         unclickable and invisible. The customer sits on a dead rail-selection
-         screen while the agent talks to a page they cannot reach, and their
-         only way out is to close the modal, which used to be recorded as a
-         drop-off. Closing it ourselves puts them back on the checkout where
-         the offer is visible, and keeps the diagnosis truthful. */
+      /* LET THEM TRY. Razorpay's own screen offers other rails after a
+         decline, and a customer reaching for UPI themselves is the cheapest
+         recovery there is — it costs us no link, no discount and no message.
+         Closing the window for them (which this did) interrupted exactly that.
+         Our notification stays HELD while the modal is open, because it would
+         render under the iframe anyway; the customer's own close is the signal
+         that they are done trying, and that is when it is delivered.
+         `_closedAfterFailure` still marks that close as ours-after-a-failure,
+         so it is recorded as giving up on a declined payment rather than as an
+         unprompted change of mind. */
       _closedAfterFailure = true;
-      try { rzp.close(); } catch (e) {}
-      _rzpModalOpen = false;
-      setTimeout(_flushHeldPush, 300);
     });
     _rzpModalOpen = true;
     rzp.open();
@@ -2457,10 +2919,13 @@ function switchRail(rail) {
   triggerRecovery({code:"method_switch", reason:"Customer switched to " + rail, source:"customer", step:"payment_processing"});
 }
 
-function triggerRecovery(err) {
+function triggerRecovery(err, deferAgent) {
   const total = getCartTotal();
   const cust = getCustomerData();
-  fetch("/api/payment-failed", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({payment_id:paymentId, amount:total, failure_code:err.code||"technical_error", failure_reason:err.reason||"Payment failed", error_source:err.source||"gateway", error_step:err.step||"payment_processing", customer:cust})});
+  /* deferAgent records the case but holds the agent until the customer has
+     answered "why did you stop?" — see api_payment_failed. Without it the
+     question and the agent race, and the agent wins by seconds. */
+  fetch("/api/payment-failed", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({payment_id:paymentId, amount:total, failure_code:err.code||"technical_error", failure_reason:err.reason||"Payment failed", error_source:err.source||"gateway", error_step:err.step||"payment_processing", customer:cust, defer_agent: !!deferAgent})});
   showStatus("recovering", "Payment failed — our agent is working on it...");
 }
 
@@ -2532,6 +2997,96 @@ socket.on("agent_push", function(d) {
   if (_rzpModalOpen) { _heldAgentPush = d; return; }
   renderAgentPush(d);
 });
+
+/* ── "Why did you stop?" ───────────────────────────────────────────────────
+   One question, on the page they are already looking at, before any recovery
+   surface. Their answer is testimony about their own intent and outranks
+   every inference we would otherwise draw from the failure code. Skipping is
+   always allowed: a customer who does not want to answer must not be trapped,
+   and silence simply leaves the agent on its inferred path. */
+function askWhyTheyStopped() {
+  if (document.getElementById("why-card")) return;
+  /* Defined out here, not inside the render, because the paths that never
+     show the card at all must release the agent too — a question we could
+     not ask must not hold a case shut. */
+  let _released = false;
+  function release() {
+    if (_released) return;
+    _released = true;
+    fetch("/api/drop-reason/skip", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({payment_id: paymentId})}).catch(function () {});
+  }
+  fetch("/api/drop-reasons").then(r => r.json()).then(function (d) {
+    const choices = (d && d.choices) || [];
+    if (!choices.length) { release(); _flushHeldPush(); return; }
+    const wrap = document.createElement("div");
+    wrap.id = "why-card";
+    wrap.style.cssText = "position:fixed;right:20px;bottom:20px;z-index:9999;" +
+      "max-width:380px;background:#fff;border:1px solid #e5e7eb;border-radius:14px;" +
+      "padding:18px;box-shadow:0 12px 40px rgba(0,0,0,.16);" +
+      "font:14px/1.5 ui-sans-serif,system-ui,sans-serif;animation:slideUp .3s ease-out";
+    let opts = "";
+    choices.forEach(function (c) {
+      opts += '<button class="why-opt" data-code="' + c.code + '" data-free="' +
+        (c.free_text ? "1" : "") + '" style="display:block;width:100%;text-align:left;' +
+        'margin-top:7px;padding:9px 12px;border:1px solid #e5e7eb;border-radius:9px;' +
+        'background:#fff;font-size:13px;cursor:pointer;color:#111827">' +
+        String(c.label).replace(/[&<>"]/g, "") + '</button>';
+    });
+    wrap.innerHTML =
+      '<div style="font-weight:650;color:#111827">Before you go — what happened?</div>' +
+      '<div style="color:#4b5563;margin-top:5px;font-size:12.5px">One tap. It tells us ' +
+      'whether to hold off or help — we will not guess.</div>' + opts +
+      '<div id="why-free" style="display:none;margin-top:9px">' +
+      '<input id="why-text" maxlength="200" placeholder="In your own words…" ' +
+      'style="width:100%;padding:9px 11px;border:1px solid #e5e7eb;border-radius:9px;' +
+      'font-size:13px;font-family:inherit">' +
+      '<button id="why-send" style="margin-top:7px;width:100%;background:#2563eb;' +
+      'color:#fff;border:0;border-radius:9px;padding:9px;font-size:13px;' +
+      'font-weight:600;cursor:pointer">Send</button></div>' +
+      '<button id="why-skip" style="margin-top:10px;width:100%;background:none;' +
+      'border:0;color:#9ca3af;font-size:12px;cursor:pointer">Skip</button>';
+    document.body.appendChild(wrap);
+
+    /* Either branch must release the agent, or a deferred case waits for an
+       answer that is never coming. `answered` distinguishes them: a reply
+       starts the agent through /api/drop-reason with the reason attached;
+       a skip, or the timeout below, starts it with nothing added. */
+    function done(answered) {
+      clearTimeout(_whyTimer);
+      const el = document.getElementById("why-card");
+      if (el) el.remove();
+      if (!answered) release();
+      _flushHeldPush();
+    }
+    /* A customer who walks away must not hold the case open. Two minutes is
+       longer than anyone spends on one question and short enough that the
+       recovery window is barely touched. */
+    const _whyTimer = setTimeout(function () { done(false); }, 120000);
+    function send(code, text) {
+      fetch("/api/drop-reason", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({payment_id: paymentId, code: code, text: text || ""})
+      }).catch(function () {}).then(function () { done(true); });
+    }
+    wrap.querySelectorAll(".why-opt").forEach(function (b) {
+      b.onclick = function () {
+        if (b.dataset.free) {
+          wrap.querySelectorAll(".why-opt").forEach(function (x) { x.style.display = "none"; });
+          document.getElementById("why-free").style.display = "block";
+          document.getElementById("why-text").focus();
+          document.getElementById("why-send").onclick = function () {
+            send("other", document.getElementById("why-text").value);
+          };
+          return;
+        }
+        send(b.dataset.code, "");
+      };
+    });
+    document.getElementById("why-skip").onclick = function () { done(false); };
+  }).catch(function () { release(); _flushHeldPush(); });
+}
 
 function renderAgentPush(d) {
   var esc = function (t) {
@@ -2985,6 +3540,16 @@ def payment_failed():
         push_event(payment_id, "signal_precedence", note)
         failure_code = prior_code
         failure_reason = str(prior.get("failure_reason") or failure_reason)
+        # ...but the cancellation is not NOTHING. Walking away after a failure
+        # is different from walking away with nothing wrong: the customer saw
+        # the decline, had Razorpay's other rails in front of them, and chose
+        # to stop. That is reluctance demonstrated, which is exactly the
+        # evidence a method failure otherwise has to earn by trying full price
+        # first. The diagnosis stays "the bank declined"; what changes is that
+        # price is now a defensible lever.
+        _abandoned_after_failure = True
+    else:
+        _abandoned_after_failure = bool(prior.get("abandoned_after_failure"))
 
     # A NEW failure means the previous attempt is over.
     #
@@ -3004,8 +3569,21 @@ def payment_failed():
     store.update_payment(payment_id, status="recovering", push_outcome=None,
                          failure_code=failure_code or "",
                          failure_reason=failure_reason or "",
-                         decline_strategy=failure_code or "")
+                         decline_strategy=failure_code or "",
+                         abandoned_after_failure=_abandoned_after_failure)
 
+
+    # The checkout asks the customer WHY they stopped, and that answer
+    # outranks anything inferable from an error code. Starting the agent here
+    # anyway meant the question and the agent raced, and the agent won: on
+    # pay_96fxy62mc it minted a link, gave 5% away and emailed the offer, and
+    # only THEN did the customer say "I didn't have enough balance" — the one
+    # answer for which a discount is useless and a link is a link nobody can
+    # pay. The reply arrives seconds later; the case can wait that long.
+    if bool(data.get("defer_agent")):
+        store.update_payment(payment_id, drop_reason_pending=True)
+        _do_flush()
+        return jsonify({"status": "awaiting_reason", "payment_id": payment_id})
 
     socketio.start_background_task(run_agent_for_payment, payment_id, amount, failure_reason, customer, "standard", failure_code, error_source, error_step)
     return jsonify({"status": "recovery_started"})
@@ -3309,6 +3887,11 @@ def health():
 
 def main():
     port = int(os.getenv("FRONTEND_PORT", "5002"))
+    autopilot_minutes = float(os.getenv("WAVE_AUTOPILOT_MINUTES", "0") or 0)
+    if autopilot_minutes > 0:
+        socketio.start_background_task(_wave_autopilot, autopilot_minutes)
+        print(f"  Wave autopilot:     every {autopilot_minutes:g} min, "
+              f"outside quiet hours")
     print(f"\n  Customer Checkout:  http://localhost:{port}/pay")
     print(f"  Merchant Dashboard: http://localhost:{port}/merchant")
     print(f"  Agent Flow:         http://localhost:{port}/graph\n")
