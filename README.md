@@ -76,6 +76,7 @@ The core idea: **the intelligence is the scaffolding around the model, not a big
 ```mermaid
 flowchart TB
     Customer((Customer))
+    Merchant((Merchant / Ops))
     Razorpay((Razorpay))
     SuperU((SuperU Voice))
 
@@ -86,12 +87,18 @@ flowchart TB
 
     subgraph Live ["Live agent — LangGraph ReAct loop"]
         PER["perception.py<br/>'what is true right now', every turn"]
-        CLS["classify.py<br/>failure kind + customer testimony"]
+        CLS["classify.py + drop_reasons + labels<br/>failure kind + customer testimony"]
         LAD["ladder.py<br/>recovery ladder per failure kind"]
         GOV["governance.py<br/>tier-gated tool allowlist"]
         LLM["LLM (agent_node)<br/>Gemini 3.1 Pro + fallbacks"]
         GATE["guardrails.py / policy_gate.py<br/>enforced on the tool path"]
-        TOOLS["tools.py<br/>links · offers · retries · voice · close"]
+        TOOLS["tools.py<br/>links · offers · retries · notify · voice · escalate · close"]
+        RAG["agentic_rag.py + knowledge base<br/>ChromaDB — query_knowledge_base"]
+    end
+
+    subgraph Deliver ["Delivery channels"]
+        NOTIF["notifications.py<br/>email / SMS (Brevo)"]
+        PRES["presence.py + push_bus.py<br/>in-page banner / push"]
     end
 
     subgraph Batch ["Batch engine"]
@@ -101,10 +108,20 @@ flowchart TB
         QUEUE["agent_queue.py<br/>exceptions → back to the live agent"]
     end
 
+    subgraph Workers ["Background & escalation"]
+        DAEMON["daemon_worker.py<br/>fires scheduled retries · wakes the agent · reconciles"]
+        ESC["escalation_queue.py<br/>human tickets"]
+    end
+
     subgraph State ["State & memory"]
         STORE["state_store.py<br/>SQLite/JSON + cross-process lock"]
         MEM["memory.py<br/>per-customer episodes"]
-        PRES["presence.py + push_bus.py<br/>in-page delivery"]
+        CFG["guardrail_config.py<br/>live-tunable limits"]
+    end
+
+    subgraph Surfaces ["Merchant surfaces"]
+        HUD["frontend.py :5002/merchant<br/>live HUD · batch log · guardrail controls"]
+        DASH["dashboard.py :5001<br/>analytics"]
     end
 
     subgraph Trust ["Audit · Ops · Evals · Traces"]
@@ -119,18 +136,35 @@ flowchart TB
     WH --> PER
     CO --> PER
     PER --> CLS --> LAD --> GOV --> LLM --> GATE --> TOOLS
-    TOOLS -->|links, retries| Razorpay
-    TOOLS -->|in-page| PRES
-    TOOLS -->|voice, gated| SuperU
-    TOOLS --> STORE
+    TOOLS -->|query| RAG
     LLM <--> MEM
+    CFG -->|limits| GATE
+
+    TOOLS -->|links, retries| Razorpay
+    TOOLS -->|email / SMS| NOTIF --> Customer
+    TOOLS -->|in-page| PRES --> Customer
+    TOOLS -->|voice, gated| SuperU
+    TOOLS -->|escalate| ESC
+    TOOLS --> STORE
+
     WAVES --> DISTILL --> EXEC
     EXEC -->|exceptions| QUEUE --> LLM
     EXEC --> STORE
+
+    STORE --> DAEMON
+    DAEMON -->|retry due / wake| PER
+
     TOOLS --> AUD
     EXEC --> AUD
     STORE --> ECON
     LLM --> OBS
+
+    Merchant -->|tune live| CFG
+    Merchant <--> HUD
+    Merchant <--> DASH
+    STORE --> HUD
+    AUD --> HUD
+    ECON --> DASH
 ```
 
 ### Layers
