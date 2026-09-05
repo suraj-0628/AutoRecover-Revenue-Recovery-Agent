@@ -1,9 +1,11 @@
 # AutoRecover — one image that runs the whole stack.
 FROM python:3.12-slim
 
-# build-essential covers any dep without a prebuilt wheel; curl for healthchecks.
+# build-essential: any dep without a prebuilt wheel. libgomp1: OpenMP runtime
+# that onnxruntime / scikit-learn wheels load at import (missing on slim).
+# curl: container healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential curl \
+        build-essential libgomp1 curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
