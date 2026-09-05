@@ -224,6 +224,33 @@ def test_scorecard_regression_gate(tmp_path, monkeypatch):
     assert run_mod.check_against_baseline(inconclusive) == ([], [])
 
 
+def test_the_no_llm_gate_does_not_fault_modes_it_never_ran(tmp_path, monkeypatch):
+    """The recorded-only gate (CI: no LLM, no quota) cannot run the model-backed
+    modes. Their ABSENCE from that run is not a regression — treating it as one
+    failed every no-LLM build for a red-team score that never moved. But a mode
+    carried forward and now STALE must still trip the ratchet: that is the
+    number worth re-running before shipping past it."""
+    from datetime import datetime, timedelta, timezone
+    from recovery_agent.evals import run as run_mod
+    monkeypatch.setattr(run_mod, "BASELINE_PATH", tmp_path / "baseline.json")
+    # Frozen with red-team defendable, as a full local run leaves it.
+    (tmp_path / "baseline.json").write_text(json.dumps(
+        {"modes": {"recorded": _gateable(conformance_rate=0.95),
+                   "redteam": _gateable(held_rate=0.9)}}))
+
+    # A recorded-only card simply never ran red-team → do not invent a regression.
+    recorded_only = {"modes": {"recorded": _gateable(conformance_rate=0.95)}}
+    assert run_mod.check_credibility(recorded_only) == []
+
+    # Red-team carried forward but measured a month ago → re-run it.
+    stale = {"modes": {"recorded": _gateable(conformance_rate=0.95),
+                       "redteam": {"held_rate": 0.9, "unit": {"effective_n": 40},
+                                   "ran_at": (datetime.now(timezone.utc)
+                                              - timedelta(days=30)).isoformat()}}}
+    assert any("redteam was defendable" in m
+               for m in run_mod.check_credibility(stale))
+
+
 def test_a_widened_corpus_advises_instead_of_failing(tmp_path, monkeypatch):
     """New decisions are new information. A rate that moved because the corpus
     grew is something to look at and re-freeze — not a code regression."""

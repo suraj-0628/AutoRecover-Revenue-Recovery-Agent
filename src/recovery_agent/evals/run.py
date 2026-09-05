@@ -425,6 +425,15 @@ def check_credibility(card: dict) -> list[str]:
     c_gate = {m for m, _x, _s in _GUARDED_METRICS
               if quality.gateability(m, cur.get(m) or {})["gateable"]}
     for mode in sorted(b_gate - c_gate):
+        # Only a mode actually MEASURED this run can have regressed. A mode not
+        # run this invocation is absent, not degraded — and the recorded-only
+        # gate (CI, no LLM) legitimately cannot run the model-backed modes.
+        # Flagging their absence fails every no-LLM build for a capability that
+        # never regressed: exactly the "cry wolf" this file warns against. A
+        # mode PRESENT but stale still trips (its number is carried forward and
+        # too old) — that is the case worth re-running.
+        if mode not in cur:
+            continue
         out.append(f"{mode} was defendable at the last freeze and is not now — "
                    f"re-run it rather than shipping past it")
     return out
