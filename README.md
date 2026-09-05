@@ -18,18 +18,17 @@ Built for the **Razorpay AI Buildathon** — *AI Revenue Recovery* track.
 
 ## Quickstart
 
-**Prerequisites:** Python 3.12+, and an OpenAI-compatible LLM endpoint.
+**Prerequisites:** Python 3.11+ (3.12 recommended), and an OpenAI-compatible LLM endpoint.
 
 ```bash
-# 1. install
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
+# 1. install (creates .venv and installs the package)
+make setup            # or: python -m venv .venv && source .venv/bin/activate && pip install -e .
 
 # 2. configure — copy the example and fill in your keys
-cp .env.example .env    # Razorpay test keys, LLM endpoint, (optional) SuperU + Brevo
+cp .env.example .env  # REQUIRED: Razorpay test keys + an LLM endpoint. Rest is optional.
 
 # 3. run everything
-./start.sh
+make start            # or: ./start.sh
 ```
 
 `start.sh` launches five processes and prints their health:
@@ -44,12 +43,14 @@ cp .env.example .env    # Razorpay test keys, LLM endpoint, (optional) SuperU + 
 
 Open the **checkout** at `http://localhost:5002/pay`, fail a payment, and watch the agent work it live in the **Merchant HUD** at `http://localhost:5002/merchant`.
 
-The LLM is configured entirely by env vars, so any OpenAI-compatible endpoint works:
+**Minimum to run:** just two things — Razorpay **test** keys, and **any OpenAI‑compatible LLM** (endpoint + model + key). Everything else — SuperU voice, Brevo email, Phoenix tracing — is **optional and off by default**; the stack boots and demos without them (e.g. with no email keys, messages are written to `data/outbox/` instead of sent). `.env.example` marks exactly what's required vs optional.
+
+The LLM is configured entirely by env vars, so any OpenAI‑compatible provider works — point it at your own key:
 
 ```dotenv
-LLM_BASE_URL=http://localhost:20128/v1     # any OpenAI-compatible router
-LLM_MODEL=antigravity/gemini-3.1-pro-high  # the primary model
-LLM_FALLBACK_MODELS=...                     # capability-ordered fallbacks
+LLM_BASE_URL=https://api.openai.com/v1   # or Gemini / Groq / Together / a local router
+LLM_MODEL=gpt-4o                          # a capable reasoning model is recommended
+LLM_API_KEY=sk-your-key-here
 ```
 
 ---

@@ -1,7 +1,16 @@
 # Recovery Agent — dev commands
-# Usage: make test, make start, make stop
+# Usage: make setup, make start, make stop, make test
 
-.PHONY: test start stop check ci evals evals-full evals-baseline
+.PHONY: setup test start stop check ci evals evals-full evals-baseline
+
+# One-command setup for a fresh clone: create the venv and install the package.
+# Then:  cp .env.example .env  (add your keys)  &&  make start
+setup:
+	python3 -m venv .venv
+	.venv/bin/pip install --upgrade pip
+	.venv/bin/pip install -e .
+	@echo ""
+	@echo "Setup complete. Next:  cp .env.example .env  (add your keys)  then  make start"
 
 test:
 	@echo "Running tests with venv Python..."

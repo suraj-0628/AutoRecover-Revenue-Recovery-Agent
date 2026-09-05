@@ -24,14 +24,16 @@ fi
 source .venv/bin/activate
 
 # --- Pre-flight: Download ChromaDB ONNX embedding model if not cached ---
+# Non-fatal: this only powers the RAG knowledge lookup. If it can't download
+# (offline, mirror down), the rest of the stack — checkout, agent, batch, HUD —
+# still runs; only the knowledge-base tool degrades. Don't block the demo on it.
 echo "Running pre-flight checks..."
 .venv/bin/python3 -m recovery_agent.scripts.download_models
 if [ $? -ne 0 ]; then
     echo ""
-    echo "ERROR: Failed to download ChromaDB embedding models. Check internet connection."
-    echo "The RAG engine requires the ONNX model to be cached locally."
-    echo "You can also download it manually: python -m recovery_agent.scripts.download_models"
-    exit 1
+    echo "WARNING: could not download the RAG embedding model (offline?)."
+    echo "Continuing — the knowledge-base lookup will be degraded, everything"
+    echo "else works. To fix later: python -m recovery_agent.scripts.download_models"
 fi
 
 # --- Pre-flight: Verify critical imports work in venv ---
