@@ -62,6 +62,9 @@ data/*.json
 
 # Agent skills & customizations
 .agents/
+# Local AI coding-agent config (not part of the project)
+opencode.json
+.opencode/
 
 
 
