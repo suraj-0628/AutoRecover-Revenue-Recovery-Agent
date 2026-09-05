@@ -73,7 +73,6 @@ fi
 echo "Starting Revenue Recovery Agent services..."
 
 # Kill any existing instances
-pkill -f "recovery_agent.dashboard" 2>/dev/null
 pkill -f "recovery_agent.webhook" 2>/dev/null
 pkill -f "recovery_agent.frontend" 2>/dev/null
 pkill -f "recovery_agent.daemon_worker" 2>/dev/null
@@ -111,10 +110,6 @@ for _ in $(seq 1 60); do
     echo -n "."
     sleep 2
 done
-
-# Start dashboard
-setsid .venv/bin/python3 -m recovery_agent.dashboard < /dev/null > /tmp/dashboard.log 2>&1 &
-DASHBOARD_PID=$!
 
 # Start webhook listener
 setsid .venv/bin/python3 -m recovery_agent.webhook < /dev/null > /tmp/webhook.log 2>&1 &
@@ -161,7 +156,6 @@ PHOENIX_OK=$(for _ in $(seq 1 10); do
     sleep 1
 done)
 PHOENIX_OK=${PHOENIX_OK:-NO}
-DASHBOARD_OK=$(wait_ok "http://localhost:${DASHBOARD_PORT:-5001}/api/metrics" "total_cases")
 WEBHOOK_OK=$(wait_ok "http://localhost:${WEBHOOK_PORT:-5000}/health" "status")
 FRONTEND_OK=$(wait_ok "http://localhost:5002/health" "status")
 DAEMON_OK=$(pgrep -f "recovery_agent.daemon_worker" > /dev/null && echo "YES" || echo "NO")
@@ -176,8 +170,6 @@ echo "  Customer Checkout: http://localhost:5002/pay"
 echo "  Merchant Dashboard: http://localhost:5002/merchant"
 echo ""
 echo "  --- Backend ---"
-echo "  Recovery Dashboard: http://localhost:${DASHBOARD_PORT:-5001}"
-echo "  Agent Flow:         http://localhost:${DASHBOARD_PORT:-5001}/graph"
 echo "  Webhook Listener:   http://localhost:${WEBHOOK_PORT:-5000}/webhook"
 echo ""
 echo "  --- Observability ---"
@@ -185,7 +177,6 @@ echo "  Phoenix Tracing:    http://localhost:6006"
 echo ""
 echo "  --- Status ---"
 echo "  Phoenix:    [$PHOENIX_OK]"
-echo "  Dashboard:  [$DASHBOARD_OK]"
 echo "  Webhook:    [$WEBHOOK_OK]"
 echo "  Frontend:   [$FRONTEND_OK]"
 echo "  Daemon:     [$DAEMON_OK]"

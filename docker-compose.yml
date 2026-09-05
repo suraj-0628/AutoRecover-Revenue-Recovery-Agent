@@ -17,8 +17,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "5002:5002"   # checkout + merchant HUD  ← start here
-      - "5001:5001"   # analytics dashboard
+      - "5002:5002"   # checkout + merchant console  <- start here
       - "5000:5000"   # Razorpay webhook listener
       - "6006:6006"   # Phoenix tracing
     healthcheck:

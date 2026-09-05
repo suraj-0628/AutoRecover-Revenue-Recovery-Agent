@@ -12,7 +12,6 @@ set -euo pipefail
     || echo "WARN: RAG embedding model unavailable (offline?); knowledge base degraded." ) &
 
 # Background services (logs to files; the frontend below streams to stdout).
-python -m recovery_agent.dashboard      > /tmp/dashboard.log     2>&1 &
 python -m recovery_agent.webhook        > /tmp/webhook.log       2>&1 &
 python -m recovery_agent.daemon_worker  > /tmp/daemon.log        2>&1 &
 phoenix serve                           > /tmp/phoenix.log       2>&1 &

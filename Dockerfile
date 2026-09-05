@@ -27,7 +27,7 @@ ENV RAZORPAY_WRITES_OK=1 \
     PHOENIX_WORKING_DIR=/app/data/phoenix \
     PYTHONUNBUFFERED=1
 
-# webhook · dashboard · frontend(checkout+HUD) · Phoenix
-EXPOSE 5000 5001 5002 6006
+# webhook · frontend (checkout + merchant console) · Phoenix
+EXPOSE 5000 5002 6006
 
 ENTRYPOINT ["bash", "docker-entrypoint.sh"]

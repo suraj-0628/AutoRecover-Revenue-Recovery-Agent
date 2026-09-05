@@ -37,9 +37,7 @@ Once the stack is running (see [Getting started](#getting-started)):
 | Surface | URL | Purpose |
 |---------|-----|---------|
 | Customer checkout | `http://localhost:5002/pay` | Make and fail a payment |
-| Merchant console | `http://localhost:5002/merchant` | Watch the agent work the case live |
-| Analytics dashboard | `http://localhost:5001` | Recovery metrics and unit economics |
-| Agent flow | `http://localhost:5001/graph` | The agent's decision graph |
+| Merchant console | `http://localhost:5002/merchant` | Watch the agent work the case live, with recovery metrics and unit economics |
 | Phoenix tracing | `http://localhost:6006` | One trace session per case |
 
 ## Highlights
@@ -141,9 +139,8 @@ flowchart TB
         CFG["guardrail_config.py<br/>live-tunable limits"]
     end
 
-    subgraph Surfaces ["Merchant surfaces"]
-        HUD["frontend.py :5002/merchant<br/>live console, batch log, guardrails"]
-        DASH["dashboard.py :5001<br/>analytics"]
+    subgraph Surfaces ["Merchant console"]
+        HUD["frontend.py :5002/merchant<br/>live console, batch log, guardrails, economics"]
     end
 
     subgraph Trust ["Audit, economics, evals, traces"]
@@ -183,10 +180,9 @@ flowchart TB
 
     Merchant -->|tune live| CFG
     Merchant <--> HUD
-    Merchant <--> DASH
     STORE --> HUD
     AUD --> HUD
-    ECON --> DASH
+    ECON --> HUD
 ```
 
 **Ingestion.** `webhook.py` handles the Razorpay `payment.failed` event. The
@@ -231,9 +227,9 @@ cp .env.example .env        # add your Razorpay test keys and LLM endpoint
 docker compose up --build
 ```
 
-The image runs all services in one container and maps ports 5000, 5001, 5002,
-and 6006, so the URLs in the [Demo](#demo) section work unchanged. State lives
-inside the container and is recreated on each start.
+The image runs all services in one container and maps ports 5000, 5002, and
+6006, so the URLs in the [Demo](#demo) section work unchanged. State lives inside
+the container and is recreated on each start.
 
 If your LLM runs on the host machine, set `LLM_BASE_URL` to
 `http://host.docker.internal:PORT/v1` in `.env`. Inside a container, `localhost`
@@ -247,12 +243,11 @@ cp .env.example .env        # add your Razorpay test keys and LLM endpoint
 make start                  # start all services and print their health
 ```
 
-`make start` (which runs `./start.sh`) launches five processes:
+`make start` (which runs `./start.sh`) launches four processes:
 
 | Process | Port | Role |
 |---------|------|------|
 | Frontend | 5002 | Customer checkout and merchant console |
-| Dashboard | 5001 | Analytics and metrics |
 | Webhook | 5000 | Razorpay `payment.failed` listener |
 | Phoenix | 6006 | Tracing |
 | Daemon | (background) | Scheduled retries, batch settle, cost reconciliation |
@@ -282,7 +277,7 @@ to `.env` and fill in the required values.
 | `VOICE_CALLS_ENABLED` | `0` | Enable SuperU voice calls |
 | `SUPERU_API_KEY`, `SUPERU_ASSISTANT_ID`, `SUPERU_FROM_PHONE` | (none) | Voice provider credentials |
 | `BREVO_API_KEY` or `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | (none) | Email delivery. Without these, messages are written to `data/outbox/` |
-| `FRONTEND_PORT`, `DASHBOARD_PORT`, `WEBHOOK_PORT` | `5002`, `5001`, `5000` | Override default ports |
+| `FRONTEND_PORT`, `WEBHOOK_PORT` | `5002`, `5000` | Override default ports |
 | `RAZORPAY_LINKS_ALREADY_SPENT` | `0` | Count of payment links already used against the account's lifetime quota |
 
 Only the Razorpay keys and an LLM endpoint are needed to run. SuperU voice,
@@ -414,7 +409,6 @@ src/recovery_agent/
 ├── evals/                 # conformance, redteam, counterfactual, replay, quality
 ├── scripts/               # model download, cost reconciliation, backfills
 ├── frontend.py            # Flask and Socket.IO: checkout and merchant console (5002)
-├── dashboard.py           # analytics (5001)
 ├── webhook.py             # payment.failed listener (5000)
 ├── daemon_worker.py       # scheduled retries, park-on-boot, reconciliation
 ├── state_store.py         # durable, cross-process case store
