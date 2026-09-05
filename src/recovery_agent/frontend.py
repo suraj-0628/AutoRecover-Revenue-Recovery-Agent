@@ -657,6 +657,16 @@ def api_batches():
     })
 
 
+def _case_is_settled(rec: dict | None) -> bool:
+    """A case the agent has finished with: recovered, escalated, or explicitly
+    closed. A late page signal (a stale retry button, a skipped-then-answered
+    reason) must not reopen one. Mirrors the terminal-state guard the push and
+    hand-off path already applies."""
+    if not rec:
+        return False
+    return bool(rec.get("closed")) or rec.get("status") in ("recovered", "escalated")
+
+
 @app.route("/api/drop-reasons", methods=["GET"])
 def api_drop_reasons():
     """What the checkout offers when it asks the customer why they stopped."""
@@ -678,6 +688,8 @@ def api_drop_reason_skip():
     rec = store.get_payment(payment_id) if payment_id else None
     if rec is None:
         return jsonify({"error": "unknown case"}), 404
+    if _case_is_settled(rec):
+        return jsonify({"status": "already_settled", "payment_id": payment_id})
     if not rec.get("drop_reason_pending"):
         return jsonify({"status": "not_waiting", "payment_id": payment_id})
 
@@ -720,6 +732,8 @@ def api_drop_reason():
         return jsonify({"error": "payment_id and a known reason code required"}), 400
     if not store.has_payment(payment_id):
         return jsonify({"error": "unknown case"}), 404
+    if _case_is_settled(store.get_payment(payment_id)):
+        return jsonify({"status": "already_settled", "payment_id": payment_id})
 
     reason = {"code": code, "label": spec["label"], "text": text,
               "at": datetime.now(timezone.utc).isoformat()}
@@ -3060,6 +3074,7 @@ function validateCustomerForm() {
 }
 
 function startPayment() {
+  if (_caseSettled) return;   /* case already recovered; the checkout is done */
   const btn = document.getElementById("pay-btn");
   const total = getCartTotal();
   if (total === 0) return;
@@ -3183,6 +3198,7 @@ function switchRail(rail) {
 }
 
 function triggerRecovery(err, deferAgent) {
+  if (_caseSettled) return;   /* case already recovered; do not reopen it */
   const total = getCartTotal();
   const cust = getCustomerData();
   /* deferAgent records the case but holds the agent until the customer has
@@ -3244,6 +3260,10 @@ function closePush(action, detail) {
    held when the payment SUCCEEDS is dropped: it belongs to a case that just
    ended. */
 let _rzpModalOpen = false;
+/* Once the case is recovered (this tab, or the recovery link opened elsewhere),
+   the checkout is done. A stale Pay Now / retry click must not re-fire the
+   failure endpoint and reopen a closed case. */
+let _caseSettled = false;
 //: Set when WE close the checkout because the payment failed, so the dismiss
 //: that follows is not misread as the customer walking away.
 let _closedAfterFailure = false;
@@ -3495,6 +3515,9 @@ socket.on("agent_event", function(data) {
      retire the banner and the notification here too. */
   if (data.event === "recovery_confirmed" ||
       (data.event === "complete" && data.status === "recovered")) {
+    _caseSettled = true;
+    const pb = document.getElementById("pay-btn");
+    if (pb) { pb.disabled = true; pb.innerHTML = "Paid"; }
     const ab = document.getElementById("agent-offer-banner");
     if (ab) { ab.remove(); document.body.style.paddingTop = ""; }
     const ap = document.getElementById("agent-push"); if (ap) ap.remove();
@@ -3820,6 +3843,29 @@ def payment_failed():
     error_source = data.get("error_source", "")
     error_step = data.get("error_step", "")
     customer = data.get("customer", {})
+
+    # A case the agent has already SETTLED must not be reopened by a late
+    # failure signal. The stale "Pay Now" / retry button on the checkout re-fires
+    # this endpoint for the SAME payment_id after the recovery link was already
+    # paid and the case closed; without this guard the handler reset the case to
+    # `recovering`, re-emitted [INIT]/[HOLD], and started a fresh run on a case
+    # closed as recovered. The push/hand-off path already refuses a settled case
+    # the same way; the failure path has to as well. The late signal is kept on
+    # the trail for the audit, and nothing else fires.
+    _settled = store.get_payment(payment_id) if store.has_payment(payment_id) else None
+    if _case_is_settled(_settled):
+        _outcome = (_settled.get("closed") or {}).get("outcome") or _settled.get("status")
+        _settled.setdefault("trail", []).append({
+            "step": "settled_no_reopen",
+            "msg": "Late failure signal on a settled case; not reopening",
+            "detail": f"case already {_outcome}; recording the signal, not restarting",
+            "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        })
+        store.update_payment(payment_id, trail=_settled["trail"])
+        _do_flush()
+        return jsonify({"status": "already_settled", "payment_id": payment_id,
+                        "outcome": _outcome, "signal_recorded": True})
+
     # A case already being worked must not get a SECOND agent run — but the
     # signal that just arrived still has to be recorded. This returned here,
     # before the precedence block below, and since the gateway failure now
