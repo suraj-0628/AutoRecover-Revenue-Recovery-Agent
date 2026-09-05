@@ -12,9 +12,16 @@ set -euo pipefail
     || echo "WARN: RAG embedding model unavailable (offline?); knowledge base degraded." ) &
 
 # Background services (logs to files; the frontend below streams to stdout).
-python -m recovery_agent.webhook        > /tmp/webhook.log       2>&1 &
-python -m recovery_agent.daemon_worker  > /tmp/daemon.log        2>&1 &
-phoenix serve                           > /tmp/phoenix.log       2>&1 &
+python -m recovery_agent.webhook       > /tmp/webhook.log 2>&1 &
+python -m recovery_agent.daemon_worker > /tmp/daemon.log  2>&1 &
+
+# Phoenix runs its first-boot DB migration inside `phoenix serve`, and on a FRESH
+# database that process comes up and then exits right after the migration
+# finishes. The retry starts against the now-migrated DB and serves normally and
+# indefinitely (verified: a warm start stays up 7+ min; a cold start exits once).
+# The loop makes that one-time cold-start exit self-heal, so tracing comes up on
+# its own a couple of minutes in rather than staying dark.
+( while true; do phoenix serve; echo "[entrypoint] phoenix exited, restarting in 2s"; sleep 2; done ) > /tmp/phoenix.log 2>&1 &
 
 echo "AutoRecover up — checkout: http://localhost:5002/pay | HUD: http://localhost:5002/merchant"
 

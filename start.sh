@@ -92,7 +92,11 @@ sleep 1
 export PHOENIX_PORT=6006
 export PHOENIX_WORKING_DIR="$(pwd)/data/phoenix"
 mkdir -p "$PHOENIX_WORKING_DIR"
-setsid .venv/bin/phoenix serve > /tmp/phoenix.log 2>&1 &
+# `phoenix serve` exits once on a FRESH database, right after its first-boot
+# migration; the retry then starts warm and serves indefinitely. The loop
+# self-heals that one-time cold-start exit so tracing reliably comes up on a
+# fresh clone too (matches docker-entrypoint.sh).
+setsid bash -c 'while true; do .venv/bin/phoenix serve; echo "[start] phoenix exited, restarting in 2s"; sleep 2; done' < /dev/null > /tmp/phoenix.log 2>&1 &
 PHOENIX_PID=$!
 
 # Wait for Phoenix to actually answer instead of guessing at a sleep.
@@ -102,14 +106,20 @@ PHOENIX_PID=$!
 # with "Connection refused", on a server that was perfectly healthy moments
 # later. Bounded, so a genuinely dead Phoenix still fails fast-ish.
 echo -n "Waiting for Phoenix"
-for _ in $(seq 1 60); do
+_phx_up=""
+for _ in $(seq 1 90); do
     if curl -s -o /dev/null --max-time 2 "http://localhost:${PHOENIX_PORT}/" 2>/dev/null; then
         echo " up."
+        _phx_up=1
         break
     fi
     echo -n "."
     sleep 2
 done
+# On a fresh clone the first-boot migration plus the one-time cold-start restart
+# can take a few minutes. Don't block the whole stack on it — say so and move on;
+# the restart loop brings tracing up on its own shortly after.
+[ -z "$_phx_up" ] && echo " still starting (first-boot migration); it will come up at :${PHOENIX_PORT} shortly."
 
 # Start webhook listener
 setsid .venv/bin/python3 -m recovery_agent.webhook < /dev/null > /tmp/webhook.log 2>&1 &
