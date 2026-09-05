@@ -10,6 +10,12 @@ services:
     image: autorecover:latest
     container_name: autorecover
     env_file: .env
+    # Lets the container reach an LLM endpoint running on the host machine.
+    # If your LLM runs on the host (e.g. a local proxy), set in .env:
+    #   LLM_BASE_URL=http://host.docker.internal:<port>/v1
+    # (A hosted LLM URL like OpenAI/Anthropic needs neither this nor a change.)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "5002:5002"   # checkout + merchant HUD  ← start here
       - "5001:5001"   # analytics dashboard
