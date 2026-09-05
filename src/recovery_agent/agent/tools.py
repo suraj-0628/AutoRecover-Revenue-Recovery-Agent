@@ -37,6 +37,40 @@ def _live_record(payment_id: str) -> dict:
         return {}
 
 
+def _undelivered_link(payment_id: str) -> str:
+    """The link_id of a created-but-never-delivered link, or '' if none.
+
+    A recovery link the customer never saw is waste — of the 30-per-lifetime
+    quota and of the case's momentum. `link_awaiting_delivery` is set when a
+    link is minted and cleared the moment show_page_offer or
+    send_recovery_notification puts it in front of the customer. While it is
+    set, minting another link or ending the turn on a wait is premature.
+    """
+    rec = _live_record(payment_id)
+    # A settled case is past all of this — the customer may have paid the link
+    # directly (so it was never "delivered" by a tool), and the closing run
+    # legitimately calls wait_for_customer to end its turn. Never block that.
+    if (rec.get("status") in ("recovered", "escalated", "unrecoverable")
+            or rec.get("closed")
+            or float(rec.get("recovered_amount") or 0) > 0):
+        return ""
+    if rec.get("link_awaiting_delivery"):
+        return str(rec.get("recovery_link_id") or "a link")
+    return ""
+
+
+def _mark_link_delivered(payment_id: str) -> None:
+    """A delivery tool reached the customer with the current link."""
+    try:
+        from recovery_agent.state_store import StateStore
+        st = StateStore()
+        if st.get_payment(payment_id) is not None:
+            st.update_payment(payment_id, link_awaiting_delivery=False)
+            st.flush()
+    except Exception:
+        pass
+
+
 def _still_worth_doing(payment_id: str, what: str) -> str:
     """Refuse an action that costs money or reaches the customer, when the case
     is already settled or the customer is mid-response.
@@ -441,11 +475,39 @@ def generate_recovery_payment_link(
     if _stop:
         return _stop
 
+    # DELIVER THE LINK YOU HAVE BEFORE MINTING ANOTHER.
+    #
+    # Links are drawn from a 30-per-lifetime account quota, and a link the
+    # customer never sees is pure waste. Live (pay_iwvp2sx7h): the agent minted
+    # a wallet link, then a netbanking link, then a third — three units of the
+    # quota — and waited without ever showing or sending any of them. A second
+    # link is only a different ROUTE once the first has actually reached the
+    # customer; before that it is the same step done twice.
+    _undelivered = _undelivered_link(payment_id)
+    if _undelivered:
+        return json.dumps({
+            "status": "blocked",
+            "reason": f"you already created a payment link ({_undelivered}) and "
+                      f"have not shown or sent it — the customer cannot act on a "
+                      f"link that only exists in the system, and each link spends "
+                      f"from a strict lifetime quota.",
+            "guidance": "Deliver the link you have first: show it on the page "
+                        "with show_page_offer (the top banner) and/or email it "
+                        "with send_recovery_notification. Only make another link "
+                        "once this one has reached the customer and a different "
+                        "route is genuinely needed.",
+        })
+
     from recovery_agent.razorpay_client import RazorpayClient
 
-    client = RazorpayClient()
-    if not client.is_configured:
-        return json.dumps({"status": "unavailable", "message": "Razorpay client not configured"})
+    # VALIDATE THE REQUEST BEFORE THE TRANSPORT.
+    #
+    # These checks used to sit behind `is_configured`, so the 100x-overcharge
+    # guard and the discount floor were unreachable whenever Razorpay was not
+    # configured — including in every test that did not carry live credentials.
+    # A safety check that only runs when the gateway is up is a safety check
+    # nobody can prove, and "no credentials" is exactly when a bad amount is
+    # most likely to go unnoticed.
 
     # Refuse to bill an amount that does not match the case.
     #
@@ -483,6 +545,11 @@ def generate_recovery_payment_link(
                            f"{floor:.2f} (max {load_policy().max_discount_pct:.0f}% off "
                            f"{expected}). Call get_recovery_offer for an authorised figure.",
             })
+
+    client = RazorpayClient()
+    if not client.is_configured:
+        return json.dumps({"status": "unavailable",
+                           "message": "Razorpay client not configured"})
 
     rails = [r.strip() for r in allowed_rails.split(",")]
     expire_by = None
@@ -580,7 +647,12 @@ def generate_recovery_payment_link(
                 _links = list(_rec.get("recovery_links") or [])
                 _links.append({"link_id": link_id, "amount": float(amount),
                                "at": datetime.now(timezone.utc).isoformat()})
-                _st.update_payment(payment_id, recovery_links=_links)
+                # Fresh link, not yet in front of the customer — the delivery
+                # tools clear this, and until they do no second link or wait is
+                # allowed.
+                _st.update_payment(payment_id, recovery_links=_links,
+                                   recovery_link_id=link_id,
+                                   link_awaiting_delivery=True)
                 _st.flush()
         except Exception:
             pass
@@ -752,6 +824,8 @@ def show_page_offer(
                  else "offer")
         ladder.record_rung(payment_id, _rung, payload["offer_text"])
         ladder.record_action(payment_id, f"page_offer:{payable_amount}", is_rung=True)
+        # The link is now on the page — it has reached the customer.
+        _mark_link_delivered(payment_id)
 
     return json.dumps({
         "status": result.get("status", "unknown"),
@@ -787,6 +861,23 @@ def wait_for_customer(
     Returns:
         Confirmation that the wait is recorded and your turn is over.
     """
+    # Do not wait on a link the customer cannot see. Live (pay_iwvp2sx7h): the
+    # agent minted a link and ended its turn here, so the customer sat on the
+    # checkout with no banner and no email while the case "waited" for them to
+    # act on something they were never shown. Waiting is for when the next move
+    # is genuinely theirs — which it is not until the link has been delivered.
+    _undelivered = _undelivered_link(payment_id)
+    if _undelivered:
+        return json.dumps({
+            "status": "blocked",
+            "reason": f"you created a payment link ({_undelivered}) but have not "
+                      f"shown or sent it, so there is nothing for the customer to "
+                      f"act on — waiting now waits on nothing.",
+            "guidance": "Show the link on the page with show_page_offer (the top "
+                        "banner) and email it with send_recovery_notification, "
+                        "THEN wait.",
+        })
+
     case = getattr(getattr(runtime, "context", None), "case", None) if runtime else None
     minutes = max(1, int(expected_within_minutes or 5))
     if case is not None:
@@ -1198,6 +1289,31 @@ def send_page_push(
     })
 
 
+
+#: Ladder-position order for offer stages. Higher = richer ceiling.
+_STAGE_ORDER: dict[str, int] = {
+    "silent_push": 0, "email_offer": 1, "ui_offer": 1, "voice": 2,
+}
+
+
+def _earned_stage(rec: dict) -> str:
+    """The richest offer stage this case has actually reached.
+
+    Derived from rungs recorded as climbed, never from what the caller says it
+    is doing. `voice` is the negotiation ceiling and requires a voice call to
+    have happened -- the whole point of that ceiling is that a person spoke to
+    the customer before 20% was put on the table.
+    """
+    climbed = rec.get("ladder") or {}
+    if climbed.get("voice_call"):
+        return "voice"
+    if climbed.get("offer") or climbed.get("page_push") or climbed.get("rail_switch"):
+        return "email_offer"
+    # Nothing contacted yet: the first offer rung is still reachable, so the
+    # 5% ceiling is legitimate. It is the 20% one that has to be earned.
+    return "email_offer"
+
+
 @tool
 def get_recovery_offer(
     amount: float,
@@ -1242,6 +1358,25 @@ def get_recovery_offer(
     # the discount is back on the table.
     if payment_id:
         rec = _live_record(payment_id)
+
+        # THE STAGE IS EARNED, NOT DECLARED.
+        #
+        # `stage` arrives as a string the model chose, and it selects the
+        # discount ceiling: 5% at the offer rungs, 20% at "voice". Nothing
+        # checked it against the ladder, so the agent could quadruple its own
+        # spending authority by typing a different word.
+        #
+        # Live (pay_qttkbl2b3, INR 24,990): it quoted "ui_offer" for 5%, emailed
+        # a link, checked the status forty seconds later, saw the money had not
+        # arrived, then quoted "voice" for 20% and emailed a SECOND, richer link.
+        # No call was ever placed. INR 4,998 was authorised on the strength of a
+        # word, against a ceiling meant to require a human conversation first.
+        #
+        # A ceiling the spender can raise is not a ceiling. The stage is now
+        # clamped to what the ladder shows has actually been climbed.
+        _earned = _earned_stage(rec)
+        if _STAGE_ORDER.get(stage, 0) > _STAGE_ORDER.get(_earned, 0):
+            stage = _earned
         # One taxonomy, shared with the batch view and the briefing. This used
         # to re-derive the answer with its own word list, which is how the same
         # case could be a method failure to the offer policy and a drop-off to
@@ -1252,6 +1387,32 @@ def get_recovery_offer(
         tried_full_price = any(
             a.startswith("link:") and a.endswith(f":{owed:.2f}")
             for a in (rec.get("actions_tried") or []))
+        # Walking away IS the proof of reluctance, so it counts as a full-price
+        # attempt having failed. The customer was declined, Razorpay put its
+        # other rails in front of them, and they cancelled instead of using
+        # one — we do not need to spend another link discovering that full
+        # price does not move them. They have already shown us.
+        if ladder.abandoned_after_failure(rec):
+            tried_full_price = True
+
+        # If the customer said why, that settles whether price is the lever.
+        # "I had no balance" is not a price objection at any discount, and
+        # "I'll pay later" is someone who has already said they intend to pay
+        # — discounting them buys nothing that was not already coming.
+        _stated = (rec.get("drop_reason") or {}).get("code") or ""
+        if _stated:
+            from recovery_agent.drop_reasons import get as _reason_spec
+            _spec = _reason_spec(_stated) or {}
+            if not _spec.get("offer_ok", True):
+                return json.dumps({
+                    "status": "not_indicated",
+                    "allowed": False,
+                    "reason": f"the customer told you why they stopped — "
+                              f"{_spec.get('means', 'not a price objection')} — "
+                              f"so this is not something a discount answers",
+                    "do_this_instead": _spec.get("do", "Take a cheaper route."),
+                })
+            tried_full_price = True     # they named price; no need to prove it
         # INCENTIVES ARE ALLOWLISTED, not blocklisted. Only a confirmed
         # drop-off — the customer choosing not to pay — is a price problem,
         # so only "dropoff" unlocks a discount outright. Everything else must
@@ -1624,6 +1785,8 @@ def send_recovery_notification(
             f"{payment_link or _last_recovery_link(runtime, payment_id)}",
             is_rung=True)
         _record_contact(payment_id, sorted(result.get("channels") or []))
+        # The link has now reached the customer by email/SMS.
+        _mark_link_delivered(payment_id)
         return json.dumps({
             "status": "ok",
             "rung": rung,
@@ -1665,14 +1828,37 @@ def retry_in_hours(
             target_time=target_iso,
             action="retry_payment",
         )
+        # Record the snapshot the ladder reads, not only the jobs table.
+        # ladder.retry_pending() and exhausted() consult rec["scheduled_job"];
+        # writing it here makes "a retry is on the clock" true the instant the
+        # tool returns, so the SAME run sees the case as waiting rather than
+        # exhausted. It used to depend on the frontend mapping the action
+        # afterwards, so within the run the ladder was briefly wrong.
+        if store.get_payment(payment_id) is not None:
+            store.update_payment(payment_id, scheduled_job={
+                "status": "scheduled", "job_id": job_id,
+                "target_timestamp": target_iso, "action": "retry_payment",
+                "reason": f"agent scheduled a retry in {round(hours, 1)}h"})
         store.flush()
 
-        # A quiet retry IS a rung — the FIRST one for a funds or transient
-        # failure, where contacting the customer cannot fix anything. It used
-        # to record only a free-text action, so the ladder never saw it and a
-        # case that had correctly scheduled a payday retry still read as
-        # "nothing tried yet" and got marched into contact rungs.
-        ladder.record_rung(payment_id, "silent_retry",
+        # A quiet retry IS a rung, but WHICH rung depends on the ladder it is
+        # on. For a funds or transient failure it is the FIRST rung
+        # (silent_retry) — contacting the customer cannot fix an empty account
+        # or our own outage, so time leads. For a method/keeps-failing case the
+        # rails have already been tried and a discount is not the lever, so a
+        # retry is the "different route" that IS the alternate_path rung: give
+        # the refused instrument time to clear. Recording only silent_retry
+        # there left the method ladder stuck at alternate_path forever — the
+        # agent scheduled a retry and the briefing still said "next: a different
+        # route," so it looped on wait (pay_7ml7v2pea).
+        _rec = _live_record(payment_id)
+        if ladder.has_rung(_rec, "silent_retry") and not ladder.climbed(_rec, "silent_retry"):
+            _rung = "silent_retry"
+        elif ladder.has_rung(_rec, "alternate_path") and not ladder.climbed(_rec, "alternate_path"):
+            _rung = "alternate_path"
+        else:
+            _rung = "silent_retry"
+        ladder.record_rung(payment_id, _rung,
                            f"retry scheduled in {round(hours, 1)}h")
         ladder.record_action(payment_id, f"retry:{round(hours, 1)}h", is_rung=True)
         return json.dumps({
@@ -2148,7 +2334,6 @@ RECOVERY_TOOLS = [
     escalate_to_human,
     query_knowledge_base,
     search_memory,
-    discover_recovery_rail,
     manage_memory,
     initiate_voice_call,
 ]

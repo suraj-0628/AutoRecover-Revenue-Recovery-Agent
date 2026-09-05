@@ -1796,6 +1796,52 @@ def _parse_tool_result(content) -> dict:
     return {"raw": text}
 
 
+def _close_if_settled_and_unclosed(payment_id: str) -> bool:
+    """Close a settled case whose run ended without close_case. True if closed.
+
+    The closing run is instructed to call close_case, but an instruction is
+    not a control: live (pay_gyx5fd5dv), the model had already stored its
+    memory, read "then stop", and ended the closing run with zero tool calls
+    — money verified in, closure never written, episode never stored. Closing
+    on verified money is bookkeeping, and bookkeeping may not depend on the
+    model choosing to do it. close_case itself re-verifies the money before
+    accepting "recovered", so a wrong status string here cannot manufacture
+    a closure.
+    """
+    from recovery_agent.state_store import StateStore
+    rec = StateStore().get_payment(payment_id) or {}
+    if not rec or rec.get("closed"):
+        return False
+    try:
+        from recovery_agent.agent.tools import close_case as _cc
+        fn = getattr(_cc, "func", _cc)
+        res = json.loads(fn(
+            payment_id=payment_id, outcome="recovered",
+            what_happened="Money verified in; closed by the harness because "
+                          "the run ended without close_case."))
+    except Exception as exc:
+        print(f"[Frontend] harness close failed for {payment_id}: {exc}",
+              flush=True)
+        return False
+    if res.get("status") in ("error", "blocked"):
+        print(f"[Frontend] harness close of {payment_id} refused: "
+              f"{res.get('reason') or res.get('message')}", flush=True)
+        return False
+    print(f"[Frontend] harness closed {payment_id} as recovered "
+          f"(run ended without close_case)", flush=True)
+    # The closure belongs in the case trail, not only on stdout — without
+    # this the monologue's last line is "Primary action: none" and the case
+    # looks abandoned at the exact moment it was won.
+    try:
+        push_event(payment_id, "case_closed", {
+            "detail": "Case closed: recovered. Money verified in; recorded "
+                      "by the harness because the run ended without "
+                      "close_case."})
+    except Exception:
+        pass
+    return True
+
+
 def _select_primary_action(tool_calls_made: dict) -> tuple[str, dict, bool]:
     """Pick the run's primary action, its receipt, and whether a ticket exists.
 
@@ -2469,6 +2515,9 @@ def _run_agent_for_payment_inner(payment_id: str, amount: float, failure_reason:
             or float((store.get_payment(payment_id) or {}).get("recovered_amount") or 0) > 0
             or case.recovered
         ) if store.has_payment(payment_id) else case.recovered
+
+        if already_recovered:
+            _close_if_settled_and_unclosed(payment_id)
 
         # `agent_already_escalated` (set by _select_primary_action) is True only
         # when escalate_to_human actually filed a ticket with the full case
@@ -3432,11 +3481,31 @@ function renderAgentPush(d) {
 socket.on("agent_event", function(data) {
   if (data.payment_id !== paymentId) return;
   if (data.event === "waiting_for_customer") {
+    /* The customer's only recovery surface is the top banner (show_page_offer).
+       The "Agent is waiting" panel below the fold was clutter the merchant
+       asked to drop — keep it hidden; the banner is what they act on. */
     const box = document.getElementById("action-box");
-    box.classList.add("visible");
-    document.getElementById("action-title").textContent = "Agent: " + (data.action || "took action");
-    document.getElementById("action-detail").textContent = data.detail || "Please respond to continue recovery.";
-    showStatus("waiting", "Agent is waiting for your response...");
+    if (box) box.classList.remove("visible");
+  }
+  /* The money can arrive on a DIFFERENT surface than this tab — the customer
+     opens the recovery link in a new tab and pays there, so this page's own
+     Razorpay handler never fires and the offer banner it is showing goes
+     stale, advertising a payment that is already done (pay_qsap5pj6h). The
+     server confirms every recovery with `recovery_confirmed`; when it lands,
+     retire the banner and the notification here too. */
+  if (data.event === "recovery_confirmed" ||
+      (data.event === "complete" && data.status === "recovered")) {
+    const ab = document.getElementById("agent-offer-banner");
+    if (ab) { ab.remove(); document.body.style.paddingTop = ""; }
+    const ap = document.getElementById("agent-push"); if (ap) ap.remove();
+    _heldAgentPush = null;
+    const wc = document.getElementById("why-card"); if (wc) wc.remove();
+    document.getElementById("action-box").classList.remove("visible");
+    document.getElementById("decline-wall").classList.remove("visible");
+    const s = document.getElementById("status");
+    s.className = "status-bar active s-success";
+    s.innerHTML = "Payment recovered! Thank you.";
+    return;
   }
   if (data.event === "complete") {
     const s = document.getElementById("status");
@@ -3714,6 +3783,33 @@ def payment_succeeded():
 _SYNTHETIC_FAILURE_CODES = {"customer_cancelled", "technical_error", "method_switch"}
 
 
+#: A short, human headline for the failure, for the top of the monologue. The
+#: kind decides the word; the gateway's own reason text follows it verbatim, so
+#: the operator sees WHAT broke before the agent has done anything about it.
+_FAILURE_HEADLINES = {
+    "method": "Bank declined the payment",
+    "funds": "Insufficient funds",
+    "transient": "Gateway / network error",
+    "dropoff": "Customer left the checkout",
+    "risk": "Flagged for risk review",
+}
+
+
+def _failure_headline(failure_code: str, failure_reason: str, amount: float) -> str:
+    """e.g. 'Bank declined the payment — declined by the bank (BAD_REQUEST_ERROR)'."""
+    try:
+        from recovery_agent.agent.classify import failure_kind
+        kind = failure_kind({"failure_code": failure_code,
+                             "failure_reason": failure_reason}) or ""
+    except Exception:
+        kind = ""
+    lead = _FAILURE_HEADLINES.get(kind, "Payment failed")
+    reason = (failure_reason or "").strip()
+    tail = f" — {reason}" if reason and reason.lower() != "payment_failed" else ""
+    code = f" ({failure_code})" if failure_code else ""
+    return f"{lead}{tail}{code}"
+
+
 @app.route("/api/payment-failed", methods=["POST"])
 def payment_failed():
     data = request.json
@@ -3724,9 +3820,18 @@ def payment_failed():
     error_source = data.get("error_source", "")
     error_step = data.get("error_step", "")
     customer = data.get("customer", {})
-    if store.has_payment(payment_id):
-        if store.get_payment(payment_id).get("status") == "recovering":
-            return jsonify({"status": "already_recovering", "payment_id": payment_id})
+    # A case already being worked must not get a SECOND agent run — but the
+    # signal that just arrived still has to be recorded. This returned here,
+    # before the precedence block below, and since the gateway failure now
+    # defers the agent the case is already `recovering` by the time the
+    # customer closes the checkout. So `abandoned_after_failure` — they were
+    # declined, Razorpay showed them its other rails, and they left anyway —
+    # was computed and thrown away on every live decline. That flag is what
+    # makes a discount defensible on a method failure; losing it silently
+    # changes what the agent is allowed to offer.
+    _already_working = (store.has_payment(payment_id)
+                        and store.get_payment(payment_id).get("status")
+                        == "recovering")
     if not store.has_payment(payment_id):
         store.save_payment(payment_id, {"payment_id": payment_id, "amount": amount, "status": "recovering", "attempts": 0, "last_action": "", "last_detail": "", "trail": [], "customer": customer or {}})
 
@@ -3796,6 +3901,14 @@ def payment_failed():
                          failure_reason=failure_reason or "",
                          decline_strategy=failure_code or "",
                          customer=_known,
+                         # Stored, not just passed. `diagnose_from_razorpay_error`
+                         # reads error_step to tell an auth failure from a
+                         # network one, and every later run — hand-off, wake,
+                         # batch — rebuilds from the record, where both were
+                         # None. The gateway's account of what broke survived
+                         # exactly one function call.
+                         error_source=error_source or (prior.get("error_source") or ""),
+                         error_step=error_step or (prior.get("error_step") or ""),
                          abandoned_after_failure=_abandoned_after_failure)
 
 
@@ -3806,6 +3919,25 @@ def payment_failed():
     # only THEN did the customer say "I didn't have enough balance" — the one
     # answer for which a discount is useless and a link is a link nobody can
     # pay. The reply arrives seconds later; the case can wait that long.
+    # Recorded above, but no second run: the agent already working this case
+    # recomputes its perception briefing from the record every turn, so it
+    # sees the new facts without being started again.
+    if _already_working:
+        return jsonify({"status": "already_recovering", "payment_id": payment_id,
+                        "signal_recorded": True})
+
+    # Lead the monologue with the FAILURE, not with "Opened for pay_x". The
+    # operator (and the demo) should see what actually broke — "Bank declined
+    # the payment — declined by the bank" — before the agent asks the customer
+    # anything or climbs a single rung. Fires once, for the run we are about to
+    # start or hold.
+    push_event(payment_id, "init", {
+        "step": "init",
+        "msg": _failure_headline(failure_code, failure_reason, amount),
+        "detail": f"INR {amount:,.2f} · case {payment_id}",
+        "amount": amount,
+    })
+
     if bool(data.get("defer_agent")):
         # Stamped, because the only thing that released this hold was a
         # setTimeout in the customer's browser. Close the tab and the case

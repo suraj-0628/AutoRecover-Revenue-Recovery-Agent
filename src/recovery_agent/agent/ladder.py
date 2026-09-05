@@ -154,6 +154,23 @@ def _entry_rung(record: dict) -> str:
         return ""
 
 
+def _offer_vetoed_by_testimony(record: dict) -> str:
+    """Why the customer's own answer rules a discount out, or '' if it doesn't."""
+    code = (record.get("drop_reason") or {}).get("code") or ""
+    if not code:
+        return ""
+    try:
+        from recovery_agent.drop_reasons import get as _reason
+        spec = _reason(code) or {}
+    except Exception:
+        return ""
+    if spec and not spec.get("offer_ok", True):
+        return (f'the customer said "{spec.get("label", code)}" — '
+                f"{spec.get('means', 'not a price objection')}, which no "
+                f"discount answers")
+    return ""
+
+
 def rungs_for(record: dict) -> list[tuple[str, str]]:
     """The ladder that belongs to this failure, entered where the customer put us.
 
@@ -247,6 +264,15 @@ def rung_possible(key: str, record: dict) -> tuple[bool, str]:
         # short of escalation forever.
         return False, ("this Razorpay test account has spent its 30 payment "
                        "links, so no offer can be made")
+    if key == "offer":
+        # Testimony that vetoes a discount (offer_ok: False) is not advice
+        # about this rung — get_recovery_offer refuses it outright, so it can
+        # never be climbed. Same rule as the spent link quota above: an
+        # unclimbable rung left in "remaining" holds exhausted() false
+        # forever, with escalation and closure both refused behind it.
+        veto = _offer_vetoed_by_testimony(record)
+        if veto:
+            return False, veto
     if key == "voice_call":
         if not voice_available():
             return False, "voice calling is switched off for this deployment"
@@ -297,6 +323,16 @@ def actions_tried(record: dict) -> list[str]:
     return list(record.get("actions_tried") or [])
 
 
+def _offer_resolved(record: dict) -> bool:
+    """Nothing about the offer stage is still owed before rung 5 can count."""
+    if climbed(record, "offer"):
+        return True
+    if not has_rung(record, "offer"):
+        return True
+    possible, _why = rung_possible("offer", record)
+    return not possible
+
+
 def record_action(payment_id: str, signature: str, is_rung: bool = False) -> None:
     """Note a recovery action that actually reached the customer.
 
@@ -324,12 +360,18 @@ def record_action(payment_id: str, signature: str, is_rung: bool = False) -> Non
         store.update_payment(payment_id, actions_tried=tried)
         store.flush()
 
-        # Anything genuinely new AFTER the offer has been made is the alternate
-        # path. Before that, it is just the ladder being climbed normally.
+        # Anything genuinely new AFTER the offer stage is settled is the
+        # alternate path. Before that, it is just the ladder being climbed
+        # normally. "Settled" is not only "climbed": a ladder with no offer
+        # rung (transient), or one whose offer can never be climbed (testimony
+        # veto, spent link quota), must not hold rung 5 hostage to a stage
+        # that cannot happen — live (no_balance cases, 2026-09-04), that left
+        # exhausted() false forever, so neither escalation nor closure could
+        # ever be permitted.
         rec = store.get_payment(payment_id) or {}
         # An action that IS one of the named rungs cannot also be the
         # alternate path — the offer email is the offer, not a different route.
-        if not is_rung and climbed(rec, "offer") and not climbed(rec, "alternate_path"):
+        if not is_rung and _offer_resolved(rec) and not climbed(rec, "alternate_path"):
             baseline = {a for a in tried[:-1]}
             if baseline:                # something came before it to differ from
                 record_rung(payment_id, "alternate_path", signature)

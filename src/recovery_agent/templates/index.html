@@ -714,6 +714,8 @@
     .ev-bad .ev-verdict { color: var(--accent-red); }
     .ev-strip-bits { font-size: 12px; color: var(--text-muted); }
 
+    .ev-live { color: var(--accent-green); font-size: 10.5px; }
+
     .ev-cards {
       display: grid; gap: 12px; margin: 14px 0 4px;
       grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -1228,6 +1230,57 @@
     .wave-bar .wave-note .won { color: var(--accent-green) }
     .wave-bar .wave-note.live { color: var(--accent-amber) }
 
+    /* The batch engine window: the same visual language as the live agent's
+       monologue, but every line is a straight read of the append-only audit
+       log — the panel IS the evidence, not a narration of it. */
+    .engine-wrap { display: grid; grid-template-columns: minmax(0,1fr) 340px;
+                   gap: 14px; margin-bottom: 16px }
+    @media (max-width: 980px) { .engine-wrap { grid-template-columns: 1fr } }
+    .engine-panel { border: 1px solid var(--border-color); border-radius: 8px;
+                    background: var(--bg-secondary); display: flex;
+                    flex-direction: column; min-height: 180px }
+    .engine-head { display: flex; align-items: center; gap: 8px;
+                   padding: 8px 12px; border-bottom: 1px solid var(--border-color);
+                   font-size: 9.5px; letter-spacing: .08em;
+                   text-transform: uppercase; color: var(--text-muted) }
+    .engine-head .dot { width: 7px; height: 7px; border-radius: 50%;
+                        background: var(--text-muted); flex: none }
+    .engine-head .dot.live { background: var(--accent-green) }
+    .engine-feed { font-family: var(--font-mono); font-size: 10.5px;
+                   line-height: 1.75; padding: 8px 12px; overflow-y: auto;
+                   max-height: 260px; color: var(--text-secondary) }
+    .engine-feed .ln { white-space: nowrap; overflow: hidden;
+                       text-overflow: ellipsis }
+    .engine-feed .ts { color: var(--text-muted); margin-right: 8px }
+    .engine-feed .pid { color: var(--accent-blue) }
+    .engine-feed .k-money { color: var(--accent-green) }
+    .engine-feed .k-ai { color: var(--accent-purple) }
+    .engine-feed .k-hold { color: var(--accent-amber) }
+    .engine-feed .k-stop { color: var(--accent-red) }
+    .engine-feed .k-frame { color: var(--text-primary) }
+    .engine-empty { padding: 18px 12px; font-size: 10.5px;
+                    color: var(--text-muted) }
+    .verdict-list { padding: 6px 10px; overflow-y: auto; max-height: 260px }
+    .verdict-row { border: 1px solid var(--border-color); border-radius: 6px;
+                   padding: 8px 10px; margin: 6px 0; font-size: 10.5px }
+    .verdict-row .v-top { display: flex; justify-content: space-between;
+                          gap: 8px; margin-bottom: 6px;
+                          font-family: var(--font-mono) }
+    .verdict-row .v-top .amt { color: var(--text-primary) }
+    .verdict-row .v-last { color: var(--text-muted); font-size: 10px;
+                           margin-bottom: 6px }
+    .verdict-row select, .verdict-row input {
+        width: 100%; background: var(--bg-primary);
+        border: 1px solid var(--border-color); border-radius: 5px;
+        color: var(--text-primary); font-size: 10.5px; padding: 4px 6px;
+        margin-bottom: 6px }
+    .verdict-row .v-save { padding: 3px 12px; border-radius: 5px;
+        border: 1px solid var(--accent-blue); background: transparent;
+        color: var(--accent-blue); font-family: var(--font-mono);
+        font-size: 10px; font-weight: 600; cursor: pointer }
+    .verdict-row .v-save:hover { background: var(--accent-blue); color: #0d1117 }
+    .verdict-row .v-done { color: var(--accent-green); font-size: 10px }
+
     .wave-desk { margin: -8px 0 16px; padding: 8px 16px;
                  border: 1px dashed var(--border-color); border-radius: 8px;
                  font-size: 10.5px; color: var(--text-muted) }
@@ -1513,15 +1566,22 @@
         <div id="session-tabs" style="display:none;align-items:stretch;gap:1px;
              border-bottom:1px solid var(--border);background:var(--bg-dark);
              overflow-x:auto;white-space:nowrap;min-height:28px"></div>
-        <div class="terminal-box" id="terminal-stream">
-          <div class="trace-step">
-            <div class="trace-header">
-              <span class="trace-chevron" style="visibility:hidden;">▸</span>
-              <span class="trace-tag" style="color:var(--accent-green);">[SYSTEM]</span>
-              <span class="trace-title">Agentic HUD Initialized — Listening to Razorpay Webhooks &amp; Session Heartbeats</span>
-            </div>
+        <!-- The system line lives OUTSIDE the scrolling stream on purpose.
+             It used to be the terminal's first child, and selectSession()
+             replaces terminal.innerHTML wholesale — so the instant the first
+             case arrived it was overwritten with that session's (empty)
+             buffer and never came back. The one line telling the operator the
+             HUD is alive vanished exactly when the HUD started doing
+             something. -->
+        <div class="trace-step" id="hud-system-line"
+             style="border-bottom:1px solid var(--border)">
+          <div class="trace-header">
+            <span class="trace-chevron" style="visibility:hidden;">▸</span>
+            <span class="trace-tag" style="color:var(--accent-green);">[SYSTEM]</span>
+            <span class="trace-title" id="hud-system-text">Agentic HUD Initialized — Listening to Razorpay Webhooks &amp; Session Heartbeats</span>
           </div>
         </div>
+        <div class="terminal-box" id="terminal-stream"></div>
 
         <!-- Tool Call Card -->
         <div class="tool-card" id="tool-card" style="display:none;">
@@ -1599,9 +1659,37 @@
     let selectedSession = null;          // the tab the operator is viewing
     let streamingPid = null;             // the payment currently being rendered
 
+    let _batchSink = null;
     function sessionFor(pid) {
+      /* "batch" is a reserved id for batch-view notifications
+         (push_event("batch", ...) for batch_started / wave_cycle_* ). push_event
+         fans those out on the live-session channel too, so without this a batch
+         run opened a phantom "batch" tab in the live monologue. The batch view
+         has its own window (the append-only engine log); the live monologue is
+         per-PAYMENT only. Hand back a detached buffer that is never rendered as
+         a tab. */
+      if (pid === "batch") {
+        return _batchSink || (_batchSink =
+          {lines: [], status: "", amount: null, unread: 0});
+      }
       if (!sessions.has(pid)) {
-        sessions.set(pid, {lines: [], status: "running", amount: null, unread: 0});
+        const fresh = {lines: [], status: "running", amount: null, unread: 0};
+        /* Seed the buffer with a line saying WHERE this session came from.
+           A case waking from its own scheduled wait used to appear as a bare
+           tab mid-stream, so work the operator never triggered read as the
+           system acting at random. It was not random -- it was a wait the
+           agent asked for, expiring -- but nothing on screen said so. */
+        fresh.lines.push(
+          '<div class="trace-step"><div class="trace-header">' +
+          '<span class="trace-chevron" style="visibility:hidden;">\u25b8</span>' +
+          '<span class="trace-tag" style="color:var(--accent-blue);">[SESSION]</span>' +
+          '<span class="trace-title">Opened for ' + pid +
+          (selectedSession
+            ? ' \u2014 this ran in the background while you were viewing ' +
+              selectedSession + '. Nothing was lost; it is all below.'
+            : '') +
+          '</span></div></div>');
+        sessions.set(pid, fresh);
         if (!selectedSession) selectSession(pid);
         renderTabs();
       }
@@ -1636,6 +1724,18 @@
 
     function renderTabs() {
       const bar = document.getElementById("session-tabs");
+      /* The system line now reports the shape of the session set, so a tab
+         appearing while you read another case is explained rather than
+         merely noticed. */
+      const sysText = document.getElementById("hud-system-text");
+      if (sysText) {
+        const busy = [...sessions.values()].filter(s => s.unread).length;
+        sysText.textContent = sessions.size
+          ? ("Agentic HUD \u2014 " + sessions.size + " case session(s) open" +
+             (busy ? ", " + busy + " with new activity" : "") +
+             ". Each tab is one payment; streams never interleave.")
+          : "Agentic HUD Initialized \u2014 Listening to Razorpay Webhooks & Session Heartbeats";
+      }
       if (!sessions.size) { bar.style.display = "none"; return; }
       bar.style.display = "flex";
       const esc = t => String(t == null ? "" : t).replace(/[&<>"']/g,
@@ -2004,6 +2104,9 @@
       // Do NOT hijack the operator's selected tab. The old line here set
       // activePaymentId to whichever payment emitted last, so a second live
       // payment silently stole the view and the action buttons.
+      // "batch" is a batch-view notification, not a live payment — never let
+      // it become the streaming target or a tab (see sessionFor).
+      if (data.payment_id === "batch") { return; }
       streamingPid = data.payment_id || null;
       if (data.payment_id) {
         const sess = sessionFor(data.payment_id);
@@ -2416,9 +2519,15 @@ function renderEvals() {
   const rec = (d.modes || {}).recorded || {};
   const rt = (d.modes || {}).redteam || {};
 
+  const live = d.recomputed || {};
+  const liveOK = live.rate != null;
   if (status) {
-    status.textContent = rec.age_hours != null
-      ? "scored " + Math.round(rec.age_hours) + "h ago" : "";
+    /* Provenance, stated. "Scored 6h ago" invites the fair question of whether
+       the number is a file someone wrote earlier; this says it was judged on
+       this request, from a corpus anyone can open. */
+    status.textContent = liveOK
+      ? "judged just now from " + live.decisions + " recorded decisions"
+      : (rec.age_hours != null ? "scored " + Math.round(rec.age_hours) + "h ago" : "");
   }
   if (meta) {
     meta.textContent = (c.cases || 0) + " cases · " + (c.turns || 0) +
@@ -2427,9 +2536,9 @@ function renderEvals() {
 
   body.innerHTML =
     evVerdictStrip(v, c) +
-    evCards(rec, rt, c) +
+    evCards(rec, rt, c, live) +
     evMoneyChart(d.counterfactual || {}) +
-    evViolations(rec) +
+    evViolations(rec, live) +
     evCorpusHealth(c, d.baseline || {});
 }
 
@@ -2451,7 +2560,8 @@ function evVerdictStrip(v, c) {
 }
 
 /* ── block 2: four cards, each with the question it answers ── */
-function evCards(rec, rt, c) {
+function evCards(rec, rt, c, live) {
+  live = live || {};
   const held = rt.held || 0, caught = rt.caught_by_gate || 0, leaked = rt.leaked || 0;
   const tot = Math.max(1, held + caught + leaked);
   const pct = n => (100 * n / tot).toFixed(1) + "%";
@@ -2472,9 +2582,14 @@ function evCards(rec, rt, c) {
 
   return '<div class="ev-cards">' +
     card("Rule conformance",
-         rec.rate != null ? (100 * rec.rate).toFixed(1) + "%" : "—",
+         live.rate != null ? (100 * live.rate).toFixed(1) + "%"
+           : (rec.rate != null ? (100 * rec.rate).toFixed(1) + "%" : "—"),
          "followed the money rules",
-         '<div class="ev-card-note">' + evEsc(rec.rate_with_ci || "") + '</div>',
+         '<div class="ev-card-note">' + evEsc(rec.rate_with_ci || "") +
+         (live.rate != null
+           ? '<br><span class="ev-live">recomputed on this request &mdash; ' +
+             live.conformant + '/' + live.decisions + ', rules only, no LLM</span>'
+           : "") + '</div>',
          !rec.gateable) +
     card("Red team", held + " / " + caught + " / " + leaked,
          "held · caught by a rail · reached a customer", bar,
@@ -2525,8 +2640,10 @@ function evMoneyChart(cf) {
 }
 
 /* ── block 4: our own failures, named ── */
-function evViolations(rec) {
-  const ex = rec.examples || [];
+function evViolations(rec, live) {
+  live = live || {};
+  const ex = (live.examples && live.examples.length) ? live.examples
+             : (rec.examples || []);
   const byRule = rec.violations_by_rule || {};
   const ruleLine = Object.keys(byRule).map(k =>
     evEsc(k) + " ×" + byRule[k]).join(", ");
@@ -3062,6 +3179,212 @@ setInterval(function () {
     badge.style.display = d.total_cases ? "" : "none";
   }).catch(function () {});
 }, 15000);
+/* ── the batch engine window ─────────────────────────────────────────
+   Renders the append-only audit log, incrementally by event id. The panel is
+   deliberately not a narration layer: if a line is on screen, a row exists in
+   a table that refuses UPDATE and DELETE. */
+
+let engineCursor = 0, engineTimer = null, engineHot = 0;
+
+function engineLine(e) {
+  const pid = e.payment_id ? '<span class="pid">' + esc(e.payment_id) + '</span> ' : "";
+  const pay = e.payload || {};
+  const rupees = (e.amount_paise || 0) / 100;
+  const money = rupees ? "INR " + rupees.toLocaleString("en-IN") : "";
+  switch (e.kind) {
+    case "batch_cycle.opened":
+      return ['k-frame', "cycle opened \u2014 " + (pay.cases || "?") + " open case(s)"];
+    case "batch_cycle.wave":
+      return ['k-frame', "wave " + pay.wave + " \u2014 acted " + (pay.acted || 0) +
+              ", held " + ((pay.skipped || 0) + (pay.deferred || 0)) +
+              ", to the agent " + (pay.exceptions || 0)];
+    case "batch_cycle.finished":
+      return ['k-frame', "cycle " + (e.result || "finished") +
+              (e.reason ? " \u2014 " + esc(e.reason) : "")];
+    case "batch_run.opened":
+      return ['k-frame', "run opened \u2014 " + esc(pay.batch_key || "") + ", " +
+              (pay.candidates || 0) + " candidate(s)" + (pay.dry_run ? " (preview)" : "")];
+    case "batch_run.planned": {
+      const d = pay.detail || {}; const prov = d.provenance || {};
+      const src = prov.source === "champion"
+        ? "from the champion's own session" : "policy default";
+      return [prov.source === "champion" ? 'k-ai' : 'k-frame',
+              "plan \u2014 " + esc(pay.tier || d.tier || "") + " band, " + src];
+    }
+    case "batch_run.finished": return ['k-frame', "run finished" +
+      (e.reason ? " \u2014 stopped: " + esc(e.reason) : "")];
+    case "batch_run.aborted": return ['k-stop', "run ABORTED \u2014 " + esc(e.reason || "")];
+    case "case.selected":
+      if (e.reason === "champion") {
+        return ['k-ai', pid + "chosen as champion \u2014 a full AI session decides for the bin"];
+      }
+      return ['k-ai', pid + esc(e.reason || "selected")];
+    case "action.result": {
+      if (e.action === "agent_session") {
+        return ['k-ai', pid + "agent session finished \u2014 " + esc(e.result || "ok")];
+      }
+      let what = esc(e.action || "acted");
+      if (e.action === "link_and_notify") { what = "link created " + money + " + email sent"; }
+      if (e.action === "notify_only") { what = "reminder email sent"; }
+      if (e.action === "retry") { what = "quiet retry scheduled"; }
+      return ['', pid + what];
+    }
+    case "case.skipped":
+      return ['k-hold', pid + "held \u2014 " + esc((e.reason || "").split(":")[0])];
+    case "case.exception":
+      return ['k-ai', pid + "to the agent's desk \u2014 " + esc(e.reason || "")];
+    case "budget.exhausted":
+      return ['k-stop', pid + "budget spent \u2014 " + esc(e.reason || "")];
+    case "money.recovered":
+      return ['k-money', pid + money + " recovered \u2014 gateway confirmed"];
+    case "case.labeled":
+      return ['k-frame', pid + "verdict: " + esc(e.reason || e.result || "") +
+              (pay.rebins_to ? " \u2192 " + esc(pay.rebins_to) : "")];
+    case "escalation.raised":
+      return ['k-hold', pid + "escalated to a person \u2014 " + esc(e.reason || "")];
+    case "action.attempted":
+      return null;                 /* the result line says it better */
+    default:
+      return ['', pid + esc(e.kind) + (e.reason ? " \u2014 " + esc(e.reason) : "")];
+  }
+}
+
+/* The rendered log is cached in the browser so a hard refresh restores it
+   INSTANTLY — before the first poll returns — instead of flashing the empty
+   state. The server backfill (since=0 returns the recent tail) is still the
+   source of truth: the first poll replaces the cache with it, identical when
+   nothing has changed. */
+const ENGINE_CACHE_KEY = "engineFeedCacheV1";
+
+function engineEmptyHtml() {
+  return '<div class="engine-empty">Nothing has run yet. Preview or run a ' +
+    'batch and every decision will land here as it is written to the log.</div>';
+}
+function saveEngineCache(feed) {
+  try { localStorage.setItem(ENGINE_CACHE_KEY, feed.innerHTML); } catch (e) {}
+}
+function restoreEngineCache() {
+  try {
+    const feed = document.getElementById("engine-feed");
+    const cached = localStorage.getItem(ENGINE_CACHE_KEY);
+    if (feed && cached) { feed.innerHTML = cached; }
+  } catch (e) {}
+}
+
+function pollEngine() {
+  fetch("/api/batch-activity?since=" + engineCursor).then(r => r.json())
+    .then(function (d) {
+      const feed = document.getElementById("engine-feed");
+      const dot = document.getElementById("engine-dot");
+      if (feed) {
+        if (dot) { dot.className = "dot" + (d.live ? " live" : ""); }
+        /* since=0 means a fresh load: the response IS the whole recent tail, so
+           replace what is on screen (the restored cache, or stale lines) with
+           it rather than appending — otherwise every refresh doubles the log. */
+        const isInitial = (engineCursor === 0);
+        if (isInitial) {
+          feed.querySelectorAll(".ln").forEach(function (n) { n.remove(); });
+        }
+        if (d.events.length) {
+          const empty = feed.querySelector(".engine-empty");
+          if (empty) { empty.remove(); }
+          const stick = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 24;
+          for (const e of d.events) {
+            const line = engineLine(e);
+            if (!line) { continue; }
+            const div = document.createElement("div");
+            div.className = "ln " + line[0];
+            div.innerHTML = '<span class="ts">' +
+              esc((e.created_at || "").slice(11, 19)) + '</span>' + line[1];
+            feed.appendChild(div);
+          }
+          while (feed.children.length > 120) { feed.removeChild(feed.firstChild); }
+          if (stick) { feed.scrollTop = feed.scrollHeight; }
+          engineCursor = d.cursor;
+          engineHot = 6;                       /* stay quick for ~15s after news */
+          loadVerdicts();
+        } else if (isInitial && !feed.querySelector(".ln")
+                   && !feed.querySelector(".engine-empty")) {
+          feed.innerHTML = engineEmptyHtml();  /* genuinely nothing logged yet */
+        }
+        saveEngineCache(feed);
+      }
+      clearTimeout(engineTimer);
+      const quick = d.live || engineHot > 0;
+      if (engineHot > 0) { engineHot--; }
+      engineTimer = setTimeout(pollEngine, quick ? 2500 : 9000);
+    }).catch(function () {
+      clearTimeout(engineTimer);
+      engineTimer = setTimeout(pollEngine, 9000);
+    });
+}
+
+/* ── the verdict queue ───────────────────────────────────────────────── */
+
+let labelChoices = null;
+
+function loadVerdicts() {
+  const holder = document.getElementById("verdict-list");
+  if (!holder) { return; }
+  const ready = labelChoices ? Promise.resolve(labelChoices)
+    : fetch("/api/labels").then(r => r.json()).then(d => (labelChoices = d.labels));
+  Promise.all([ready, fetch("/api/batch-verdicts").then(r => r.json())])
+    .then(function (both) {
+      const verdicts = both[1].verdicts || [];
+      if (!verdicts.length) {
+        holder.innerHTML = '<div class="engine-empty">Nothing waiting. Cases ' +
+          'a run acted on that stay unpaid appear here for a human\u2019s ' +
+          'why \u2014 paid cases verdict themselves.</div>';
+        return;
+      }
+      holder.innerHTML = verdicts.map(function (v) {
+        const opts = ['<option value="">why didn\u2019t it land?</option>']
+          .concat(labelChoices.map(l =>
+            '<option value="' + esc(l.code) + '">' + esc(l.label) + '</option>'));
+        return '<div class="verdict-row" id="vr-' + esc(v.payment_id) + '">' +
+          '<div class="v-top"><span class="pid">' + esc(v.payment_id) + '</span>' +
+          '<span class="amt">INR ' + Number(v.amount).toLocaleString("en-IN") + '</span></div>' +
+          (v.last_action ? '<div class="v-last">last: ' + esc(v.last_action) + '</div>' : '') +
+          '<select onchange="verdictPick(\'' + esc(v.payment_id) + '\', this)">' +
+          opts.join("") + '</select>' +
+          '<input type="text" placeholder="note (what did they say?)" ' +
+          'style="display:none" id="vn-' + esc(v.payment_id) + '">' +
+          '<button class="v-save" onclick="saveVerdict(\'' + esc(v.payment_id) +
+          '\', this)">Save verdict</button></div>';
+      }).join("");
+    }).catch(function () {});
+}
+
+function verdictPick(pid, sel) {
+  const spec = (labelChoices || []).find(l => l.code === sel.value);
+  const note = document.getElementById("vn-" + pid);
+  if (note) { note.style.display = (spec && spec.wants_note) ? "" : "none"; }
+}
+
+function saveVerdict(pid, btn) {
+  const row = document.getElementById("vr-" + pid);
+  const code = row.querySelector("select").value;
+  if (!code) { return; }
+  const note = (document.getElementById("vn-" + pid) || {}).value || "";
+  btn.disabled = true;
+  fetch("/api/cases/" + pid + "/label", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({code: code, note: note})})
+    .then(r => r.json()).then(function (d) {
+      if (d.error) {
+        btn.disabled = false; btn.textContent = d.error.slice(0, 40); return;
+      }
+      row.innerHTML = '<div class="v-done">verdict saved \u2014 ' +
+        (d.rebins_to ? "re-binned to " + esc(d.rebins_to)
+                     : "handled") + '</div>';
+      setTimeout(function () { row.remove(); loadVerdicts(); }, 1600);
+      loadBatches();
+    }).catch(function () { btn.disabled = false; });
+}
+
+restoreEngineCache();
+pollEngine();
+loadVerdicts();
 loadBatches();
 
 </script>
@@ -3100,6 +3423,25 @@ loadBatches();
         touches go to the agent, not to a louder inbox</span>
     </div>
     <div class="wave-desk" id="wave-desk" style="display:none"></div>
+    <div class="engine-wrap">
+      <div class="engine-panel">
+        <div class="engine-head"><span class="dot" id="engine-dot"></span>
+          batch engine &mdash; every line is the append-only audit log</div>
+        <div class="engine-feed" id="engine-feed">
+          <div class="engine-empty">Nothing has run yet. Preview or run a
+            batch and every decision will land here as it is written to the
+            log.</div>
+        </div>
+      </div>
+      <div class="engine-panel">
+        <div class="engine-head">needs a verdict &mdash; why didn't it land?</div>
+        <div class="verdict-list" id="verdict-list">
+          <div class="engine-empty">Cases a run acted on that stay unpaid
+            appear here. Paid cases verdict themselves &mdash; only the
+            gateway marks money recovered.</div>
+        </div>
+      </div>
+    </div>
     <div class="batch-grid" id="batch-grid"></div>
     <div class="batch-quiet" id="batch-quiet" style="display:none"></div>
   </section>

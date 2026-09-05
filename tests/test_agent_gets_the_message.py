@@ -20,7 +20,7 @@ import json
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from recovery_agent.agent.graph import should_continue
+from recovery_agent.agent.graph import should_continue, MAX_TURNS_PER_RUN as CAP
 from recovery_agent.agent.governance import get_allowed_tools
 from recovery_agent.agent.tools import TOOLS_BY_NAME
 
@@ -45,7 +45,7 @@ def run_of(turns, *pending):
 
 def test_the_cap_lets_a_decided_action_finish():
     """The cap exists to stop a runaway loop, not to discard a conclusion."""
-    out = should_continue(run_of(8, "send_recovery_notification"))
+    out = should_continue(run_of(CAP, "send_recovery_notification"))
     assert out == "tool_repetition_guard", \
         "the agent had decided to send; the cap must not eat it"
 
@@ -53,23 +53,23 @@ def test_the_cap_lets_a_decided_action_finish():
 def test_every_finishing_action_gets_the_grace():
     for tool in ("send_recovery_notification", "show_page_offer", "retry_in_hours",
                  "escalate_to_human", "close_case", "wait_for_customer"):
-        assert should_continue(run_of(8, tool)) == "tool_repetition_guard", tool
+        assert should_continue(run_of(CAP, tool)) == "tool_repetition_guard", tool
 
 
 def test_more_exploring_at_the_cap_still_stops():
     """A diagnostic call is not a conclusion — it is the loop the cap is for."""
-    assert should_continue(run_of(8, "check_payment_status")) == "stopping_check"
-    assert should_continue(run_of(8, "get_customer_payment_history")) == "stopping_check"
+    assert should_continue(run_of(CAP, "check_payment_status")) == "stopping_check"
+    assert should_continue(run_of(CAP, "get_customer_payment_history")) == "stopping_check"
 
 
 def test_the_grace_is_granted_exactly_once():
     """Otherwise the escape hatch becomes the loop."""
-    assert should_continue(run_of(9, "send_recovery_notification")) == "stopping_check"
+    assert should_continue(run_of(CAP + 1, "send_recovery_notification")) == "stopping_check"
 
 
 def test_a_mixed_batch_does_not_buy_extra_turns():
     assert should_continue(
-        run_of(8, "send_recovery_notification", "check_payment_status")) \
+        run_of(CAP, "send_recovery_notification", "check_payment_status")) \
         == "stopping_check"
 
 

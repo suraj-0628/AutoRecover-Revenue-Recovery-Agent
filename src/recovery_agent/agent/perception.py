@@ -106,7 +106,18 @@ def ground_truth(payment_id: str, verify: bool = False) -> dict:
     if kind in ("method", "funds", "transient", "dropoff", "risk"):
         facts["failure_kind"] = kind
     facts["failure_code"] = rec.get("failure_code") or ""
+    facts["drop_reason"] = rec.get("drop_reason") or {}
     facts["refusals"] = rec.get("refusals") or {}
+
+    # Is the customer looking at the checkout RIGHT NOW? It changes the best
+    # channel: an in-page top-bar reaches someone who is present, an email
+    # reaches someone who has left. Without this fact the agent defaulted to
+    # email even while the customer sat on the page it could have pushed to.
+    try:
+        from recovery_agent import presence
+        facts["customer_on_page"] = presence.is_live(payment_id)
+    except Exception:
+        facts["customer_on_page"] = False
 
     try:
         from recovery_agent.agent import ladder
@@ -121,9 +132,27 @@ def ground_truth(payment_id: str, verify: bool = False) -> dict:
         # that belongs to a different failure.
         facts["ladder_rungs"] = [k for k, _ in ladder.rungs_for(rec)]
         facts["retry_pending"] = ladder.retry_pending(rec)
+        facts["abandoned_after_failure"] = ladder.abandoned_after_failure(rec)
         facts["ladder_exhausted"] = ladder.exhausted(rec)
         facts["unavailable"] = [f"{u['rung']} ({u['why_not']})"
                                 for u in st["unavailable"]]
+        # How long ago the last rung was climbed. Without this the briefing
+        # could only say WHAT had been tried, and "already tried" thirty
+        # seconds after an email reads as "already failed" — a belief that
+        # walks the agent up further rungs while the customer is still
+        # holding the link it just sent (pay_gyx5fd5dv).
+        from datetime import datetime, timezone
+        stamps = []
+        for v in (rec.get("ladder") or {}).values():
+            try:
+                stamps.append(datetime.fromisoformat(str(v.get("at"))))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if stamps:
+            latest = max(s if s.tzinfo else s.replace(tzinfo=timezone.utc)
+                         for s in stamps)
+            age = (datetime.now(timezone.utc) - latest).total_seconds() / 60
+            facts["minutes_since_last_rung"] = round(max(0.0, age), 1)
     except Exception:
         pass
 
@@ -215,7 +244,9 @@ def as_briefing(facts: dict) -> str:
             f"{facts.get('captured_payment_id') or 'a confirmed payment'}.\n"
             "  This case is SETTLED. There is nothing left to recover. Any further "
             "message, offer, link or call would reach a customer who has already "
-            "paid you. Record what worked with manage_memory, then stop."
+            "paid you. Record what worked with manage_memory, then close the case "
+            "with close_case, outcome 'recovered'. Only then stop — a settled case "
+            "that is never closed stays open on every ledger that reads it."
         )
     elif facts.get("escalated"):
         head = (
@@ -237,7 +268,54 @@ def as_briefing(facts: dict) -> str:
             head += f"\n  Already climbed: {', '.join(facts['climbed'])}"
         if facts.get("actions_tried"):
             head += (f"\n  Already tried: {', '.join(facts['actions_tried'])}"
-                     f"\n  Do not repeat any of those — they did not work.")
+                     f"\n  Do not repeat any of those — a repeat is not a new "
+                     f"attempt.")
+            age = facts.get("minutes_since_last_rung")
+            if age is not None and age < 30:
+                head += (f"\n  The latest of them was ~{max(1, round(age))} "
+                         f"minute(s) ago — it has NOT failed, it has not had "
+                         f"time to work. The ball is with the customer: give "
+                         f"it time (wait_for_customer) before reaching for "
+                         f"another rung.")
+        if facts.get("drop_reason"):
+            try:
+                from recovery_agent.drop_reasons import briefing_line
+                head += "\n  " + briefing_line(facts["drop_reason"])
+            except Exception:
+                pass
+        elif facts.get("abandoned_after_failure"):
+            head += ("\n  THEY FAILED, THEN WALKED. This customer was declined, "
+                     "had the other payment methods in front of them on the "
+                     "checkout, and closed it anyway. That is different from a "
+                     "customer still trying (the rail is the problem) and "
+                     "different from one who never got that far (nothing "
+                     "broke). Their reluctance is demonstrated, so a discount "
+                     "is a fair lever here — you do not have to prove full "
+                     "price fails first. Give them a reason before you give "
+                     "them another route.")
+        if facts.get("customer_on_page"):
+            head += ("\n  THE CUSTOMER IS ON THE CHECKOUT PAGE RIGHT NOW. Lead "
+                     "with the in-page top-bar, not the inbox: once you have "
+                     "the payment link, show it on the page with show_page_offer "
+                     "— pass the FULL amount for a rail switch, or the authorised "
+                     "discounted amount for an offer — AND also send it with "
+                     "send_recovery_notification as the copy they keep if they "
+                     "leave. The banner reaches them where they are; the email "
+                     "is the backup. When they have left, email alone is right.")
+        if (nxt == "alternate_path"
+                and facts.get("failure_kind") == "method"
+                and not facts.get("retry_pending")):
+            head += ("\n  THE RAILS HAVE BEEN TRIED AND THE INSTRUMENT KEEPS "
+                     "FAILING. A new link or another banner cannot fix a refused "
+                     "instrument — do not send one, and do not discount it "
+                     "(price is not the problem). The different route now is "
+                     "TIME: schedule a retry with retry_in_hours (24h is "
+                     "reasonable) so the bank issue can clear. That hands the "
+                     "case to the batch, which reworks it when the retry fires. "
+                     "A short note by email that you will retry is fine — it "
+                     "reuses the link already sent, do NOT mint a new one — then "
+                     "call wait_for_customer. Do not loop on wait without "
+                     "scheduling the retry first.")
         if facts.get("retry_pending"):
             head += ("\n  A retry is ALREADY SCHEDULED and has not fired yet. "
                      "That is the most likely thing to recover this, so the "
@@ -249,6 +327,13 @@ def as_briefing(facts: dict) -> str:
                  "this case now.")
 
     kind = facts.get("failure_kind")
+    # The failure KIND still describes what broke, but once the customer has
+    # walked away from it the advice that follows from it is superseded. Left
+    # unconditional the briefing contradicted itself in consecutive lines —
+    # "a discount is a fair lever here" and then "a discount does not address
+    # what went wrong" — which is worse than either instruction alone.
+    if facts.get("abandoned_after_failure") and kind in ("method", "unknown"):
+        kind = None
     if kind == "transient":
         head += (
             "\n  This did NOT fail on the customer's side. The gateway or the "

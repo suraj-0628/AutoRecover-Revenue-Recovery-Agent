@@ -97,16 +97,23 @@ def run_recorded(state_dir: str, limit: int | None) -> dict:
                              "turn": d.get("turn"),
                              "chosen": [c.get("name") for c in d.get("chosen") or []],
                              "rules": sorted({v.rule for v in bad})})
-    return {
+    from recovery_agent.evals import quality
+    # Stamped with its own credibility: the corpus it ran over, the unit that
+    # actually supports the rate (cases, not turns), and which parts of the
+    # policy that corpus can never see. Without this the headline read 92.9%
+    # over "28 decisions" that were 28 turns from 4 cases, with `method` and
+    # `funds` entirely absent — a number nothing in the report contradicted.
+    return quality.stamp({
         "decisions": len(decisions),
         "conformant": conformant,
         "violations": len(decisions) - conformant,
         "conformance_rate": round(conformant / len(decisions), 3),
+        "rate_with_ci": quality.describe_rate(conformant, len(decisions)),
         "violations_by_rule": dict(sorted(by_rule.items(),
                                           key=lambda kv: -kv[1])),
         "examples": examples,
         "state_dir": state_dir,
-    }
+    }, decisions)
 
 
 def run_replay(state_dir: str, k: int, limit: int, model: str | None) -> dict:
@@ -280,14 +287,48 @@ def _load_json(path: Path) -> dict:
 
 def write_scorecard(new_modes: dict) -> dict:
     """Merge freshly-run modes over the previous scorecard, so a recorded-only
-    run does not erase the last red-team results."""
+    run does not erase the last red-team results.
+
+    Each mode is stamped with WHEN it ran. Merging forward without that is how
+    a red-team score measured before a prompt rewrite ends up approving the
+    rewrite: the card carried one timestamp, every mode inherited it, and a
+    week-old number looked as fresh as the one just computed.
+    """
+    from recovery_agent.evals import quality
+
     card = _load_json(RESULTS_PATH)
     modes = card.get("modes") or {}
-    modes.update(new_modes)
+    modes.update({k: quality.stamp(v) if "ran_at" not in v else v
+                  for k, v in new_modes.items()})
     card = {"ran_at": datetime.now(timezone.utc).isoformat(), "modes": modes}
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESULTS_PATH.write_text(json.dumps(card, indent=2))
     return card
+
+
+def baseline_objections(card: dict) -> list[str]:
+    """Why this scorecard should not become the baseline.
+
+    Freezing an under-powered corpus is worse than not freezing: every later
+    run compares itself to a number nobody could defend, and the comparison
+    inherits the false confidence permanently. Written as objections rather
+    than a hard stop — an operator who has read them can still proceed.
+    """
+    rec = (card.get("modes") or {}).get("recorded") or {}
+    unit, cov = rec.get("unit") or {}, rec.get("coverage") or {}
+    out = []
+    n = unit.get("effective_n")
+    if isinstance(n, int) and n < quality_min_cases():
+        out.append(f"only {n} independent cases (want {quality_min_cases()}+) — "
+                   f"a rate over {n} moves {100 / max(n, 1):.0f} points per case")
+    for blind in cov.get("blind_spots") or []:
+        out.append(blind)
+    return out
+
+
+def quality_min_cases() -> int:
+    from recovery_agent.evals import quality
+    return quality.MIN_CASES_TO_GATE
 
 
 def check_against_baseline(card: dict) -> tuple[list[str], list[str]]:
@@ -299,6 +340,8 @@ def check_against_baseline(card: dict) -> tuple[list[str], list[str]]:
     code regression — so growth demotes the comparison to an advisory that
     says to look, and to re-freeze deliberately.
     """
+    from recovery_agent.evals import quality
+
     baseline = _load_json(BASELINE_PATH)
     if not baseline:
         return [], []
@@ -310,6 +353,18 @@ def check_against_baseline(card: dict) -> tuple[list[str], list[str]]:
         cur_mode = (card.get("modes") or {}).get(mode, {})
         cur = cur_mode.get(metric)
         if base is None or cur is None or cur_mode.get("inconclusive") not in (None, 0):
+            continue
+
+        # A score only gets to fail a build if it can be defended: measured
+        # recently, over enough independent cases to tell a regression from
+        # noise. Anything else is reported loudly and gates nothing — a green
+        # build bought with a stale or underpowered number is worse than no
+        # gate, because it is believed.
+        verdict = quality.gateability(mode, cur_mode)
+        if not verdict["gateable"]:
+            advisories.append(
+                f"{mode}.{metric} = {cur} NOT GATED — "
+                + "; ".join(verdict["reasons"]))
             continue
         if (mode == "recorded"
                 and cur_mode.get("decisions") != base_mode.get("decisions")):
@@ -326,6 +381,68 @@ def check_against_baseline(card: dict) -> tuple[list[str], list[str]]:
     return regressions, advisories
 
 
+def check_credibility(card: dict) -> list[str]:
+    """Regressions in the evals' own ABILITY TO VERIFY, not in the agent.
+
+    Three ways a change quietly blinds the suite, all of which look like a
+    green build: the corpus loses cases, it stops covering a failure family,
+    or a metric that used to be defendable stops being one. Each is a real
+    regression — the code may be fine and you would no longer know.
+
+    Deliberately a ratchet rather than a threshold: the current corpus cannot
+    meet an absolute bar (7 cases, no `funds` family), and blocking every
+    build until it does would just get the gate switched off. What it can do
+    is refuse to go backwards.
+    """
+    from recovery_agent.evals import quality
+
+    base = _load_json(BASELINE_PATH).get("modes") or {}
+    cur = (card.get("modes") or {})
+    out: list[str] = []
+
+    b_unit = (base.get("recorded") or {}).get("unit") or {}
+    c_unit = (cur.get("recorded") or {}).get("unit") or {}
+    b_n, c_n = b_unit.get("effective_n"), c_unit.get("effective_n")
+    if isinstance(b_n, int) and isinstance(c_n, int) and c_n < b_n:
+        out.append(f"corpus SHRANK: {b_n} -> {c_n} independent cases — the "
+                   f"suite can see less than it could before")
+
+    # Absence of baseline data is NOT evidence that things used to be better.
+    # A baseline frozen before coverage was recorded has no `coverage` key, and
+    # treating that as "everything was covered" invented a regression on the
+    # very first real run — which is how a gate earns a reputation for crying
+    # wolf and gets switched off.
+    b_cov = (base.get("recorded") or {}).get("coverage")
+    c_cov = (cur.get("recorded") or {}).get("coverage") or {}
+    lost = (set(c_cov.get("missing_kinds") or [])
+            - set((b_cov or {}).get("missing_kinds") or [])) if b_cov else set()
+    if lost:
+        out.append(f"policy coverage LOST: {sorted(lost)} no longer exercised "
+                   f"by any case in the corpus")
+
+    b_gate = {m for m, _x, _s in _GUARDED_METRICS
+              if quality.gateability(m, base.get(m) or {})["gateable"]}
+    c_gate = {m for m, _x, _s in _GUARDED_METRICS
+              if quality.gateability(m, cur.get(m) or {})["gateable"]}
+    for mode in sorted(b_gate - c_gate):
+        out.append(f"{mode} was defendable at the last freeze and is not now — "
+                   f"re-run it rather than shipping past it")
+    return out
+
+
+def _gated_metric_count(card: dict) -> int:
+    """How many metrics actually had the standing to fail this build."""
+    from recovery_agent.evals import quality
+    n = 0
+    for mode, metric, _slack in _GUARDED_METRICS:
+        cur = (card.get("modes") or {}).get(mode, {})
+        if cur.get(metric) is None:
+            continue
+        if quality.gateability(mode, cur)["gateable"]:
+            n += 1
+    return n
+
+
 def render_report(card: dict) -> None:
     modes = card.get("modes") or {}
     lines = [
@@ -338,6 +455,42 @@ def render_report(card: dict) -> None:
         "vs `evals/baseline.json`.",
         "",
     ]
+    # Credibility before results. A reader who sees 92.9% first has already
+    # formed a belief by the time they reach the sample size.
+    from recovery_agent.evals import quality
+    rec0 = modes.get("recorded") or {}
+    unit, cov = rec0.get("unit") or {}, rec0.get("coverage") or {}
+    if unit or cov:
+        lines += ["## How much these numbers are worth", ""]
+        if unit:
+            lines.append(
+                f"- Corpus is **{unit.get('turns')} turns across "
+                f"{unit.get('cases')} cases** ({unit.get('turns_per_case')} per "
+                f"case; the largest single case supplies "
+                f"{100 * unit.get('largest_case_share', 0):.0f}% of them). Turns "
+                f"within a case are correlated, so **the unit that supports a "
+                f"rate is the case: n={unit.get('effective_n')}**.")
+        if cov:
+            lines.append(
+                f"- Policy coverage: **{cov.get('covered')}/{cov.get('of')} "
+                f"failure families**. Cases by kind: "
+                f"`{cov.get('cases_by_kind')}`.")
+            for blind in cov.get("blind_spots") or []:
+                lines.append(f"  - **BLIND SPOT** — {blind}")
+        gated = _gated_metric_count(card)
+        lines.append(
+            f"- **{gated} of {len(_GUARDED_METRICS)} metrics are currently "
+            f"defendable enough to fail a build.** The rest are reported and "
+            f"explicitly not gated — a green build bought with a stale or "
+            f"underpowered number is worse than no gate, because it is "
+            f"believed.")
+        for mode, metric, _s in _GUARDED_METRICS:
+            v = quality.gateability(mode, modes.get(mode) or {})
+            if not v["gateable"] and (modes.get(mode) or {}).get(metric) is not None:
+                lines.append(f"  - `{mode}.{metric}` not gated — "
+                             + "; ".join(v["reasons"]))
+        lines.append("")
+
     rec = modes.get("recorded")
     if rec:
         lines += ["## Recorded decisions (live corpus, no LLM)", ""]
@@ -404,6 +557,21 @@ def render_report(card: dict) -> None:
                     f"{row.get('signal_hits_with')}× with memory"
                     + (" (memory used)" if row.get("memory_used") else ""))
         lines.append("")
+
+    # The counterfactual belongs IN the report, not beside it. A conformance
+    # number on its own says the agent followed the rules; it does not say the
+    # agent was worth having. Replaying scripted policies through the same
+    # decision points is the cheapest honest answer to "versus what?".
+    try:
+        from recovery_agent.evals.counterfactual import compare, render
+        cf = compare()
+        lines += ["", render(cf), ""]
+        card.setdefault("modes", {})["counterfactual"] = cf
+        (RESULTS_PATH.parent / "counterfactual.json").write_text(
+            json.dumps(cf, indent=2))
+    except Exception as exc:                     # never block the report
+        lines += ["", f"_Counterfactual unavailable: {exc}_", ""]
+
     REPORT_PATH.write_text("\n".join(lines) + "\n")
 
 
@@ -452,6 +620,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[evals] report    -> {REPORT_PATH}")
 
     if args.write_baseline:
+        # Freezing an under-powered corpus is worse than not freezing: every
+        # later run then compares itself to a number nobody could defend, and
+        # inherits that false confidence permanently. Objections are printed
+        # and the freeze proceeds — the operator gets to decide, but not to
+        # do it unaware.
+        for objection in baseline_objections(card):
+            print(f"[evals] BASELINE CAVEAT: {objection}")
         BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
         BASELINE_PATH.write_text(json.dumps(card, indent=2))
         print(f"[evals] baseline  -> {BASELINE_PATH}")
@@ -465,7 +640,29 @@ def main(argv: list[str] | None = None) -> int:
             for r in regressions:
                 print(f"  - {r}")
             return 1
-        print("[evals] no regressions against baseline")
+        # THE RATCHET. A blanket "allow unverified" flag is a free pass: it
+        # lets the suite's ability to verify decay to nothing while every
+        # build stays green. So credibility itself is gated. You may ship
+        # while under-powered — you may not ship a change that makes the
+        # evals LESS able to catch you.
+        for line in check_credibility(card):
+            regressions.append(line)
+        if regressions:
+            print("[evals] REGRESSIONS:")
+            for r in regressions:
+                print(f"  - {r}")
+            return 1
+
+        gated = _gated_metric_count(card)
+        if gated == 0:
+            # A suite that gates nothing did not verify anything. Reporting
+            # that as "no regressions" is the most expensive lie an eval
+            # system can tell, because it is believed and acted on.
+            print("[evals] NOT VERIFIED: no metric was defendable enough to "
+                  "gate on (see advisories above). The build is unverified, "
+                  "not proven good.")
+            return 0 if os.getenv("EVALS_ALLOW_UNVERIFIED") else 1
+        print(f"[evals] no regressions against baseline ({gated} metric(s) gated)")
     return 0
 
 

@@ -239,9 +239,19 @@ def precheck(record: dict, plan: BatchPlan, *, run_id: str,
     if barred:
         return d(SKIPPED, f"pursuit_barred: {barred}")
 
-    # 5. A case in another live run.
-    if record.get("batch_run_id") and record.get("batch_run_id") != run_id:
-        return d(SKIPPED, "already_in_a_run")
+    # 5. A case in another run that is STILL GOING. Two live runs on one case
+    #    would double-contact; a finished run releases the case — a later wave
+    #    legitimately touches it again, and what stops a repeat contact then is
+    #    the ladder, which never repeats a rung. A stamp from a run this
+    #    process no longer knows (a restart) is treated as released too, for
+    #    the same reason: the ladder is the durable guard, the stamp is only
+    #    the concurrency guard.
+    other = str(record.get("batch_run_id") or "")
+    if other and other != run_id:
+        from recovery_agent.batch import run as batch_run_mod
+        live = batch_run_mod.get(other)
+        if live is not None and live.status == batch_run_mod.OPEN:
+            return d(SKIPPED, "already_in_a_run")
 
     # 6. Reachable at all?
     customer = record.get("customer") or {}

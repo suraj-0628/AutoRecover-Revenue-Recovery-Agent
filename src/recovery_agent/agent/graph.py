@@ -489,6 +489,43 @@ MAX_TOOL_CONTENT = 500  # chars per tool result shown to the LLM
 _NEVER_TRIM_TOOLS = frozenset({"check_payment_status"})
 
 
+#: `wait_for_customer` ends its result with "Do not call any more tools." That
+#: is TRUE for the turn it was returned in, and false for every turn after —
+#: but it lives in the history forever, and it is the most recent, most
+#: concrete instruction the model can see.
+#:
+#: Live (pay_lohj3x6gt, INR 34,990): the customer paid the recovery link 15
+#: seconds after the offer email. The next turn ran with settled=True, the
+#: SETTLED_PROMPT telling it to store the lesson and close the case, and only
+#: four tools bound — and it called NOTHING, because the last concrete thing
+#: in its context said not to. Money banked, case left open.
+#:
+#: SETTLED_PROMPT already neutralises the stale "FOLLOW-UP" framing by name.
+#: This is the same defect one layer down: an instruction that expired is
+#: still being obeyed. Rewrite it into a statement of what happened, so the
+#: history reports the past instead of commanding the present.
+_EXPIRED_TURN_ORDER = "Do not call any more tools."
+_EXPIRED_TURN_REPLACEMENT = ("(That instruction applied to that turn only; "
+                             "it has since ended and you are running again.)")
+
+
+def _defuse_expired_instructions(messages: list) -> list:
+    """Turn-scoped orders in history become past-tense records."""
+    out = []
+    for msg in messages:
+        if (isinstance(msg, ToolMessage) and msg.content
+                and _EXPIRED_TURN_ORDER in str(msg.content)):
+            fixed = str(msg.content).replace(_EXPIRED_TURN_ORDER,
+                                             _EXPIRED_TURN_REPLACEMENT)
+            try:
+                msg = msg.model_copy(update={"content": fixed})
+            except AttributeError:
+                msg = ToolMessage(content=fixed, tool_call_id=msg.tool_call_id,
+                                  name=msg.name, id=msg.id)
+        out.append(msg)
+    return out
+
+
 def _trim_tool_results_for_llm(messages: list,
                                max_chars: int = MAX_TOOL_CONTENT) -> list:
     """Shorten large tool results for THIS LLM call only.
@@ -570,6 +607,22 @@ def _assemble_llm_messages(briefing: list, history: list,
     """
     head = [SystemMessage(content=SETTLED_PROMPT if settled else SYSTEM_PROMPT)]
     head += list(briefing)
+    if settled:
+        # A settled run is bookkeeping, not recovery: record the lesson,
+        # close the case. The recovery transcript is not context for that
+        # job — it is noise, and live (pay_xtog5tut1) it was echo fodder:
+        # handed the full settled context, the model answered by quoting the
+        # briefing back, zero tool calls, twice in a row. Keep only the
+        # newest hand-off (the last HumanMessage) and whatever this closing
+        # run has itself done since; the briefing above already carries the
+        # money facts, the ladder, and what was tried.
+        last_human = None
+        for i in range(len(history) - 1, -1, -1):
+            if isinstance(history[i], HumanMessage):
+                last_human = i
+                break
+        if last_human is not None:
+            return head + list(history[last_human:])
     if len(history) <= max_messages:
         return head + list(history)
 
@@ -629,7 +682,15 @@ def _build_model(tools: list | None = None, model_name: str | None = None):
         max_tokens=2048,
         cache=True,  # MANDATE 1: langchain_core.caches.InMemoryCache
     )
-    return model.bind_tools(tools or RECOVERY_TOOLS)
+    # One tool at a time, never a parallel batch. A tool result can change what
+    # the next call should be — the customer's payment history decides which
+    # rail to switch to, check_payment_status decides whether to act at all —
+    # and a parallel batch commits to the second call before the first has
+    # answered. Live (pay_fxvh8pdbi) the agent fired check_payment_status and
+    # get_customer_payment_history together; harmless there, but the same shape
+    # sends a link before the history that should have shaped it comes back.
+    # Sequential keeps the ReAct loop honestly forward-driven.
+    return model.bind_tools(tools or RECOVERY_TOOLS, parallel_tool_calls=False)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -919,8 +980,8 @@ def agent_node(state: RecoveryState, config: RunnableConfig) -> dict:
     # left the agent forbidden from working the ladder while still being told
     # to work it — which is how a paid case produced an invented follow-up and
     # then no action at all.
-    messages = _trim_tool_results_for_llm(
-        _assemble_llm_messages(briefing, state["messages"], settled=_settled))
+    messages = _defuse_expired_instructions(_trim_tool_results_for_llm(
+        _assemble_llm_messages(briefing, state["messages"], settled=_settled)))
 
     # One gate for every model call in the process. The old version was a
     # module attribute and a sleep: N concurrent sessions — a champion, a
@@ -1051,6 +1112,15 @@ def _build_tool_node(tools=None) -> ToolNode:
 # ROUTING — should_continue checks for tool_calls + stopping rules
 # ═══════════════════════════════════════════════════════════════
 
+#: Hard per-run turn cap. Raised from 8 when tool calls went sequential
+#: (parallel_tool_calls=False in _build_model): one call per turn means a case
+#: that used to fold check_payment_status and get_customer_payment_history into
+#: a single turn now spends a turn on each, so a full ladder climb takes a few
+#: more turns. Still only a runaway guard — a decided finishing action gets one
+#: grace round past it (see should_continue).
+MAX_TURNS_PER_RUN = 12
+
+
 def should_continue(state: RecoveryState) -> Literal["tool_repetition_guard", "stopping_check", "__end__"]:
     """Decide if we should continue the loop or stop.
 
@@ -1058,7 +1128,7 @@ def should_continue(state: RecoveryState) -> Literal["tool_repetition_guard", "s
     If the LLM returned a final response → check stopping rules before ending.
     MAX_TURNS: hard cap to prevent exceeding LLM context/proxy limits.
     """
-    MAX_TURNS = 8
+    MAX_TURNS = MAX_TURNS_PER_RUN
     messages = state["messages"]
     last_message = messages[-1]
 

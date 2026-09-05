@@ -25,11 +25,21 @@ ENV = pathlib.Path(__file__).resolve().parent.parent / ".env"
 PROVIDERS = {
     "proxy": {
         "LLM_BASE_URL": "http://localhost:20128/v1",
-        "LLM_MODEL": "no-think/antigravity/claude-sonnet-4-6",
-        # Empty: let graph._fallback_chain use its own capability-ordered list.
-        "LLM_FALLBACK_MODELS": "",
+        # Sonnet is the intended primary and is quota-exhausted upstream; a
+        # dead primary is not a free position, it is a wasted call on every
+        # turn. Leading with the best model that actually answers instead.
+        # On this suite's one measurable decision — what to do about
+        # insufficient funds — the pro model schedules a retry (right: they
+        # have no money yet) while every flash model emails a link (wrong:
+        # nobody can pay a link with an empty account). Put Sonnet back in
+        # front the moment its quota returns.
+        "LLM_MODEL": "antigravity/gemini-3.1-pro-high",
+        "LLM_FALLBACK_MODELS": ("antigravity/gemini-3.1-pro-low,"
+                                "antigravity/gemini-pro-agent,"
+                                "antigravity/gemini-3.6-flash-high,"
+                                "antigravity/gemini-2.5-flash"),
         "_key_from": None,          # the router holds the real credentials
-        "LLM_CALLS_PER_MINUTE": "7.5",
+        "LLM_CALLS_PER_MINUTE": "5",
     },
     "groq": {
         "LLM_BASE_URL": "https://api.groq.com/openai/v1",

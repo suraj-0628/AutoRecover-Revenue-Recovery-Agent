@@ -45,7 +45,7 @@ SETTINGS: list[dict[str, Any]] = [
     {
         "key": "max_contacts_24h", "env": "GUARDRAIL_MAX_CONTACTS_24H",
         "label": "Contacts per customer / 24h", "kind": "slider",
-        "min": 1, "max": 12, "step": 1, "default": 5, "group": "Contact",
+        "min": 1, "max": 30, "step": 1, "default": 5, "group": "Contact",
         "what": "How many emails, SMS and calls one customer may receive in a "
                 "rolling day. In-page notifications never count — the customer "
                 "is already on the page.",
@@ -53,6 +53,22 @@ SETTINGS: list[dict[str, Any]] = [
                "times in an evening (offer email, a call, the agreed link, a "
                "rail switch). Set below that and the cap blocks your own "
                "policy rather than spam.",
+    },
+    {
+        "key": "min_contact_gap_minutes", "env": "GUARDRAIL_MIN_CONTACT_GAP_MIN",
+        "label": "Minimum gap between contacts", "kind": "slider",
+        "min": 0, "max": 60, "step": 1, "default": 5, "group": "Contact",
+        "what": "How long the agent must leave a customer alone after "
+                "contacting them, before it may contact them again on the "
+                "same case.",
+        "why": "The daily cap counts contacts but says nothing about their "
+               "spacing, so a whole day's allowance can be spent in a minute. "
+               "Live (pay_qttkbl2b3): a 5% offer was emailed, the status was "
+               "checked forty seconds later, and because the money had not yet "
+               "arrived a second email went out at 20% -- two offers and two "
+               "links inside ninety seconds. Nobody decides on a payment that "
+               "fast, so the second one bought nothing the first had not "
+               "already bought. Set to 0 to disable.",
     },
     {
         "key": "quiet_enabled", "env": "", "label": "Quiet hours",

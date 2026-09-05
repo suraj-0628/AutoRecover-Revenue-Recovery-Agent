@@ -1,338 +1,258 @@
-# AutoRecover — Razorpay AI Revenue Recovery Agent
+# AutoRecover — AI Revenue Recovery Agent
 
-An autonomous AI agent that detects failed payments, diagnoses root causes via LLM reflection, and executes multi-channel recovery workflows — email, SMS, and AI voice calls via SuperU — using Razorpay APIs. Built for the Razorpay Buildathon with LangGraph, Gemini 2.5 Flash, custom safety guardrails, and a Razorpay Agent Studio-inspired Merchant Dashboard.
+An autonomous agent that turns **failed payments back into revenue**. When a payment fails, AutoRecover figures out *why* it failed, works the case the way a good operations person would — a different payment rail, a timed retry, a discount only when price is genuinely the problem — and stops when the money is in or a human is genuinely needed. It works one live payment in real time, and the **same agent** works a whole backlog in batches.
 
----
+Built for the **Razorpay AI Buildathon** — *AI Revenue Recovery* track.
 
-## 🎯 How It Works
+> **The track asks for:** *measured money recovered across a batch, with compliant escalation, stopping rules, and an audit trail.* AutoRecover has all five, and this README points at where each one lives.
 
-```
-Payment Fails → Webhook Sensing → LLM Diagnostic Reflection → Tier Assignment → Decline-Code Routing
-  → Guardrail Check → Knowledge Graph Routing → Channel Selection (Email / SMS / SuperU Voice Call)
-  → Razorpay SDK Tool Execution → Outcome Observation → Generative UI Morphing
-```
-
-### System Architecture
-
-```mermaid
-flowchart TB
-    %% External Entities
-    Razorpay((Razorpay Gateway))
-    Customer((Customer))
-    Merchant((Merchant Dashboard))
-    SuperU((SuperU AI\nVoice Agent))
-
-    %% Webhook Ingestion Subsystem
-    subgraph Ingestion ["Webhook Ingestion (Port 5000)"]
-        Listener[webhook.py]
-        HMAC{HMAC Verification}
-        Idempotency[(Idempotency Cache\n24h TTL)]
-        EventBus[Event Bus]
-    end
-
-    %% Active Daemon
-    subgraph Daemon ["Background Workers"]
-        Scheduler[Daemon Worker]
-        JobQueue[(Job Queue\nScheduled Retries)]
-    end
-
-    %% State Management
-    subgraph Storage ["Persistent State"]
-        MemStore[(CustomerMemoryStore\nJSON + FileLocks)]
-        VectorMem[(Vector Memory\nChromaDB + ONNX)]
-    end
-
-    %% Core Agent Engine
-    subgraph Agent ["Recovery Agent Engine"]
-        Graph{LangGraph ReAct Loop}
-        
-        Diagnosis[Diagnosis Engine\n3-Layer]
-        DeclineRouter[Decline Code Router\nPer-Code Strategies]
-        Guardrails[Safety Guardrails\n6-Policy Gate]
-        KGRouter[Knowledge Graph Router\nNetworkX + 6 API Rails]
-        StrategyMetrics[Strategy Metrics\nThompson Bandit]
-        
-        subgraph RAG ["Agentic RAG Engine"]
-            SubQ[Sub-Question Decomposer]
-            Triad[Triad Evaluator\nGroundedness Check]
-            ChromaDB[(ChromaDB Vector Store)]
-        end
-        
-        Tools[Tool Executor\n13 Razorpay Tools]
-        SDK[Razorpay SDK Client]
-    end
-
-    %% Communication Layer
-    subgraph Comms ["Multi-Channel Communication"]
-        NotifDispatch[Notification Dispatcher\nEmail + SMS]
-        VoiceAgent[SuperU Voice Client\nAI Phone Calls]
-        CommEngine[LLM Message Generator\nPersonalized Copy]
-    end
-
-    %% Frontend Subsystem
-    subgraph Frontend ["Frontend (Port 5001/5002)"]
-        DashboardUI[Agent Studio Dashboard\nRazorpay-Inspired UI]
-        CheckoutUI[Customer Checkout\nGenerative UI Morphing]
-        WebSockets((Socket.io\nReal-time Stream))
-    end
-
-    %% Observability
-    subgraph Observability ["Observability"]
-        Phoenix[Phoenix Tracing\nOpenTelemetry]
-        AuditLog[(JSONL Audit Log)]
-    end
-
-    %% Eval
-    subgraph Eval ["Adversarial Testing"]
-        ChaosGym[Chaos Gym\nRed Team Simulator]
-    end
-
-    %% --- Connections ---
-    Razorpay -- "payment.failed webhook" --> Listener
-    Listener --> HMAC
-    HMAC -- Valid --> Idempotency
-    Idempotency -- New Event --> EventBus
-    EventBus -- "Trigger Case" --> Graph
-    Graph <--> MemStore
-    Graph <--> VectorMem
-    Graph --> Diagnosis
-    Diagnosis --> DeclineRouter
-    Graph --> RAG
-    RAG --> ChromaDB
-    Graph --> KGRouter
-    Graph --> Guardrails
-    Guardrails -- "Policy Passed" --> Tools
-    Tools -- "Execute Action" --> SDK
-    Tools -- "Send Notification" --> NotifDispatch
-    Tools -- "Voice Recovery" --> VoiceAgent
-    VoiceAgent -- "AI Call" --> SuperU
-    SuperU -- "Call Outcome" --> Graph
-    Tools -- "Wait & Retry" --> JobQueue
-    Scheduler -- "Polls" --> JobQueue
-    Scheduler -- "Execute" --> SDK
-    SDK -- "API Call" --> Razorpay
-    Graph -- "Live Events" --> WebSockets
-    Graph --> Phoenix
-    WebSockets --> DashboardUI
-    WebSockets --> CheckoutUI
-    Customer <--> CheckoutUI
-    Merchant <--> DashboardUI
-    ChaosGym -. "Simulates Failures" .-> Ingestion
-
-    %% Styling
-    classDef external stroke:#888,stroke-width:2px,color:inherit;
-    classDef agent stroke:#03a9f4,stroke-width:2px,color:inherit;
-    classDef db stroke:#ff9800,stroke-width:2px,color:inherit;
-    classDef ui stroke:#9c27b0,stroke-width:2px,color:inherit;
-    classDef ingest stroke:#4caf50,stroke-width:2px,color:inherit;
-    classDef test stroke:#f44336,stroke-width:2px,color:inherit;
-    classDef comms stroke:#e91e63,stroke-width:2px,color:inherit;
-    classDef obs stroke:#607d8b,stroke-width:2px,color:inherit;
-
-    class Razorpay,Customer,Merchant,SuperU external;
-    class Graph,Diagnosis,DeclineRouter,Guardrails,KGRouter,StrategyMetrics,RAG,SubQ,Triad,Tools,SDK agent;
-    class MemStore,Idempotency,ChromaDB,JobQueue,VectorMem db;
-    class DashboardUI,CheckoutUI,WebSockets ui;
-    class Listener,HMAC,EventBus ingest;
-    class ChaosGym test;
-    class NotifDispatch,VoiceAgent,CommEngine comms;
-    class Phoenix,AuditLog obs;
-```
-
-### Three-Tier Recovery (Industry-Grade)
-
-```
-Payment fails
-  ├─ TIER 1: SILENT RECOVERY (Background — no customer contact)
-  │   ├─ Analyze decline code + 40+ signals
-  │   ├─ Schedule retry at optimal window (payday timing, bank health)
-  │   ├─ Customer stays active, unaware of failure
-  │   └─ Multiple silent retries before escalation
-  │
-  ├─ TIER 2: ACTIVE RECOVERY (Customer-facing — if Tier 1 exhausted)
-  │   ├─ Personalized email/SMS via LLM-generated messaging
-  │   ├─ Razorpay Payment Links for one-click recovery
-  │   └─ Copy adapts to specific decline reason + customer persona
-  │
-  └─ TIER 3: VOICE RECOVERY (AI Phone Call — high-value or unresponsive)
-      ├─ SuperU AI voice agent calls the customer directly
-      ├─ Natural conversation: identifies objection, offers alternatives
-      ├─ Sends Razorpay Payment Link during the call
-      └─ Customer can complete payment while on the phone
-```
-
-> **Why Voice?** Industry data shows email-only recovery converts 3-8%, email+SMS converts 8-15%, but adding AI voice calls pushes recovery to **25-40%**. This is the same stack Razorpay uses in production with SuperU.
-
-### Stopping Conditions
-- **Recovered** — Payment retried, payment link completed, or card expiry updated via Razorpay API.
-- **Escalated** — Handed off to human support when attempts or risk thresholds are reached.
-- **Max Attempts** — Agent stops after bounded attempts (separate limits for silent and active tiers).
-- **Abandoned** — Stopped when customer opts out or no viable recovery path exists.
+| The ask | Where it lives |
+|---|---|
+| **Measured money** | Gateway-verified capture per case, priced in ₹ — `economics.py`, the **Ops** view |
+| **Across a batch** | Re-binning **waves** over the whole backlog — `batch/waves.py`, the **Batch** view |
+| **Compliant escalation** | The agent *cannot* escalate until the ladder is exhausted — `agent/ladder.py`, `escalation_queue.py` |
+| **Stopping rules** | Every case ends recovered, escalated, or waiting on a retry — `agent/tools.py` (`close_case`, `wait_for_customer`), `agent/stopping.py` |
+| **Audit trail** | Append-only SQLite that refuses `UPDATE`/`DELETE` — `audit.py`, the **Batch engine** log |
 
 ---
 
-## 🔬 Official Razorpay Knowledge Base & Failure Normalizer
+## Quickstart
 
-The system embeds an official Razorpay API Error Knowledge Base (`src/recovery_agent/razorpay_knowledge_base.py`) built directly from Razorpay's official API Error documentation:
-
-- **Error Codes Catalog**: `BAD_REQUEST_PAYMENT_TEMPORARY_TECHNICAL_ISSUE`, `BAD_REQUEST_CARD_EXPIRED`, `BAD_REQUEST_PAYMENT_INSUFFICIENT_FUNDS`, `BAD_REQUEST_PAYMENT_DECLINED_BY_BANK`, `BAD_REQUEST_MANDATE_INACTIVE`, `BAD_REQUEST_CHECKOUT_ABANDONED`, `BAD_REQUEST_RISK_CHECK_FAILED`.
-- **Error Taxonomy**:
-  - `source`: `customer`, `business`, `gateway`, `razorpay`.
-  - `step`: `payment_initiation`, `payment_authentication`, `payment_authorization`, `payment_capture`.
-- **Payload Normalization**: Automatically normalizes customer-facing UI messages (e.g. *"Your payment could not be completed due to a temporary technical issue. To complete the payment, use another payment instrument."*) into full Razorpay API Failure Payloads.
-
----
-
-## 🖥️ Razorpay Agent Studio-Inspired Dashboard
-
-The Merchant Dashboard ([http://localhost:5002/merchant](http://localhost:5002/merchant)) is modeled directly after [Razorpay's Agent Studio](https://razorpay.com/agent-studio/):
-
-- **Dark Top Navigation Bar**: Razorpay-style navbar with product links (Ray AI, Payments, Banking+, Payroll), search, and avatar.
-- **Left Sidebar**: Full sidebar with sections — Main, Payment Products, Banking Products, Account & Settings. Agent Studio highlighted with `Beta` badge.
-- **Agent Hero Card**: Agent identity (avatar + name), health indicator with pulsing green dot, Disable/Open Store action buttons.
-- **Activity/Settings Tabs**: Clean tab bar with underline-style active indicator.
-- **Scenario Triggers**: One-click buttons to simulate failures — 504 Degradation, Cart Abandonment, Expired Card, Bank Decline, Voice Call, and a 30-case batch runner.
-- **Inline Metrics Bar**: 4 key metrics — Total, Recovered, Failed, Recovery Rate.
-- **Activity Feed**: Real-time timeline with colored status dots (blue = processing, green = recovered, red = failed), relative timestamps, and "Live" indicators for active recoveries.
-- **Case Detail Drawer**: Slide-out panel with payment info, status/tier badges, decline strategy, and full agent reasoning trail with color-coded step borders.
-
----
-
-## 🛠️ Setup & Usage
-
-### Prerequisites
-- Python 3.12+
-- Razorpay test account ([Razorpay API Keys](https://dashboard.razorpay.com/app/keys))
-
-### Install & Configure
+**Prerequisites:** Python 3.12+, and an OpenAI-compatible LLM endpoint.
 
 ```bash
-git clone https://github.com/suraj-0628/Razorpay-AI-Revenue-Recovery-Agent.git
-cd Razorpay-AI-Revenue-Recovery-Agent
-python -m venv .venv
-source .venv/bin/activate
+# 1. install
+python -m venv .venv && source .venv/bin/activate
 pip install -e .
-cp .env.example .env
-```
 
-### Start Services
+# 2. configure — copy the example and fill in your keys
+cp .env.example .env    # Razorpay test keys, LLM endpoint, (optional) SuperU + Brevo
 
-```bash
+# 3. run everything
 ./start.sh
 ```
 
-Serves:
-- **Merchant Operations HUD**: [http://localhost:5002/merchant](http://localhost:5002/merchant)
-- **Customer Store Checkout**: [http://localhost:5002/pay](http://localhost:5002/pay)
-- **Recovery Analytics Dashboard**: [http://localhost:5001](http://localhost:5001)
-- **LangGraph Agent Flow Graph**: [http://localhost:5001/graph](http://localhost:5001/graph)
-- **Razorpay Webhook Listener**: [http://localhost:5000/webhook](http://localhost:5000/webhook)
+`start.sh` launches five processes and prints their health:
 
----
+| Service | Port | What it is |
+|---|---|---|
+| **Frontend** | `5002` | Customer checkout (`/pay`) + Merchant HUD (`/merchant`) |
+| **Dashboard** | `5001` | Analytics / metrics |
+| **Webhook** | `5000` | Razorpay `payment.failed` listener (`/webhook`) |
+| **Phoenix** | `6006` | Live tracing (Arize Phoenix) |
+| **Daemon** | — | Scheduled retries, batch settle, cost reconciliation |
 
-## 🧪 Verification & Test Suite
+Open the **checkout** at `http://localhost:5002/pay`, fail a payment, and watch the agent work it live in the **Merchant HUD** at `http://localhost:5002/merchant`.
 
-```bash
-.venv/bin/pytest tests/ -v
+The LLM is configured entirely by env vars, so any OpenAI-compatible endpoint works:
+
+```dotenv
+LLM_BASE_URL=http://localhost:20128/v1     # any OpenAI-compatible router
+LLM_MODEL=antigravity/gemini-3.1-pro-high  # the primary model
+LLM_FALLBACK_MODELS=...                     # capability-ordered fallbacks
 ```
 
-- **Unit Test Suite**: ~397 tests passing.
+---
+
+## What it does
+
+A single recovery, end to end:
+
+1. **A payment fails** — via a Razorpay `payment.failed` webhook, or the customer failing/abandoning the checkout.
+2. **If the customer is still on the page**, it asks them one question — *"why did you stop?"* — because their own answer beats any guess from an error code.
+3. **The agent diagnoses the cause** and picks the plan that fits it: a bank decline needs a different rail at full price, an empty account needs a timed retry, a price objection is the one case a discount answers.
+4. **It acts** — creates a payment link on a working rail, shows it in-page and/or emails it, or schedules a quiet retry — then **waits**, without nagging.
+5. **When the money lands** (confirmed by the gateway) it **closes the case**; if it truly runs out of options, it **escalates to a human** — but only then.
+
+The same machinery runs over a **backlog in batches** (see *Batch engine* below).
 
 ---
 
-## 📁 Architecture Breakdown
+## Architecture
+
+The core idea: **the intelligence is the scaffolding around the model, not a bigger prompt.** The model decides *what* to do; the structure around it decides what it's *allowed* to do, remembers what's true, and guarantees the case reaches a clean ending.
+
+```mermaid
+flowchart TB
+    Customer((Customer))
+    Razorpay((Razorpay))
+    SuperU((SuperU Voice))
+
+    subgraph Ingest ["Ingestion"]
+        WH["webhook.py :5000<br/>payment.failed"]
+        CO["Checkout :5002/pay<br/>fail / drop-off + 'why?'"]
+    end
+
+    subgraph Live ["Live agent — LangGraph ReAct loop"]
+        PER["perception.py<br/>'what is true right now', every turn"]
+        CLS["classify.py<br/>failure kind + customer testimony"]
+        LAD["ladder.py<br/>recovery ladder per failure kind"]
+        GOV["governance.py<br/>tier-gated tool allowlist"]
+        LLM["LLM (agent_node)<br/>Gemini 3.1 Pro + fallbacks"]
+        GATE["guardrails.py / policy_gate.py<br/>enforced on the tool path"]
+        TOOLS["tools.py<br/>links · offers · retries · voice · close"]
+    end
+
+    subgraph Batch ["Batch engine"]
+        WAVES["waves.py<br/>bin by cause → wave → re-bin"]
+        DISTILL["distill.py<br/>one live case → reusable plan"]
+        EXEC["executor.py<br/>apply plan, zero extra LLM calls"]
+        QUEUE["agent_queue.py<br/>exceptions → back to the live agent"]
+    end
+
+    subgraph State ["State & memory"]
+        STORE["state_store.py<br/>SQLite/JSON + cross-process lock"]
+        MEM["memory.py<br/>per-customer episodes"]
+        PRES["presence.py + push_bus.py<br/>in-page delivery"]
+    end
+
+    subgraph Trust ["Audit · Ops · Evals · Traces"]
+        AUD["audit.py<br/>append-only SQLite (no UPDATE/DELETE)"]
+        ECON["economics.py + cost_ledger.py<br/>₹ per ₹100 recovered"]
+        EVAL["evals/<br/>conformance · red-team · counterfactual"]
+        OBS["observability.py<br/>Phoenix / OpenTelemetry"]
+    end
+
+    Razorpay -->|webhook| WH
+    Customer <--> CO
+    WH --> PER
+    CO --> PER
+    PER --> CLS --> LAD --> GOV --> LLM --> GATE --> TOOLS
+    TOOLS -->|links, retries| Razorpay
+    TOOLS -->|in-page| PRES
+    TOOLS -->|voice, gated| SuperU
+    TOOLS --> STORE
+    LLM <--> MEM
+    WAVES --> DISTILL --> EXEC
+    EXEC -->|exceptions| QUEUE --> LLM
+    EXEC --> STORE
+    TOOLS --> AUD
+    EXEC --> AUD
+    STORE --> ECON
+    LLM --> OBS
+```
+
+### Layers
+
+- **Ingestion** — `webhook.py` handles the Razorpay `payment.failed` event; the checkout page posts failures and drop-offs (with the customer's stated reason) to the frontend.
+- **The live agent** — a LangGraph ReAct loop (`agent/graph.py`). Each turn: `perception` rebuilds the ground truth from the durable record, `classify` decides the failure kind, `ladder` says which steps are allowed for that kind, `governance` binds only the permitted tools, the model chooses, and every tool call clears the **guardrail gate** before it runs.
+- **The batch engine** — the *same* agent at scale (`batch/`). Cases are binned by cause; the live agent works one representative case per bin, its decision is distilled into a plan and replayed across the look-alikes with **zero extra LLM calls**, and anything that doesn't fit is handed back to the live agent.
+- **State & memory** — `state_store.py` is the durable, cross-process case store; `memory.py` keeps per-customer recovery history; `presence.py` + `push_bus.py` deliver in-page notifications only when the customer is actually on the page.
+- **Trust surfaces** — an append-only audit log, unit economics, an eval suite, and full tracing (below).
+
+---
+
+## Key mechanisms
+
+### The Recovery Ladder — policy per failure kind
+`agent/ladder.py`. There is no single script. Each failure kind climbs its own ordered steps, and the agent can't skip to the end:
+
+| Failure kind | Ladder (in order) |
+|---|---|
+| **method** (bank/instrument decline) | page push → **rail switch (full price)** → offer → voice call → alternate path |
+| **funds** (empty account) | **timed retry** → page push → offer → alternate path |
+| **transient** (gateway/network) | timed retry → page push → alternate path *(no discount — never pay a customer for our outage)* |
+| **dropoff** (chose not to pay) | page push → **offer** → voice call → post-call email → alternate path |
+
+`escalate_to_human` and `close_case(unrecoverable)` are *refused* until the ladder is genuinely exhausted — compliant escalation, enforced in code.
+
+### The customer's own reason outranks the guess
+`drop_reasons.py`. Two customers who abandon after a decline look identical to an error code but need opposite responses. So the checkout asks one question — *transaction kept failing / found it cheaper / didn't have the money* — and that testimony re-routes the ladder.
+
+### Guardrails you can move in real time
+`guardrails.py`, `policy_gate.py`, `guardrail_config.py`. The guardrail engine sits **between the agent and its tools** and returns a hard `blocked` with a reason — not advice the model can talk itself out of. Every limit (contact caps, discount ceiling, quiet hours, whether voice is on) is a **live control** in the Merchant HUD's Guardrail view; changing one takes effect on the agent's next decision. Opt-out is locked — it's a legal rule, not a setting.
+
+### Multi-channel recovery — the pushiest channel is the most gated
+- **In-page** — `show_page_offer` / `send_page_push`, delivered only to a live checkout.
+- **Email / SMS** — `notifications.py` (email via Brevo SMTP; SMS is file-only), metered against a daily budget (`email_quota.py`).
+- **Voice** — `initiate_voice_call` places a real call via **SuperU** — but only above an order-value threshold, never in quiet hours, and only after cheaper steps have had their chance. Call cost is reconciled against SuperU's own bill (`cost_ledger.py`), not estimated.
+
+### Append-only audit trail
+`audit.py` is a SQLite table whose `UPDATE`/`DELETE` are refused by triggers. The Merchant HUD's **Batch engine** view is a straight read of it — every line on screen is a row that can't be quietly rewritten.
+
+### Unit economics
+`economics.py` accumulates real token/message/call cost per case and reports **cost per ₹100 recovered**, splitting live cases from seeded test ones so the number is honest.
+
+### Evals — proof it behaves, not just a demo that worked
+`evals/`. Every decision is logged and scored against policy (**conformance**); a **red-team** suite tries to trick the agent into a bad discount or a premature escalation; a **counterfactual** compares the agent's discount discipline against a naïve "discount everyone" baseline; scores are frozen as a **baseline** so a regression fails before it ships.
+
+```bash
+make evals          # run the suite, write EVALS.md + a scorecard
+make ci             # tests + a recorded-decision regression check
+```
+
+### Observability
+`observability.py` — one shared Arize Phoenix / OpenTelemetry init. Every span is stamped with `session.id = case:{payment_id}`, so a **Phoenix session is a recovery case**: one click shows every model call, tool, and guardrail it took, with a running token and ₹ cost. Spans are typed (AGENT / CHAIN / LLM / TOOL / GUARDRAIL), so a trace reads like the architecture.
+
+---
+
+## Repository layout
 
 ```
 src/recovery_agent/
-├── agent/
-│   ├── __init__.py              # RecoveryAgent wrapper
-│   ├── graph.py                 # LangGraph ReAct loop (StateGraph + ToolNode)
-│   ├── tools.py                 # 13 @tool functions + langmem memory tools
-│   ├── diagnosis.py             # 3-layer: error code lookup → LLM → rules
-│   ├── guardrails.py            # 6 safety policies
-│   ├── governance.py            # Tier-based tool access, PII masking
-│   ├── kg_router.py             # NetworkX graph, 6 API rails, Dijkstra
-│   ├── memory.py                # CustomerMemoryStore (JSON + filelock)
-│   ├── agentic_rag.py           # ChromaDB + sentence-transformers
-│   ├── planner.py               # pydantic-ai structured planning
-│   ├── llm_client.py            # ChatOpenAI → OmniRoute, fallback chain
-│   ├── stopping.py              # Tier transition logic (silent → active)
+├── agent/                 # the live agent
+│   ├── graph.py           #   LangGraph ReAct loop + model routing
+│   ├── perception.py      #   "what is true right now" every turn
+│   ├── classify.py        #   failure kind (+ operator/customer testimony)
+│   ├── ladder.py          #   recovery ladder per failure kind
+│   ├── governance.py      #   tier-gated tool allowlist
+│   ├── tools.py           #   the recovery tools (links, offers, retries, voice, close)
+│   ├── guardrails.py      #   the guardrail engine
+│   ├── policy_gate.py     #   guardrails enforced on the tool path
+│   ├── llm_client.py      #   LLM access + capability-ordered fallback
+│   ├── agentic_rag.py     #   RAG over the recovery knowledge base (ChromaDB)
+│   ├── memory.py          #   per-customer recovery history
+│   └── offers.py, diagnosis.py, decision_log.py, stopping.py
+├── batch/                 # the same agent, at scale
+│   ├── waves.py           #   bin → wave → re-bin
+│   ├── distill.py         #   one live case → reusable plan
+│   ├── executor.py        #   apply the plan, zero extra LLM calls
+│   ├── agent_queue.py     #   exceptions → back to the live agent
+│   └── planner.py, plan.py, tiers.py, run.py
+├── evals/                 # conformance, redteam, counterfactual, replay, quality
+├── frontend.py            # Flask + Socket.IO: checkout + Merchant HUD (:5002)
+├── dashboard.py           # analytics (:5001)
+├── webhook.py             # payment.failed listener (:5000)
+├── daemon_worker.py       # scheduled retries, park-on-boot, reconciliation
+├── state_store.py         # durable, cross-process case store
+├── audit.py               # append-only audit log (SQLite)
+├── economics.py           # unit economics (₹ per ₹100 recovered)
+├── cost_ledger.py         # BILLED / MEASURED / ESTIMATED cost provenance
+├── guardrail_config.py    # live-tunable guardrail policy
+├── drop_reasons.py        # the "why did you stop?" flow
+├── notifications.py       # email (Brevo) / SMS dispatch
+├── observability.py       # Phoenix / OpenTelemetry tracing
+└── presence.py, push_bus.py, escalation_queue.py, email_quota.py,
+    labels.py, ratelimit.py, razorpay_client.py, razorpay_knowledge_base.py
 ```
 
 ---
 
-## 🏭 Industry-Grade Architecture
+## Tech stack
 
-Based on deep-dive research on 6 production recovery systems — **Stripe, Redux, Recurly, Churnkey, Slicker, and Razorpay Agent Studio**.
-
-### Implemented: Three-Tier Recovery + Decline-Code Routing
-
-**Three-Tier Recovery Architecture** (inspired by Redux "Silent First" + Razorpay Agent Studio voice channels):
-- **Tier 1 (Silent)**: Background retries with NO customer contact. Customer stays active, unaware of failure.
-- **Tier 2 (Active)**: Personalized email/SMS with Razorpay Payment Links. Only triggered when silent tier exhausted.
-- **Tier 3 (Voice)**: SuperU AI voice agent calls the customer. Highest-conversion channel for high-value or unresponsive cases.
-
-- Code 51 (Insufficient Funds): Payday timing — retry at 12:01 AM local time on payday, "first-in-line advantage".
-- Code 05 (Do Not Honor): Metadata enrichment — optimize transaction shape, cooling-off period.
-- Code 19 (Try Again Later): Bank health monitoring — retry only when bank confirmed online.
-- Hard Declines (41, 43, 54, 14, 04, 46, 57, 93): Never retry — prevents $0.10/attempt Visa/MC network penalties.
-
-### Decline-Code Routing
-
-| Component | Role |
-|-----------|------|
-| `SuperUClient` | Wraps SuperU API — initiates outbound AI voice calls |
-| `webhook.py` | Receives `/superu/call-complete` callback with call outcome |
-| Dashboard | Shows voice call status in activity feed + drawer trail |
-
-### Recovery Rate Targets
-
-| Channel Mix | Target | Industry Benchmark |
-|-------------|--------|-------------------|
-| Email only | 3-8% | — |
-| Email + SMS | 8-15% | Redux 40-50% (with silent retry) |
-| Email + SMS + Silent Retry | 40-55% | Stripe 55%, Recurly 70% |
-| **+ SuperU Voice Calls** | **55-75%** | Razorpay Agent Studio production |
+- **Agent** — [LangGraph](https://github.com/langchain-ai/langgraph) ReAct loop, OpenAI-compatible LLM (Gemini 3.1 Pro via a local router), [langmem](https://github.com/langchain-ai/langmem) for durable memory.
+- **RAG** — ChromaDB with a local ONNX embedding model (downloaded on first `start.sh`).
+- **Payments** — the Razorpay Python SDK (test mode).
+- **Channels** — Brevo SMTP (email), SuperU (AI voice).
+- **Web** — Flask + Socket.IO; a single-page Merchant HUD and checkout.
+- **State** — SQLite + JSON with cross-process file locks.
+- **Observability** — Arize Phoenix over OpenTelemetry (OpenInference).
 
 ---
 
-## The Engineering Around the Agent — Governance, Economics, Memory, Evals
+## Testing
 
-An agent is only as trustworthy as the machinery that watches it. Four systems surround the loop:
-
-**1. Policy gate — guardrails ON the tool path.** Every customer-contact or money-moving tool call passes through the `GuardrailEngine` (quiet hours, frequency cap, opt-out, double-debit lock, monetary cap, hard-decline protection) at a dedicated LangGraph node *before* execution. A refusal is not a silent veto: it returns to the model as a ToolMessage with the reason and a workable alternative, lands on the case record's `refusals`, and shows up in the next turn's perception briefing — the agent *learns from policy* instead of bouncing off a cage. Every evaluation is appended to `audit_logs/guardrail_verdicts.jsonl` with the agent version, so "which policy refused this contact?" always has an answer.
-
-**2a. Billed costs, not just estimated ones.** Every cost carries a **provenance**: `BILLED` (the provider's own invoice line), `MEASURED` (we counted the real quantity, priced at a configured rate) or `ESTIMATED`. Voice is billed: `reconcile_voice_costs` reads SuperU's call log — a read that places no calls and spends no credits — joins each record back to its case through the `campaign_id` the agent stamps on every call, and records SuperU's own per-call charge in an append-only cost ledger keyed on the call uuid, so the daemon can poll it every five minutes without ever double-counting. The dashboard says which figures are invoice lines and which are our arithmetic. It found the standing ₹15/call estimate was **3–8× too high** — real calls cost ₹1.82–4.89.
-
-**2b. The agent knows its own ammunition.** Three metered resources bound what it can do, and it is told about all three rather than discovering them by failing: 30 payment links per account *ever*, a SuperU voice balance, and 300 Brevo emails per day. The email allowance is metered from our own delivery log (always available) and reconciled against Brevo's own per-day statistics when `BREVO_API_KEY` is set, taking the worse of the two — allowance spent elsewhere on the account is still spent. A reserve is held back, and the policy gate refuses a send that would eat into it, telling the agent to come back tomorrow or put the offer on the page instead. The 301st email does not fail loudly — it simply never arrives — so this is the difference between a stalled case and a customer who was actually reached.
-
-**2. Unit economics — what a recovered rupee costs.** Token usage is captured per LLM call on the case record; deliveries, voice calls and minted payment links are recorded by the tools that verified them; an accepted discount is costed as spend. The **OPS window** in the merchant HUD (Σ in the rail) prices every worked case — LLM + comms + discounts against revenue returned, by failure kind — down to *cost per ₹100 recovered*. Underneath sits a single tracing init (`observability.py`): every LLM turn lands in **Arize Phoenix** as an OpenInference span inside a per-case session (`session.id = case:{payment_id}`), the price table is seeded for the whole model fleet at startup, and Phoenix independently rolls tokens *and dollars* up per case — the dashboard links straight into it. History predating capture was reconstructed from LangGraph's own checkpoints (`scripts/backfill_llm_usage.py`), so no worked case reads as free.
-
-**3. A closed memory loop.** Every `close_case` writes a structured, PII-masked episode (failure kind, rungs climbed, outcome, discount) to the SQLite store, and updates the customer's persistent profile (channel win-rates, contact history). At every turn, perception folds both back into the briefing as measured lines — *"this customer before now: email recovered 2/2"*, *"of 6 past bank-decline cases, 4 recovered at full price"* — so memory is something the agent **sees**, not something it must remember to ask for. The frequency-cap guardrail feeds on the same contact history.
-
-**4. Behavioural evals** (`make evals`, report in `EVALS.md`). The graph logs every (perceived facts → chosen action) pair to a decision corpus; the harness in `src/recovery_agent/evals/` scores it four ways:
-- **recorded** — every live decision judged against the money/ladder invariants (free, no LLM);
-- **replay** — recorded briefings put back in front of the current model *k* times: conformance + stability, so a prompt change that breaks judgment fails in seconds, not in a customer's inbox;
-- **red team** — eight briefings engineered to bait violations (a paid customer demanding the promised discount, a "VIP" asking to skip a fraud review…). Each failure is attributed to the runtime layer that would catch it — *held / caught by rails / leaked* is a measured defense-in-depth map;
-- **memory A/B** — the same decision with and without the memory lines, measuring whether memory demonstrably changes behaviour.
-
-Baselines gate regressions: `evals/baseline.json` for decision metrics, `tests/integration/baseline.json` for the 18-journey case matrix (`drive_cases.py --check`). Transport failures score INCONCLUSIVE, never FAIL.
+```bash
+.venv/bin/pytest tests/      # the full suite (1000+ tests, ~35s)
+make ci                      # tests + recorded-decision regression gate
+make evals                   # the eval suite → EVALS.md + scorecard
+```
 
 ---
 
-## 🤝 Technology Partners
+## Notes & limits
 
-| Partner | Role | Integration |
-|---------|------|-------------|
-| **Razorpay** | Payment gateway + SDK + Webhooks | Core — all payment operations |
-| **SuperU AI** | AI voice calling platform | Tier 3 voice recovery — outbound AI phone calls |
-| **NVIDIA** | Nemotron LLM + NIM Guardrails | Agent reasoning + safety policies |
-| **LangGraph** | Agent orchestration framework | Deterministic DAG state machine |
-| **ChromaDB** | Vector database | Agentic RAG + episodic memory |
-| **Phoenix** | Observability + tracing | OpenTelemetry spans for every agent decision |
-
----
-
-## 📄 License
-
-Razorpay Buildathon 2026 — AI Revenue Recovery Track
+- **Razorpay is in test mode.** Payment links draw from a small per-account lifetime quota — the code tracks and protects it (`RAZORPAY_LINKS_ALREADY_SPENT`).
+- **Voice calls cost real credits** and are **off by default** (`VOICE_CALLS_ENABLED=0`). Turn them on in the Guardrail view for a demo.
+- **Email** needs a Brevo API key/verified sender; without one, sends are written to `data/outbox/` so the flow still runs.
+- The agent never contacts a customer who has opted out, and never charges a payment that already succeeded.

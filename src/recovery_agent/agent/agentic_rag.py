@@ -29,16 +29,23 @@ from recovery_agent.agent.llm_client import invoke_llm_json
 _phoenix_rag_initialized = False
 
 def _ensure_phoenix_rag():
-    """Lazy-init Phoenix OTel for LlamaIndex on first RAG query (avoids blocking at import)."""
+    """Delegate to the one init point. Never register a provider here.
+
+    This used to call `phoenix.otel.register()` itself with a hardcoded
+    endpoint, which was wrong three ways: it ignored PHOENIX_COLLECTOR_ENDPOINT
+    (so a remote collector was bypassed), it ignored PHOENIX_DISABLED (so the
+    test suite exported into the live project no matter what it was told), and
+    OTel honours exactly ONE global provider -- so registering a second one
+    mid-process orphaned every span already holding a tracer from the first.
+    init_observability() instruments LlamaIndex itself when it is importable.
+    """
     global _phoenix_rag_initialized
     if _phoenix_rag_initialized:
         return
     _phoenix_rag_initialized = True
     try:
-        from phoenix.otel import register
-        from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
-        register(endpoint="http://localhost:6006/v1/traces")
-        LlamaIndexInstrumentor().instrument()
+        from recovery_agent.observability import init_observability
+        init_observability("agentic-rag")
     except Exception as e:
         print(f"Observability disabled: {e}")
 

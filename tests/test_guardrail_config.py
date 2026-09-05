@@ -61,8 +61,9 @@ def test_the_source_is_reported_so_the_screen_can_say_where_it_came_from(monkeyp
 # ── values are coerced and bounded ──────────────────────────────────────────
 
 def test_a_slider_is_clamped_to_its_range():
+    ceiling = gc.BY_KEY["max_contacts_24h"]["max"]
     gc.update({"max_contacts_24h": 999})
-    assert gc.get("max_contacts_24h") == 12
+    assert gc.get("max_contacts_24h") == ceiling
     gc.update({"max_contacts_24h": 0})
     assert gc.get("max_contacts_24h") == 1
 

@@ -86,6 +86,41 @@ def failure_kind(record: dict) -> str:
     if strategy in _NOT_A_CAUSE:
         strategy = ""
 
+    # THE OPERATOR'S LABEL FIRST OF ALL.
+    #
+    # It outranks even the customer's own drop-reason answer, because it is
+    # NEWER: the drop-reason describes intent before any attempt was made,
+    # while the label describes what happened to the latest attempt. A
+    # customer who said "no balance" last week and whose card the bank now
+    # refuses is a method problem today, whatever they were then.
+    labeled = (record.get("operator_label") or {}).get("code") or ""
+    if labeled:
+        try:
+            from recovery_agent.labels import get as _label
+            spec = _label(labeled)
+            if spec and spec.get("kind"):
+                return spec["kind"]
+        except Exception:
+            pass
+
+    # THE CUSTOMER'S OWN ANSWER FIRST.
+    #
+    # Everything below infers intent from an error code. When the customer has
+    # actually been asked and has told us, inference is not merely weaker — it
+    # is answering a question that has already been answered. "I had no
+    # balance" and "I found it cheaper elsewhere" produce the SAME bank
+    # decline and demand opposite responses: one needs time and no discount,
+    # the other needs a discount and no waiting.
+    stated = (record.get("drop_reason") or {}).get("code") or ""
+    if stated:
+        try:
+            from recovery_agent.drop_reasons import get as _reason
+            spec = _reason(stated)
+            if spec and spec.get("kind"):
+                return spec["kind"]
+        except Exception:
+            pass
+
     reason = str(record.get("failure_reason") or "").lower()
 
     def _catalog(candidate: str) -> str:
@@ -197,7 +232,10 @@ BATCHES: list[dict[str, str]] = [
 BATCH_BY_KEY = {b["key"]: b for b in BATCHES}
 
 #: Statuses that mean the money is no longer at risk.
-_SETTLED = ("recovered",)
+#: `settled_outside` is a human's report of money on a rail we do not watch —
+#: it leaves the batches exactly like a recovery, but its amount is never added
+#: to recovered money, which stays gateway-verified only.
+_SETTLED = ("recovered", "settled_outside")
 #: A case the real-time agent is still working. Batching it would put two runs
 #: on one payment, which the session model does not allow.
 _IN_FLIGHT = ("recovering",)
@@ -239,7 +277,12 @@ def classify(record: dict) -> str | None:
         return None
 
     job = record.get("scheduled_job") or {}
-    if status == "scheduled" or (job and job.get("status") != "cancelled"):
+    # Every terminal state means "this will not fire": a completed or failed
+    # job is no more pending than a cancelled one, and none of them may file
+    # the case under "nothing to do until it fires".
+    _job_over = str(job.get("status") or "").lower() in (
+        "cancelled", "completed", "failed")
+    if status == "scheduled" or (job and not _job_over):
         return "awaiting_retry"
 
     if kind == "funds":

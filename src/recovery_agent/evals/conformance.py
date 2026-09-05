@@ -44,6 +44,7 @@ ENFORCED_BY = {
     "ladder_before_humans": "tools:escalate_to_human ladder consult",
     "refused_twice_change_course": "policy_gate + tool_repetition_guard",
     "never_overcharge": "tools:generate_recovery_payment_link amount check",
+    "price_lever_missed": "model",
 }
 
 
@@ -158,6 +159,33 @@ def judge(facts: dict, tool: str, args: dict | None = None) -> Verdict:
         if kind == "method" and not _full_price_tried(facts):
             return Verdict(False, "method_full_price_first",
                            "discount shown before full price was ever tried")
+
+    # THE OTHER DIRECTION. Every rule above punishes giving money away when it
+    # cannot help. None punished refusing to offer when it is the only thing
+    # that can — so a "never discount anything" policy scored as well as the
+    # agent and spent nothing, which made the whole comparison meaningless. A
+    # one-sided rulebook measures caution, not judgement.
+    #
+    # Narrow on purpose: only a drop-off (nothing broke, the customer simply
+    # left — the one family where price IS the lever), only at the rung the
+    # ladder has already chosen for it, and only when the decision charges
+    # full price anyway. Declining to act at all is still allowed; this judges
+    # acting in the wrong direction.
+    if tool in ("generate_recovery_payment_link", "show_page_offer"):
+        stated = (facts.get("drop_reason") or {}).get("code") or ""
+        at_offer_rung = facts.get("next_rung") == "offer"
+        charged = _f(args.get("amount") or args.get("payable_amount"))
+        owed_now = _f(facts.get("owed"))
+        full_price = owed_now > 0 and charged >= owed_now * 0.999
+        if full_price and (stated == "better_price"
+                           or (kind == "dropoff" and at_offer_rung)):
+            why = ("the customer said outright that they found a better price"
+                   if stated == "better_price" else
+                   "nothing broke — they simply left, and the ladder is at the "
+                   "offer rung")
+            return Verdict(False, "price_lever_missed",
+                           f"charged full price when {why}; the discount is the "
+                           f"one lever this case has")
 
     if tool == "escalate_to_human":
         if kind != "risk" and facts.get("next_rung"):

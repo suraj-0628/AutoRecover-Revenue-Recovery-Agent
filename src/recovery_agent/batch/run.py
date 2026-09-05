@@ -58,6 +58,11 @@ class BatchRun:
     budget: BatchBudget = field(default_factory=BatchBudget)
     dry_run: bool = False
     started_by: str = "dashboard"
+    #: Set when this run is one wave of a cycle. Purely identity — the run
+    #: behaves identically either way; the cycle reads these back off the
+    #: audit trail to tell its waves apart.
+    wave: int = 0
+    cycle_id: str = ""
     run_id: str = field(default_factory=lambda: f"run_{uuid.uuid4().hex[:12]}")
 
     spend: ex.Spend = field(default_factory=ex.Spend)
@@ -121,7 +126,7 @@ class BatchRun:
                      actor=self.started_by, batch_key=self.batch_key,
                      dry_run=self.dry_run, candidates=len(candidates),
                      amount_paise=at_risk, budget=self.budget.as_dict(),
-                     workers=WORKERS)
+                     workers=WORKERS, wave=self.wave, cycle_id=self.cycle_id)
         for tier, plan in self.plans.items():
             audit.record(audit.BATCH_PLANNED, subject_type=audit.BATCH_RUN,
                          subject_id=self.run_id, batch_run_id=self.run_id,
@@ -222,7 +227,8 @@ class BatchRun:
         """The live view. `projection()` is the same numbers from the log."""
         base = projection(self.run_id)
         base.update({"status": self.status, "stop_reason": self.stop_reason,
-                     "dry_run": self.dry_run,
+                     "dry_run": self.dry_run, "wave": self.wave,
+                     "cycle_id": self.cycle_id,
                      "budget": self.budget.as_dict(),
                      "spend": self.spend.as_dict(),
                      "decisions": [d.as_dict() for d in self.decisions]})
@@ -290,6 +296,8 @@ def projection(run_id: str) -> dict[str, Any]:
             out.update(batch_key=payload.get("batch_key", ""),
                        started_by=e.get("actor", ""),
                        started_at=e["created_at"],
+                       wave=int(payload.get("wave") or 0),
+                       cycle_id=str(payload.get("cycle_id") or ""),
                        dry_run=bool(payload.get("dry_run")),
                        candidates=int(payload.get("candidates") or 0),
                        at_risk_paise=int(e.get("amount_paise") or 0))

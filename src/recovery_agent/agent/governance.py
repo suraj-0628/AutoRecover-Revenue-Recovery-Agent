@@ -59,7 +59,6 @@ class ToolAccessPolicy(BaseModel):
         "diagnose_payment_failure",
         "get_customer_payment_history",
         "query_knowledge_base",
-        "discover_recovery_rail",
         "manage_memory",
         "search_memory",
         "generate_recovery_payment_link",
@@ -205,8 +204,7 @@ def mask_tool_output(tool_name: str, output: str) -> str:
         return mask_pii(output)
 
     # Knowledge/memory tools: no PII in output
-    if tool_name in ("query_knowledge_base",
-                      "manage_memory", "search_memory", "discover_recovery_rail"):
+    if tool_name in ("query_knowledge_base", "manage_memory", "search_memory"):
         return output
 
     # Default: mask everything

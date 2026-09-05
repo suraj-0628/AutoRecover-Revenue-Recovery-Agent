@@ -75,3 +75,22 @@ data-test/
 # baseline are deliberately committed (CI scores them on a fresh checkout).
 evals/results/
 data/phoenix/
+
+# Local runtime state & databases — never commit (may hold customer PII).
+# The app recreates everything under data/ on start.
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.csv
+data/*.log
+data/.store.lock
+data/backups/
+data/memory/
+
+# EXCEPTION: the knowledge base drives the discount policy + RAG and is
+# REQUIRED to run, so keep it tracked despite the blanket *.md and data ignores.
+!data/knowledge_base/
+!data/knowledge_base/*.md
+
+# Stray runtime data under src/
+src/data/

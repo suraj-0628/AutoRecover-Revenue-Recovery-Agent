@@ -367,6 +367,24 @@ class StateStore:
                 if reason:
                     job["cancelled_reason"] = reason[:200]
                 cancelled.append(job_id)
+            # The record's `scheduled_job` snapshot is what classify() and
+            # ladder.retry_pending() read — not this jobs table. Cancelling
+            # the job while the snapshot still said "scheduled" filed the
+            # case under awaiting_retry ("Nothing to do until it fires",
+            # runnable: False) for a retry nothing would ever fire — the
+            # parked-at-restart zombie. Synced even when nothing was pending
+            # to cancel, so a snapshot left stale by an earlier sweep heals
+            # on the next call.
+            rec = self._payments.get(payment_id)
+            snap = (rec or {}).get("scheduled_job") or {}
+            if rec is not None and snap and str(snap.get("status") or "").lower() not in (
+                    "cancelled", "completed", "failed"):
+                snap = dict(snap)
+                snap["status"] = "cancelled"
+                snap["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+                if reason:
+                    snap["cancelled_reason"] = reason[:200]
+                rec["scheduled_job"] = snap
         return cancelled
 
     def fail_job(self, job_id: str, error: str = "") -> None:

@@ -259,6 +259,40 @@ class AuditLog:
                 "ORDER BY event_id LIMIT ?", (batch_run_id, limit)).fetchall()
         return [self._row(r) for r in rows]
 
+    def batch_activity(self, since_event_id: int = 0,
+                       limit: int = 200) -> list[dict]:
+        """Everything batch-shaped, oldest first. The batch window's feed.
+
+        It is a straight read of this table — not a narration layer — which is
+        what lets the UI say "every line here is the append-only log" and mean
+        it.
+
+        Two modes, so a hard refresh restores the log exactly as it was:
+          - `since_event_id > 0` (incremental poll): the events AFTER the
+            cursor, in order — one indexed range scan every couple of seconds.
+          - `since_event_id == 0` (a fresh page load): the most RECENT `limit`
+            events, still returned oldest-first. Returning the oldest `limit`
+            instead meant that once a demo wrote more than `limit` batch events,
+            a reload showed the very first ones ever logged and had to crawl
+            forward a page at a time to reach what was actually on screen. The
+            tail is what "keep the log as it is" means.
+        """
+        with self._conn() as conn:
+            if int(since_event_id or 0) > 0:
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE event_id > ? AND "
+                    "(batch_run_id != '' OR subject_type = ? OR kind = ?) "
+                    "ORDER BY event_id LIMIT ?",
+                    (int(since_event_id), BATCH_RUN, CASE_LABELED,
+                     int(limit))).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM (SELECT * FROM events WHERE "
+                    "(batch_run_id != '' OR subject_type = ? OR kind = ?) "
+                    "ORDER BY event_id DESC LIMIT ?) ORDER BY event_id",
+                    (BATCH_RUN, CASE_LABELED, int(limit))).fetchall()
+        return [self._row(r) for r in rows]
+
     def of_kind(self, kind: str, *, batch_run_id: str | None = None,
                 limit: int = 5000) -> list[dict]:
         sql = "SELECT * FROM events WHERE kind = ?"
@@ -310,11 +344,15 @@ CASE_SELECTED = "case.selected"
 CASE_SKIPPED = "case.skipped"
 CASE_EXCEPTION = "case.exception"
 CASE_CLOSED = "case.closed"
+CASE_LABELED = "case.labeled"
 CASE_REASONING = "case.reasoning"
 
 ACTION_ATTEMPTED = "action.attempted"
 ACTION_RESULT = "action.result"
 
+CYCLE_OPENED = "batch_cycle.opened"
+CYCLE_WAVE = "batch_cycle.wave"
+CYCLE_FINISHED = "batch_cycle.finished"
 LADDER_RUNG = "ladder.rung_climbed"
 ESCALATION_RAISED = "escalation.raised"
 MONEY_RECOVERED = "money.recovered"

@@ -162,8 +162,12 @@ class QuietHourGuardrail:
 class FrequencyCapGuardrail:
     """Maximum 2 communications per customer per 24-hour window."""
 
-    def __init__(self, max_contacts_per_24h: int = 2):
+    def __init__(self, max_contacts_per_24h: int = 2,
+                 min_gap_minutes: int = 5):
         self.max_contacts = max_contacts_per_24h
+        # A daily cap counts contacts but says nothing about their SPACING, so
+        # a whole day's allowance can be spent in a minute.
+        self.min_gap_minutes = min_gap_minutes
 
     def check(
         self,
@@ -208,6 +212,47 @@ class FrequencyCapGuardrail:
                 original_action=action.value,
             )
 
+        # THE GAP, AFTER THE COUNT.
+        #
+        # Order matters only when BOTH limits apply, and then the daily
+        # cap is the binding one: waiting five minutes does not clear it,
+        # so naming the gap would send the agent off to wait for something
+        # that will still be refused. Name the limit that actually holds.
+        #
+        # Live (pay_qttkbl2b3, INR 24,990): the agent emailed a 5% offer,
+        # called check_payment_status forty seconds later, saw the money had
+        # not arrived -- of course it had not -- and emailed a second offer at
+        # 20%. Two offers, two payment links, ninety seconds apart. Nobody
+        # decides on a purchase that fast, so the second one bought nothing
+        # the first had not already bought; it only cost a link and a deeper
+        # discount.
+        #
+        # The refusal names wait_for_customer on purpose. The agent had that
+        # tool the whole time and did not reach for it, because nothing made
+        # the passage of time a thing it had to deal with.
+        if self.min_gap_minutes > 0:
+            last = None
+            for record in profile.payment_history:
+                if record.status == "contact" and record.channel_used:
+                    if last is None or record.timestamp > last:
+                        last = record.timestamp
+            if last is not None:
+                gap_s = (current - last).total_seconds()
+                need_s = self.min_gap_minutes * 60
+                if gap_s < need_s:
+                    wait_min = max(1, int((need_s - gap_s) // 60) + 1)
+                    return GuardrailCheckResult(
+                        guardrail="frequency_cap",
+                        verdict=GuardrailVerdict.BLOCKED,
+                        reason=(f"You contacted this customer "
+                                f"{int(gap_s // 60)} minute(s) ago. They have "
+                                f"not had time to read it, let alone act on "
+                                f"it. Minimum gap is "
+                                f"{self.min_gap_minutes} minutes."),
+                        original_action=action.value,
+                        modified_action=ActionType.WAIT_AND_RETRY.value,
+                    )
+
         return GuardrailCheckResult(
             guardrail="frequency_cap",
             verdict=GuardrailVerdict.PASS,
@@ -242,13 +287,27 @@ class DoubleDebitLockGuardrail:
                 original_action=action.value,
             )
 
-        # Check if there's already a successful or pending payment in recent attempts
+        # Only a DEBIT can double-debit.
+        #
+        # This used to block on any attempt with result == "success", but
+        # `Attempt.result` is the result of the ACTION, not of a payment: a
+        # delivered page push and a sent email both record "success". So the
+        # first time anything worked, this fired and told the agent "payment
+        # already succeeded" -- a flat contradiction of the same turn's
+        # briefing, which said the money was not back. Live (pay_p9oxiasll) it
+        # refused a legitimate retry_in_hours on the strength of a delivered
+        # notification.
+        #
+        # A guardrail that cries wolf is worse than none: it teaches the agent
+        # its own instruments disagree, and there is no right move after that.
         for attempt in case.attempts:
-            if attempt.result == "success":
+            if attempt.action_type == ActionType.RETRY_PAYMENT and \
+                    attempt.result == "success":
                 return GuardrailCheckResult(
                     guardrail="double_debit_lock",
                     verdict=GuardrailVerdict.BLOCKED,
-                    reason=f"Double-debit blocked: payment already succeeded in attempt {attempt.id}",
+                    reason=f"Double-debit blocked: a payment retry already succeeded "
+                           f"in attempt {attempt.id}",
                     original_action=action.value,
                 )
 
@@ -465,7 +524,10 @@ class GuardrailEngine:
                                               quiet_end=quiet_end)
         self.frequency_cap = FrequencyCapGuardrail(
             max_contacts_per_24h=int(_cfg(
-                "max_contacts_24h", _env_int("GUARDRAIL_MAX_CONTACTS_24H", 5))))
+                "max_contacts_24h", _env_int("GUARDRAIL_MAX_CONTACTS_24H", 5))),
+            min_gap_minutes=int(_cfg(
+                "min_contact_gap_minutes",
+                _env_int("GUARDRAIL_MIN_CONTACT_GAP_MIN", 5))))
         self.double_debit = DoubleDebitLockGuardrail()
         self.opt_out = OptOutGuardrail()
         self.monetary_cap = MonetaryCapGuardrail(

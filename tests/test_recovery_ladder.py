@@ -285,16 +285,18 @@ def test_turns_are_counted_per_run_not_per_session():
 
 def test_one_run_that_loops_is_still_capped():
     from langchain_core.messages import AIMessage, HumanMessage
-    from recovery_agent.agent.graph import should_continue
+    from recovery_agent.agent.graph import should_continue, MAX_TURNS_PER_RUN
 
     names = ["search_memory", "diagnose_payment_failure", "query_knowledge_base",
              "get_customer_payment_history", "check_payment_status",
              "discover_recovery_rail", "get_recovery_offer", "send_page_push",
              "show_page_offer"]
     msgs = [HumanMessage(content="failed")]
-    for i in range(9):
+    # One past the cap, so the single grace round for a finishing call is
+    # already spent — a run that keeps looping is stopped regardless.
+    for i in range(MAX_TURNS_PER_RUN + 1):
         msgs.append(AIMessage(content="", tool_calls=[
-            {"name": names[i], "args": {"i": i}, "id": f"x{i}"}]))
+            {"name": names[i % len(names)], "args": {"i": i}, "id": f"x{i}"}]))
     state = {"messages": msgs, "tool_call_history": [], "blocked_rounds": 0}
     assert should_continue(state) == "stopping_check"
 

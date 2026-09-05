@@ -291,10 +291,68 @@ def _release_stranded_holds() -> int:
     return released
 
 
+#: Statuses that mean "the agent was still working this when we stopped".
+_OPEN_ON_BOOT = ("recovering", "awaiting_customer", "scheduled")
+
+
+def park_open_cases_on_boot() -> int:
+    """Send cases that were mid-flight at shutdown to the batch, not the HUD.
+
+    A wake job carries no notion of the restart that happened between it being
+    scheduled and it firing. So on every spin-up the daemon's first poll fired
+    the whole accumulated backlog at once: cases the operator had not touched
+    erupted into the live monologue, each climbing a rung and emailing a real
+    customer about a window that expired hours ago.
+
+    That is wrong twice. The messages are stale -- "complete your payment in
+    the next 15 minutes" about a checkout from yesterday -- and the live view
+    is for what is happening NOW, so work nobody triggered has no business
+    seizing it.
+
+    Parking is not dropping. The case keeps its history, its jobs are
+    cancelled rather than lost, and `classify()` places it in the batch it
+    belongs to, where it can be worked deliberately. Recovery still happens;
+    it just stops ambushing a fresh session.
+    """
+    from recovery_agent.state_store import StateStore
+
+    store = StateStore()
+    store.refresh()
+    parked = 0
+    for rec in list(store.payment_values()):
+        pid = str(rec.get("payment_id") or "")
+        if not pid or str(rec.get("status") or "") not in _OPEN_ON_BOOT:
+            continue
+        if rec.get("closed") or float(rec.get("recovered_amount") or 0) > 0:
+            continue
+        try:
+            store.cancel_jobs_for(pid, reason="parked at restart")
+            store.update_payment(
+                pid, status="parked",
+                parked_at=datetime.now(timezone.utc).isoformat(),
+                parked_from=str(rec.get("status") or ""),
+                parked_reason="the stack restarted while this case was open; "
+                              "it is in the batch to be worked deliberately")
+            parked += 1
+        except Exception as e:
+            print(f"[daemon] could not park {pid}: {e}", file=sys.stderr)
+    if parked:
+        store.flush()
+        print(f"[daemon] parked {parked} open case(s) into the batch — they "
+              f"will not wake into the live view", flush=True)
+    return parked
+
+
 def daemon_loop():
     """Main daemon loop — polls every POLL_INTERVAL seconds."""
     print(f"[daemon] Starting daemon worker (poll interval: {POLL_INTERVAL}s)")
     print(f"[daemon] Frontend URL: {FRONTEND_URL}")
+
+    # Before the FIRST poll, so no backlogged wake can beat us to it.
+    try:
+        park_open_cases_on_boot()
+    except Exception as e:
+        print(f"[daemon] Error parking open cases: {e}", file=sys.stderr)
 
     last_reconcile = 0.0
     while True:

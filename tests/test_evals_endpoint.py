@@ -180,3 +180,63 @@ def test_no_module_registers_its_own_tracer_provider():
            re.search(r"\bregister\(\s*endpoint\s*=", body):
             offenders.append(str(py.relative_to(src)))
     assert not offenders, f"these register their own provider: {offenders}"
+
+
+def test_the_live_rate_agrees_with_the_frozen_scorecard(live):
+    """The screen shows a number it recomputed on this request. If that ever
+    disagrees with what the eval runner wrote, the dashboard is quietly telling
+    a different story from CI — and a judge who checks would be right to stop
+    believing both.
+
+    The first attempt at this scored per TOOL CALL and got 70/72 against the
+    runner's 74/76, because a turn calling three tools is ONE decision.
+    """
+    rc = live.get("recomputed") or {}
+    assert "error" not in rc, rc.get("error")
+    card = live["modes"]["recorded"]
+    assert rc["decisions"] == card["decisions"], "different unit of analysis"
+    assert round(rc["rate"], 3) == round(card["rate"], 3), (
+        f"dashboard says {rc['rate']}, scorecard says {card['rate']}")
+
+
+def test_the_recompute_needs_no_model_and_no_network():
+    """It has to be honest AND instant, or nobody will press the button in
+    front of an audience. Rule-based judging over the whole corpus is ~0.03s."""
+    import json as _json
+    import time
+    from recovery_agent.evals.conformance import judge_decision
+    rows = [_json.loads(l) for l in
+            (Path(__file__).resolve().parents[1] / "evals" / "corpus" /
+             "decisions.jsonl").read_text().splitlines() if l.strip()]
+    t0 = time.time()
+    for r in rows:
+        judge_decision(r.get("facts") or {}, r.get("chosen") or [])
+    assert time.time() - t0 < 2.0, "too slow to recompute live in a demo"
+
+
+# ── the monologue keeps its bearings across cases ───────────────────────
+
+def test_the_system_line_is_not_inside_the_swapped_terminal():
+    """selectSession() replaces terminal.innerHTML wholesale, so anything
+    parked inside the terminal as static markup is destroyed the first time a
+    case arrives. The [SYSTEM] line — the one thing telling the operator the
+    HUD is alive — vanished exactly when the HUD started doing something."""
+    html = _template()
+    term = html.index('id="terminal-stream"')
+    sysline = html.index('id="hud-system-line"')
+    assert sysline < term, "the system line is inside the region that gets swapped"
+    # and the terminal must start empty, not carrying markup that will be lost
+    tail = html[term:term + 200]
+    assert 'id="terminal-stream"></div>' in tail, \
+        "terminal-stream still ships static children that selectSession will erase"
+
+
+def test_a_background_session_says_where_it_came_from():
+    """A case waking from its own scheduled wait used to appear as a bare tab
+    mid-stream, so work the operator never triggered read as the system acting
+    at random."""
+    html = _template()
+    fn = html[html.index("function sessionFor("):]
+    fn = fn[:fn.index("\n    }")]
+    assert "[SESSION]" in fn, "a new session buffer carries no origin line"
+    assert "background" in fn, "the line must say it ran while you were elsewhere"

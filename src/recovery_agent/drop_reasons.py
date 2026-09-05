@@ -110,10 +110,27 @@ REASONS: list[dict[str, Any]] = [
 BY_CODE = {r["code"]: r for r in REASONS}
 
 
+#: The three the checkout actually asks. One question, three buttons, and each
+#: answer sends the case down a genuinely different ladder: the instrument
+#: (method → rail switch), the price (dropoff → offer), or the money (funds →
+#: timed retry). The other REASONS entries still exist for records set by any
+#: other path — this is only what the customer is shown at the point of leaving.
+CHECKOUT_CHOICES = ("payment_kept_failing", "better_price", "no_balance")
+
+
 def choices() -> list[dict[str, Any]]:
-    """What the checkout renders. Only what the customer needs to see."""
-    return [{"code": r["code"], "label": r["label"],
-             "free_text": bool(r.get("free_text"))} for r in REASONS]
+    """What the checkout renders. Only what the customer needs to see.
+
+    Rendered in CHECKOUT_CHOICES order — instrument, price, money — not in the
+    order REASONS happens to be declared.
+    """
+    out = []
+    for code in CHECKOUT_CHOICES:
+        r = BY_CODE.get(code)
+        if r:
+            out.append({"code": r["code"], "label": r["label"],
+                        "free_text": bool(r.get("free_text"))})
+    return out
 
 
 def get(code: str) -> dict[str, Any] | None:
