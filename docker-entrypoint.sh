@@ -3,10 +3,13 @@
 # foreground so the container lives with it and its logs stream to `docker logs`.
 set -euo pipefail
 
-# Best-effort: cache the RAG embedding model. Non-fatal — only the knowledge-base
-# lookup degrades if it can't download; everything else runs.
-python -m recovery_agent.scripts.download_models \
-    || echo "WARN: RAG embedding model unavailable (offline?); knowledge base degraded."
+# Warm the RAG embedding model in the BACKGROUND so services start immediately.
+# It's a ~80MB download; blocking on it would make the stack look hung for
+# minutes on first run. Non-fatal — the knowledge-base lookup just degrades
+# until it finishes; everything else is up right away.
+( python -m recovery_agent.scripts.download_models \
+    && echo "RAG embedding model ready." \
+    || echo "WARN: RAG embedding model unavailable (offline?); knowledge base degraded." ) &
 
 # Background services (logs to files; the frontend below streams to stdout).
 python -m recovery_agent.dashboard      > /tmp/dashboard.log     2>&1 &

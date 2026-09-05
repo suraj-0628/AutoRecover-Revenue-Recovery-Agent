@@ -10,10 +10,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install the package + all dependencies.
-COPY . .
+# Dependency layer — cached unless pyproject/src change, so edits to the
+# entrypoint, config or docs rebuild in seconds instead of re-installing.
+COPY pyproject.toml ./
+COPY src ./src
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -e .
+
+# Everything else (entrypoint, config, knowledge base, evals corpus).
+COPY . .
 
 # Only a service may spend the Razorpay link quota / SuperU credits (matches
 # start.sh). Voice stays OFF unless enabled in the guardrail config.
