@@ -1,0 +1,31 @@
+# Keep the build context small and free of local state / secrets.
+.venv/
+venv/
+.git/
+.github/
+**/__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+
+# Secrets never go in the image (passed at runtime via env_file)
+.env
+
+# Local runtime state / databases (may hold PII). The knowledge base under
+# data/knowledge_base/ is REQUIRED and kept (it is not matched below).
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.json
+data/*.csv
+data/.store.lock
+data/backups/
+data/memory/
+data/audit_logs/
+data/escalations/
+data/outbox/
+data/phoenix/
+data-test/
+
+# Generated eval output (corpus + baseline are kept)
+evals/results/

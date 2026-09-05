@@ -31,7 +31,16 @@ cp .env.example .env  # REQUIRED: Razorpay test keys + an LLM endpoint. Rest is 
 make start            # or: ./start.sh
 ```
 
-`start.sh` launches five processes and prints their health:
+### …or with Docker (one command, no Python setup)
+
+```bash
+cp .env.example .env        # add Razorpay test keys + your LLM endpoint/key
+docker compose up --build   # builds the image and starts the whole stack
+```
+
+Ports `5000–5002` and `6006` are mapped, so the URLs below work unchanged. State lives inside the container (fresh each run); the app recreates it on start.
+
+`start.sh` (or the container) launches five processes and prints their health:
 
 | Service | Port | What it is |
 |---|---|---|

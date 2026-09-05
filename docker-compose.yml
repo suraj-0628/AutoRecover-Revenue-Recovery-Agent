@@ -1,0 +1,23 @@
+# AutoRecover — one-command local run.
+#
+#   cp .env.example .env      # add Razorpay TEST keys + an LLM endpoint/key
+#   docker compose up --build
+#
+# Then open  http://localhost:5002/pay  (checkout)  and  /merchant  (HUD).
+services:
+  autorecover:
+    build: .
+    image: autorecover:latest
+    container_name: autorecover
+    env_file: .env
+    ports:
+      - "5002:5002"   # checkout + merchant HUD  ← start here
+      - "5001:5001"   # analytics dashboard
+      - "5000:5000"   # Razorpay webhook listener
+      - "6006:6006"   # Phoenix tracing
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5002/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 40s
